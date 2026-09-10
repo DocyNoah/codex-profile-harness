@@ -179,3 +179,112 @@ Result: exit 0; compile succeeded and `git diff --check` produced no output.
 ### Concerns
 
 None.
+
+## Legacy cursor direct-lookup correction
+
+This section supersedes the prior correction's transcript reconstruction
+approach. Legacy cursor upgrade no longer rereads or infers previously consumed
+transcript boundaries.
+
+### Root cause
+
+Reconstructing all bytes before a metadata-less cursor assumed that those bytes
+belonged to the last receipt. That assumption is false after multiple captures,
+and the reconstruction was unavailable once the cumulative transcript exceeded
+the 1 MiB per-delta bound. On a mismatch it could also republish historical
+transcript content as a new delta.
+
+### RED evidence
+
+The first regression simulates multiple bounded captures whose cumulative
+transcript is greater than 1 MiB. It uses a 5,000-character original session ID
+and a secret-bearing, over-limit fallback message, with the hand-derived legacy
+receipt ID expected from the full stripped session ID and redacted/bounded
+fallback. The second regression requires a base-payload mismatch to produce an
+empty-delta recovery receipt rather than recollect prior evidence.
+
+Command:
+
+```text
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_transcript_capture.TranscriptCaptureTests.test_legacy_cursor_reuses_last_receipt_after_multiple_megabyte_captures tests.test_transcript_capture.TranscriptCaptureTests.test_legacy_cursor_rejects_tampered_receipt_payload -v
+```
+
+Pre-fix result: 2 tests ran with 2 failures in 0.327s. The cumulative transcript
+case returned `captured` instead of `duplicate`; mismatch recovery contained
+`["legacy evidence"]` instead of an empty assistant delta.
+
+A separate safety regression proved that direct receipt lookup must be gated by
+an actually loaded, matching legacy cursor rather than merely by the availability
+of a prospective next cursor.
+
+Command:
+
+```text
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_transcript_capture.TranscriptCaptureTests.test_legacy_receipt_is_not_reused_without_a_matching_legacy_cursor -v
+```
+
+Pre-fix result: 1 test ran with 1 failure in 0.143s; a validly shaped receipt was
+incorrectly returned as `duplicate` even after the cursor had been removed.
+
+### Implementation
+
+- `prepare_transcript_delta()` now reports only whether an existing
+  metadata-less cursor matched the current transcript identity, prefix, and
+  position. It no longer seeks backward or reads any previously consumed bytes.
+- Capture computes the exact pre-enrichment legacy delivery ID directly from
+  the current hook input: event, full stripped session ID, stripped turn/reason,
+  and the digest of the already redacted/bounded fallback message. It looks up
+  only that deterministic inbox path.
+- Reuse requires the shared stable receipt validator, matching filename/ID,
+  event and normalized cwd, all four legacy transcript-enrichment fields, and
+  exact equality of every non-enrichment payload field with the current
+  normalized hook payload. A receipt is never reused without a matched legacy
+  cursor.
+- A missing, invalid, or base-mismatched legacy receipt follows the normal
+  empty-delta evidence-bound publication path. Cursor metadata is promoted only
+  after that new receipt is durable, so historical transcript bytes are neither
+  guessed nor recollected.
+- Existing evidence-bound new-delta identity and inbox-directory durability
+  ordering are unchanged.
+
+### Verification
+
+Legacy upgrade regressions:
+
+```text
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_transcript_capture.TranscriptCaptureTests.test_legacy_cursor_reuses_valid_legacy_receipt_and_promotes_metadata tests.test_transcript_capture.TranscriptCaptureTests.test_legacy_cursor_reuses_last_receipt_after_multiple_megabyte_captures tests.test_transcript_capture.TranscriptCaptureTests.test_legacy_cursor_rejects_tampered_receipt_payload tests.test_transcript_capture.TranscriptCaptureTests.test_legacy_receipt_is_not_reused_without_a_matching_legacy_cursor -v
+```
+
+Result: 4 tests passed in 0.607s, 0 failures.
+
+Focused GREEN:
+
+```text
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_transcript_capture
+```
+
+Result: 21 tests passed in 3.303s, 0 failures.
+
+Complete suite:
+
+```text
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests
+```
+
+Result: 177 tests passed in 46.111s, 0 failures.
+
+Compile and whitespace verification:
+
+```text
+python3 -m compileall -q src tests && git diff --check
+```
+
+Result: exit 0; compile succeeded and `git diff --check` produced no output.
+
+### Implementation commit
+
+`4bdc152`
+
+### Concerns
+
+None.
