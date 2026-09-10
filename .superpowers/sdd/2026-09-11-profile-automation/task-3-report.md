@@ -217,3 +217,54 @@ implemented.
 - Automatic checkpoint latency is now bounded by the external 15-minute
   maintenance schedule rather than each lifecycle hook. Runtime receipts and
   cursors remain intentionally untracked and require whole-profile backup.
+
+## Final fix C round 2: Subject-preserving preflight
+
+### Commit
+
+- `3a863bbc39038c687385838a277292f612fe2d80` — `fix: preserve pending checkpoint subjects`
+
+### RED evidence
+
+- Six new maintenance tests initially reported two failures and six errors in
+  1.731s: invalid config/time prevented checkpointing, malformed or unknown
+  failure metadata was cleared, and curation/improvement/recovery commit failures
+  were immediately consumed by the same run's generic final checkpoint.
+- The active-lease safety case already passed, confirming the existing lease
+  excluded maintenance; it remains as a regression test for partial-state safety.
+
+### Behavior
+
+- Maintenance now acquires a non-reclaiming profile lease before config and clock
+  validation whenever no other owner exists, then performs Git preflight while
+  holding that lease. If a lease already exists, normal configured stale-owner
+  handling occurs before any preflight, so live partial transactions are never
+  checkpointed.
+- Preflight reads the bounded failure diagnostic while holding the Git guard and
+  accepts only the exact recorded schema, an aware timestamp, nonempty error, and
+  an allowlisted deterministic subject. Malformed, unknown, oversized, or unsafe
+  diagnostics remain untouched and are never executed.
+- A valid pending subject is retried first. Generic checkpointing occurs only
+  after that retry succeeds or when no pending retry exists; another retry
+  failure remains diagnostic and cannot fall through to a generic commit.
+- The same-run generic `finally` checkpoint was removed. New curation,
+  improvement, and recovery checkpoint failures retain their exact subjects and
+  managed dirtiness until the next scheduled preflight.
+- Documentation and skill guidance now describe preflight timing, subject
+  preservation, validation order, and active-lease safety.
+
+### Verification
+
+- Focused Git/maintenance/integration/transcript/package suite: 84 tests passed
+  in 16.233s with `ResourceWarning` promoted to errors.
+- Full suite: 201 tests passed in 50.795s with `ResourceWarning` promoted to
+  errors.
+- `python3 -m compileall -q src tests` — exit 0.
+- `git diff --check` — exit 0.
+
+### Concerns
+
+- When a pre-existing lease blocks the early safe preflight, config/time must be
+  valid before configured stale-owner recovery can acquire the lease. No Git
+  action occurs in that blocked state, which favors transaction safety over
+  checkpointing invalid configuration concurrently.
