@@ -95,6 +95,28 @@ class ProfileLeaseTests(unittest.TestCase):
             self.assertEqual(1, outcomes.count("acquired"), outcomes)
             self.assertEqual(7, outcomes.count("busy"), outcomes)
 
+    def test_elapsed_timeout_never_steals_a_lease_from_its_live_owner(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory) / "profile"
+            init_profile(root, "Work")
+            first = ProfileLease(root, owner={"worker": "first"}, stale_timeout=0.01)
+            first.acquire()
+            try:
+                owner_path = root / ".harness/state/curation.lock/owner.json"
+                metadata = json.loads(owner_path.read_text(encoding="utf-8"))
+                metadata["acquired_at"] = (
+                    datetime.now(timezone.utc) - timedelta(hours=1)
+                ).isoformat().replace("+00:00", "Z")
+                owner_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+                with self.assertRaises(LeaseBusyError):
+                    with ProfileLease(
+                        root, owner={"worker": "second"}, stale_timeout=0.01
+                    ):
+                        self.fail("a live owner was displaced after its timestamp elapsed")
+            finally:
+                first.release()
+
 
 if __name__ == "__main__":
     unittest.main()

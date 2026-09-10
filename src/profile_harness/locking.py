@@ -11,7 +11,7 @@ import shutil
 import socket
 import time
 import uuid
-from typing import Any
+from typing import Any, BinaryIO
 
 from .fs import atomic_write_text
 
@@ -57,6 +57,7 @@ class ProfileLease:
             "hostname": socket.gethostname(),
         }
         self._acquired = False
+        self._guard: BinaryIO | None = None
 
     def _metadata(self) -> dict[str, Any]:
         return {
@@ -84,10 +85,19 @@ class ProfileLease:
         return age > self.stale_timeout
 
     def acquire(self) -> "ProfileLease":
+        if self._acquired:
+            raise RuntimeError("curation lease is already acquired by this owner")
         self.path.parent.mkdir(parents=True, exist_ok=True)
         guard_path = self.path.parent / "curation.guard"
-        with guard_path.open("a+b") as guard:
-            fcntl.flock(guard.fileno(), fcntl.LOCK_EX)
+        guard = guard_path.open("a+b")
+        try:
+            fcntl.flock(guard.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            guard.close()
+            metadata = self._existing_metadata()
+            owner = json.dumps(metadata.get("owner", {}), sort_keys=True)
+            raise LeaseBusyError(f"curation lease is live: {owner}") from error
+        try:
             try:
                 self.path.mkdir()
             except FileExistsError:
@@ -109,14 +119,18 @@ class ProfileLease:
                 shutil.rmtree(self.path, ignore_errors=True)
                 raise
             self._acquired = True
+            self._guard = guard
             return self
+        except BaseException:
+            fcntl.flock(guard.fileno(), fcntl.LOCK_UN)
+            guard.close()
+            raise
 
     def release(self) -> None:
         if not self._acquired:
             return
-        guard_path = self.path.parent / "curation.guard"
-        with guard_path.open("a+b") as guard:
-            fcntl.flock(guard.fileno(), fcntl.LOCK_EX)
+        guard = self._guard
+        try:
             metadata = self._existing_metadata()
             if metadata.get("token") == self.token:
                 try:
@@ -124,7 +138,12 @@ class ProfileLease:
                     self.path.rmdir()
                 except FileNotFoundError:
                     pass
-        self._acquired = False
+        finally:
+            self._acquired = False
+            self._guard = None
+            if guard is not None:
+                fcntl.flock(guard.fileno(), fcntl.LOCK_UN)
+                guard.close()
 
     def __enter__(self) -> "ProfileLease":
         return self.acquire()
