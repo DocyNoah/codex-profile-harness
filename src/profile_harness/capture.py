@@ -14,6 +14,7 @@ from typing import Any
 
 from .config import DEFAULT_MAX_TEXT_CHARS, find_profile_root, load_profile_config
 from .fs import require_safe_path
+from .transcript import prepare_transcript_delta, publish_cursor
 
 
 MAX_INPUT_BYTES = 1024 * 1024
@@ -195,6 +196,15 @@ def capture_event(payload: dict, cwd: Path | None = None) -> CaptureResult:
 
     maximum = _max_text_chars(profile_root)
     normalized = _normalized_payload(payload, maximum)
+    transcript = prepare_transcript_delta(
+        profile_root,
+        session_id.strip(),
+        payload.get("transcript_path"),
+        lambda text: _normalize_text(text, maximum),
+    )
+    normalized.update(transcript.payload)
+    if transcript.payload.get("capture_quality") == "partial":
+        normalized.pop("transcript_path", None)
     discriminator_value = payload.get("turn_id") or payload.get("reason") or ""
     if not isinstance(discriminator_value, str):
         raise CaptureError("turn_id and reason must be strings")
@@ -221,6 +231,11 @@ def capture_event(payload: dict, cwd: Path | None = None) -> CaptureResult:
     }
     content = json.dumps(receipt, ensure_ascii=False, sort_keys=True, indent=2) + "\n"
     created = _publish_exclusively(receipt_path, content)
+    if created:
+        try:
+            publish_cursor(transcript, profile_root)
+        except (OSError, ValueError):
+            pass
     return CaptureResult(
         True,
         "captured" if created else "duplicate",

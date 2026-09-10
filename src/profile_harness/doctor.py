@@ -47,6 +47,7 @@ REQUIRED_PLUGIN_FILES = (
     "skills/profile-harness/SKILL.md",
     "scripts/build_local_marketplace.py",
     "src/profile_harness/packaging.py",
+    "src/profile_harness/transcript.py",
     "templates/prompts/curate.md",
     "templates/profile/AGENTS.md",
     "templates/profile/CONTEXT.md",
@@ -271,13 +272,13 @@ def _validate_receipt_schema(value: object) -> None:
         label="receipt.cwd",
     )
     payload = properties.get("payload", {})
-    expected_payload = {"cwd", "last_assistant_message", "permission_mode", "reason", "session_id", "stop_hook_active", "transcript_path", "turn_id", "extra_keys"}
+    expected_payload = {"cwd", "last_assistant_message", "permission_mode", "reason", "session_id", "stop_hook_active", "transcript_path", "turn_id", "extra_keys", "user_messages", "assistant_messages", "transcript_digest", "capture_quality"}
     if (payload.get("type") != "object" or payload.get("additionalProperties") is not False
             or payload.get("required") != ["session_id"]
             or set(payload.get("properties", {})) != expected_payload):
         raise ValueError("receipt payload schema must match normalized runtime fields")
     payload_properties = payload["properties"]
-    for field in expected_payload - {"stop_hook_active", "extra_keys", "session_id"}:
+    for field in {"cwd", "last_assistant_message", "permission_mode", "reason", "transcript_path", "turn_id"}:
         _string_contract(
             payload_properties[field],
             minimum=None,
@@ -305,6 +306,31 @@ def _validate_receipt_schema(value: object) -> None:
         maximum=MAX_RECEIPT_BYTES,
         label="receipt.payload.extra_keys.items",
     )
+    for field in ("user_messages", "assistant_messages"):
+        messages = _array_contract(
+            payload_properties[field],
+            maximum=8,
+            unique=False,
+            label=f"receipt.payload.{field}",
+        )
+        _string_contract(
+            messages,
+            minimum=None,
+            maximum=MAX_RECEIPT_BYTES,
+            label=f"receipt.payload.{field}.items",
+        )
+    _string_contract(
+        payload_properties["transcript_digest"],
+        minimum=64,
+        maximum=64,
+        pattern="^[a-f0-9]{64}$",
+        label="receipt.payload.transcript_digest",
+    )
+    if payload_properties["capture_quality"] != {
+        "type": "string",
+        "enum": ["complete", "partial"],
+    }:
+        raise ValueError("receipt.payload.capture_quality is weakened")
 
 
 def _exact_integer(schema: dict, field: str, expected: int, label: str) -> None:

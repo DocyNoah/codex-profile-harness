@@ -35,6 +35,7 @@ PACKAGED_FILES = (
     "src/profile_harness/locking.py",
     "src/profile_harness/packaging.py",
     "src/profile_harness/runner.py",
+    "src/profile_harness/transcript.py",
     "templates/profile/AGENTS.md",
     "templates/profile/CONTEXT.md",
     "templates/profile/DASHBOARD.md",

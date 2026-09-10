@@ -47,7 +47,11 @@
         "stop_hook_active": {"type": "boolean"},
         "transcript_path": {"type": "string", "maxLength": 1048576},
         "turn_id": {"type": "string", "maxLength": 1048576},
-        "extra_keys": {"type": "array", "maxItems": 10000, "items": {"type": "string", "maxLength": 1048576}}
+        "extra_keys": {"type": "array", "maxItems": 10000, "items": {"type": "string", "maxLength": 1048576}},
+        "user_messages": {"type": "array", "maxItems": 8, "items": {"type": "string", "maxLength": 1048576}},
+        "assistant_messages": {"type": "array", "maxItems": 8, "items": {"type": "string", "maxLength": 1048576}},
+        "transcript_digest": {"type": "string", "minLength": 64, "maxLength": 64, "pattern": "^[a-f0-9]{64}$"},
+        "capture_quality": {"type": "string", "enum": ["complete", "partial"]}
       },
       "additionalProperties": false
     }

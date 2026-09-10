@@ -182,13 +182,20 @@ def _valid_receipt(path: Path, *, expected_id: str | None = None) -> dict[str, A
     ):
         raise CurationError("receipt cwd is required")
     payload = receipt.get("payload")
-    allowed_payload = {"cwd", "last_assistant_message", "permission_mode", "reason", "session_id", "stop_hook_active", "transcript_path", "turn_id", "extra_keys"}
-    text_payload = allowed_payload - {"stop_hook_active", "extra_keys"}
+    allowed_payload = {"cwd", "last_assistant_message", "permission_mode", "reason", "session_id", "stop_hook_active", "transcript_path", "turn_id", "extra_keys", "user_messages", "assistant_messages", "transcript_digest", "capture_quality"}
+    text_payload = {"cwd", "last_assistant_message", "permission_mode", "reason", "session_id", "transcript_path", "turn_id"}
     if (not isinstance(payload, dict) or set(payload) - allowed_payload
             or not isinstance(receipt["payload"].get("session_id"), str)
             or not receipt["payload"]["session_id"].strip()
             or any(key in payload and (not isinstance(payload[key], str) or len(payload[key]) > MAX_RECEIPT_BYTES) for key in text_payload)
             or ("stop_hook_active" in payload and not isinstance(payload["stop_hook_active"], bool))
+            or ("capture_quality" in payload and payload["capture_quality"] not in {"complete", "partial"})
+            or ("transcript_digest" in payload and (not isinstance(payload["transcript_digest"], str)
+                or re.fullmatch(r"[a-f0-9]{64}", payload["transcript_digest"]) is None))
+            or any(field in payload and (not isinstance(payload[field], list)
+                or len(payload[field]) > 8
+                or any(not isinstance(item, str) or len(item) > MAX_RECEIPT_BYTES for item in payload[field]))
+                for field in ("user_messages", "assistant_messages"))
             or ("extra_keys" in payload and (not isinstance(payload["extra_keys"], list)
                 or len(payload["extra_keys"]) > 10_000
                 or any(not isinstance(item, str) or len(item) > MAX_RECEIPT_BYTES for item in payload["extra_keys"])) )):
