@@ -55,3 +55,62 @@ implemented.
   history from accidental edits, but not from disk loss.
 - Public documentation, versioning, CI, and publication remain deferred to Task
   4 as required.
+
+## Fix round 1
+
+### Commit
+
+- `89e902784cf80786a2701af94a0e7da1698f1248` — `fix: harden profile git execution`
+
+### RED evidence
+
+- Seven focused security tests produced eight expected failures before the fix:
+  hostile `GIT_*` variables redirected Git; real post-index/filter/fsmonitor
+  programs executed; allowlist-root repositories and dangling links were not
+  diagnosed; failure state was written after unlocking; read-only inspection
+  changed the index mtime; file-shaped forbidden rules matched backup names;
+  and the Git runner had no hard output bound.
+- The disabled-hooks-directory test then proved that merely pointing Git at a
+  fixed directory was insufficient: a planted hook in that directory executed
+  and the checkpoint committed.
+- Direct ordering spies passed for registry, curation, and recovery, but the
+  improvement spy failed because its checkpoint observed both runtime prompt
+  and result files before their cleanup.
+
+### Behavior
+
+- Every Git process now discards inherited `GIT_*` and askpass injection,
+  supplies the validated profile `.git` and work tree explicitly, disables
+  system/global config injection, and uses a command-scoped profile identity.
+- All Git commands override hooks, fsmonitor, signing, and configured clean,
+  smudge, and process filters. Mutating operations require a verified empty
+  profile-local hooks directory; add and commit therefore execute no repository
+  hooks or configured content processors.
+- Git stdout and stderr share a 16 KiB hard capture ceiling. The process is
+  terminated on overflow or timeout, and all pipes are closed. Read-only
+  commands set `GIT_OPTIONAL_LOCKS=0` and leave the real index mtime unchanged.
+- Managed directory roots containing `.git`, dangling links, and symlinked path
+  components are rejected. Nested repositories below valid roots remain
+  pruned. Forbidden files use exact matching while forbidden directories use
+  component-safe prefixes.
+- Failure diagnostics are created and cleared while the Git guard remains held;
+  mixed thread/subprocess failure-then-success coverage proves an older failure
+  cannot overwrite later success.
+- Real ref-lock commit failure is retryable, hook capture remains successful
+  while profile Git is unavailable, and direct spies verify registry, curation,
+  improvement, and recovery invoke checkpoints only after their durable state
+  and cleanup boundaries.
+
+### Verification
+
+- Focused security/integration suite: 30 tests passed in 8.743s with
+  `ResourceWarning` promoted to errors.
+- Full suite: 150 tests passed in 38.530s with `ResourceWarning` promoted to
+  errors.
+- `python3 -m compileall -q src tests` — exit 0.
+- `git diff --check` — exit 0.
+
+### Concerns
+
+- No new concerns. Missing remotes remain intentionally warning-only, and Task
+  4 public-release work remains untouched.
