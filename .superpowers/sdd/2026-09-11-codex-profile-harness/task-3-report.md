@@ -194,3 +194,205 @@ cache after verification.
 - The library-level primitives expect a coordinating caller to hold
   `ProfileLease`; all public CLI curation paths do so. Direct library consumers
   must preserve that contract.
+
+## Review fixes: transaction boundary hardening
+
+Review fix commit SHA: `acb1465648040767ad73afb048e9d0a2c3520641`
+
+The review identified one critical symlink escape and three important
+transaction/input-integrity issues. All four were reproduced with tests before
+their fixes.
+
+### Critical: exact target scope and symlink rejection
+
+Root cause: the transaction writer called `Path.resolve()` on a model-selected
+fixed destination. An existing `STATUS.md` symlink therefore changed the actual
+write target to its referent. Directory links could similarly redirect locally
+derived profile-memory and proposal filenames.
+
+RED command:
+
+```text
+PYTHONPYCACHEPREFIX=/private/tmp/task3-review-symlink-red \
+  python3 -m unittest \
+  tests.test_curation.CurationTests.test_repo_fixed_file_symlink_cannot_overwrite_profile_identity \
+  tests.test_curation.CurationTests.test_profile_memory_directory_symlink_cannot_escape_its_exact_scope -v
+```
+
+Observed:
+
+```text
+AssertionError: CurationError not raised
+Ran 2 tests
+FAILED (failures=2)
+```
+
+Fix: every action target is now checked lexically against its exact allowed
+directory, must be a direct child, must resolve back into that exact directory,
+and may not contain a symlink in any component. Writes use the validated lexical
+path, so they never follow an existing destination link.
+
+GREEN result:
+
+```text
+Ran 2 tests in 0.027s
+OK
+```
+
+### Important: atomic rollback restoration
+
+Root cause: normal writes were atomic, but rollback restored snapshots with
+`shutil.copy2` and the journal with `Path.write_bytes`, directly truncating the
+destination. A read-only journal reproduced the unsafe direct-open path.
+
+RED command:
+
+```text
+PYTHONPYCACHEPREFIX=/private/tmp/task3-review-rollback-red \
+  python3 -m unittest \
+  tests.test_curation.CurationTests.test_rollback_atomically_replaces_a_read_only_journal_head -v
+```
+
+Observed:
+
+```text
+RuntimeError: injected write failure
+During handling of the above exception, another exception occurred:
+PermissionError: [Errno 13] Permission denied: '.../curation.jsonl'
+FAILED (errors=1)
+```
+
+Fix: added `atomic_write_bytes`, which writes a same-directory temporary file,
+flushes and `fsync`s it, then publishes with `os.replace`. Both snapshot targets
+and journal-head bytes now use that path during rollback; original modes are
+restored after content publication.
+
+GREEN result:
+
+```text
+Ran 2 tests in 0.032s
+OK
+```
+
+### Important: complete batch-manifest integrity
+
+Root cause: `_read_batch` checked only that listed files existed. It did not bind
+the manifest batch ID to its directory, reject duplicate IDs, or compare the
+manifest set with every actual processing receipt. An extra receipt could be
+silently deleted by successful batch cleanup.
+
+RED command:
+
+```text
+PYTHONPYCACHEPREFIX=/private/tmp/task3-review-manifest-red \
+  python3 -m unittest \
+  tests.test_curation.CurationTests.test_apply_rejects_manifest_batch_id_mismatch_before_writes \
+  tests.test_curation.CurationTests.test_apply_rejects_duplicate_manifest_receipt_ids_before_writes \
+  tests.test_curation.CurationTests.test_apply_rejects_and_returns_unaccounted_processing_receipts -v
+```
+
+Observed:
+
+```text
+AssertionError: CurationError not raised
+FileNotFoundError: .../one.json -> .../one.<batch>.json
+AssertionError: CurationError not raised
+Ran 3 tests
+FAILED (failures=2, errors=1)
+```
+
+An additional RED proved an unsafe receipt ID was returned to inbox after the
+manifest rejected it:
+
+```text
+AssertionError: True is not false
+Ran 1 test
+FAILED (failures=1)
+```
+
+Fix: manifest batch IDs must match their directory; IDs are safe, bounded, and
+unique; and the manifest set must exactly equal the actual processing JSON
+receipt set. Unaccounted valid receipts return to inbox, while invalid or unsafe
+ones go to dead-letter with a reason.
+
+GREEN results:
+
+```text
+Ran 3 tests in 0.040s
+OK
+Ran 1 test in 0.015s
+OK
+```
+
+### Important: bounded result input and schema shapes
+
+Root cause: `load_result` called `read_text()` before applying any file limit,
+and source/supersedes arrays plus identifier strings lacked explicit limits in
+the manual validator and JSON Schema.
+
+RED command:
+
+```text
+PYTHONPYCACHEPREFIX=/private/tmp/task3-review-bounds-red \
+  python3 -m unittest \
+  tests.test_curation.CurationTests.test_result_file_and_action_arrays_have_hard_size_limits \
+  tests.test_curation.CurationTests.test_result_schema_bounds_every_array_and_string_shape -v
+```
+
+Observed:
+
+```text
+AssertionError: "size" does not match "curation result is invalid JSON: ..."
+KeyError: 'maxItems'
+Ran 2 tests
+FAILED (failures=1, errors=1)
+```
+
+Fix: result reads are capped at 1 MiB before UTF-8 decoding or JSON parsing;
+non-standard JSON constants remain rejected. Actions, source IDs, superseded ADR
+IDs, repository names, titles, content, and reasons now have explicit array or
+string limits in both the manual boundary and schema.
+
+GREEN result:
+
+```text
+Ran 2 tests in 0.001s
+OK
+```
+
+### Review-fix verification
+
+Focused command:
+
+```text
+PYTHONPYCACHEPREFIX=/private/tmp/task3-review-focused-green \
+  python3 -m unittest tests.test_curation tests.test_locking -v
+```
+
+Result:
+
+```text
+Ran 26 tests in 0.915s
+OK
+```
+
+Full verification commands:
+
+```text
+git diff --check
+PYTHONPYCACHEPREFIX=/private/tmp/task3-review-final-cache \
+  python3 -m py_compile src/profile_harness/*.py bin/profile-harness
+python3 -m json.tool schemas/curation-result.schema.json
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -v
+PYTHONDONTWRITEBYTECODE=1 python3 bin/profile-harness curate --help
+```
+
+Result:
+
+```text
+Ran 53 tests in 2.058s
+OK
+```
+
+All commands exited 0. No new marketplace or user configuration files were
+created or changed.
