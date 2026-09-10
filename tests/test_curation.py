@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from pathlib import Path
 import stat
 import subprocess
@@ -112,6 +113,71 @@ class CurationTests(unittest.TestCase):
             with self.subTest(action=action["type"]):
                 with self.assertRaises(CurationError):
                     validate_actions({"actions": [action]}, allowed_ids, {"api"})
+
+    def test_result_file_and_action_arrays_have_hard_size_limits(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            oversized = Path(temporary_directory) / "result.json"
+            oversized.write_bytes(b" " * 1_048_577)
+            from profile_harness.curation import load_result
+
+            with self.assertRaisesRegex(CurationError, "size"):
+                load_result(oversized)
+
+        sources = [f"receipt-{index}" for index in range(101)]
+        with self.assertRaisesRegex(CurationError, "bounded"):
+            validate_actions(
+                {
+                    "actions": [
+                        {
+                            "type": "profile_proposal",
+                            "title": "Proposal",
+                            "content": "Content",
+                            "source_receipt_ids": sources,
+                        }
+                    ]
+                },
+                set(sources),
+                set(),
+            )
+        with self.assertRaisesRegex(CurationError, "bounded"):
+            validate_actions(
+                {
+                    "actions": [
+                        {
+                            "type": "repo_decision",
+                            "repository": "api",
+                            "title": "Decision",
+                            "content": "Content",
+                            "supersedes": [str(index) for index in range(101)],
+                            "source_receipt_ids": ["one"],
+                        }
+                    ]
+                },
+                {"one"},
+                {"api"},
+            )
+
+    def test_result_schema_bounds_every_array_and_string_shape(self) -> None:
+        schema = json.loads(
+            (ROOT / "schemas/curation-result.schema.json").read_text(encoding="utf-8")
+        )
+        definitions = schema["$defs"]
+
+        self.assertEqual(100, schema["properties"]["actions"]["maxItems"])
+        self.assertEqual(100, definitions["sources"]["maxItems"])
+        self.assertEqual(128, definitions["sources"]["items"]["maxLength"])
+        self.assertEqual(64000, definitions["content"]["maxLength"])
+        supersedes = definitions["repoDecision"]["properties"]["supersedes"]
+        self.assertEqual(100, supersedes["maxItems"])
+        self.assertEqual(20, supersedes["items"]["maxLength"])
+        for definition in ("repoStatus", "repoTasks", "repoDecision"):
+            self.assertEqual(
+                128,
+                definitions[definition]["properties"]["repository"]["maxLength"],
+            )
+        discard_sources = definitions["discard"]["properties"]["source_receipt_ids"]
+        self.assertEqual(100, discard_sources["maxItems"])
+        self.assertEqual(128, discard_sources["items"]["maxLength"])
 
     def test_every_non_discard_action_requires_batch_source_provenance(self) -> None:
         base = {
@@ -320,6 +386,36 @@ class CurationTests(unittest.TestCase):
             snapshots = root / ".harness/memory/archive/snapshots" / batch.batch_id
             self.assertTrue(snapshots.is_dir())
 
+    def test_rollback_atomically_replaces_a_read_only_journal_head(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root, api, _ = self.make_profile(Path(temporary_directory))
+            self.add_receipt(root, "one")
+            batch = prepare_curation(root)
+            journal = root / ".harness/memory/journal/curation.jsonl"
+            append_entry(journal, {"batch_id": "before", "actions": 0})
+            journal_before = journal.read_bytes()
+            journal.chmod(0o444)
+
+            with self.assertRaisesRegex(RuntimeError, "injected"):
+                apply_actions(
+                    root,
+                    batch.batch_id,
+                    {
+                        "actions": [
+                            {
+                                "type": "repo_status",
+                                "repository": "api",
+                                "content": "# Changed",
+                                "source_receipt_ids": ["one"],
+                            }
+                        ]
+                    },
+                    fail_after_writes=1,
+                )
+
+            self.assertEqual(journal_before, journal.read_bytes())
+            self.assertIn("No current status", (api / "STATUS.md").read_text())
+
     def test_failed_apply_dead_letters_a_receipt_tampered_after_preparation(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root, _, _ = self.make_profile(Path(temporary_directory))
@@ -333,6 +429,84 @@ class CurationTests(unittest.TestCase):
             self.assertFalse((root / ".harness/memory/inbox/one.json").exists())
             self.assertTrue(
                 list((root / ".harness/memory/archive/dead-letter").glob("one*.json"))
+            )
+
+    def test_apply_rejects_manifest_batch_id_mismatch_before_writes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root, _, _ = self.make_profile(Path(temporary_directory))
+            self.add_receipt(root, "one")
+            batch = prepare_curation(root)
+            manifest_path = batch.path / "batch.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["batch_id"] = "different"
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+            with self.assertRaisesRegex(CurationError, "batch ID"):
+                apply_actions(root, batch.batch_id, {"actions": []})
+
+            self.assertTrue((root / ".harness/memory/inbox/one.json").exists())
+
+    def test_apply_rejects_duplicate_manifest_receipt_ids_before_writes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root, _, _ = self.make_profile(Path(temporary_directory))
+            self.add_receipt(root, "one")
+            batch = prepare_curation(root)
+            manifest_path = batch.path / "batch.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["receipt_ids"] = ["one", "one"]
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+            with self.assertRaisesRegex(CurationError, "unique"):
+                apply_actions(root, batch.batch_id, {"actions": []})
+
+            self.assertTrue((root / ".harness/memory/inbox/one.json").exists())
+
+    def test_apply_rejects_and_returns_unaccounted_processing_receipts(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root, _, _ = self.make_profile(Path(temporary_directory))
+            self.add_receipt(root, "one")
+            batch = prepare_curation(root)
+            extra = {
+                "id": "two",
+                "event": "Stop",
+                "captured_at": "2026-09-11T00:00:00Z",
+                "cwd": str(root),
+                "payload": {"session_id": "session"},
+            }
+            (batch.path / "two.json").write_text(json.dumps(extra), encoding="utf-8")
+
+            with self.assertRaisesRegex(CurationError, "receipt set"):
+                apply_actions(root, batch.batch_id, {"actions": []})
+
+            self.assertTrue((root / ".harness/memory/inbox/one.json").exists())
+            self.assertTrue((root / ".harness/memory/inbox/two.json").exists())
+
+    def test_unsafe_processing_receipt_id_is_dead_lettered_not_returned(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root, _, _ = self.make_profile(Path(temporary_directory))
+            self.add_receipt(root, "one")
+            batch = prepare_curation(root)
+            receipt_path = batch.path / "one.json"
+            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+            receipt["id"] = "unsafe id"
+            unsafe_path = batch.path / "unsafe id.json"
+            receipt_path.unlink()
+            unsafe_path.write_text(json.dumps(receipt), encoding="utf-8")
+            manifest_path = batch.path / "batch.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["receipt_ids"] = ["unsafe id"]
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+            with self.assertRaises(CurationError):
+                apply_actions(root, batch.batch_id, {"actions": []})
+
+            self.assertFalse((root / ".harness/memory/inbox/unsafe id.json").exists())
+            self.assertTrue(
+                list(
+                    (root / ".harness/memory/archive/dead-letter").glob(
+                        "unsafe id*.json"
+                    )
+                )
             )
 
     def test_apply_rejects_a_batch_id_that_could_escape_processing(self) -> None:
@@ -369,6 +543,64 @@ class CurationTests(unittest.TestCase):
                 )
 
             self.assertFalse((root / "STATUS.md").exists())
+            self.assertTrue((root / ".harness/memory/inbox/one.json").exists())
+
+    def test_repo_fixed_file_symlink_cannot_overwrite_profile_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root, api, _ = self.make_profile(Path(temporary_directory))
+            self.add_receipt(root, "one")
+            batch = prepare_curation(root)
+            identity = root / "IDENTITY.md"
+            original_identity = identity.read_bytes()
+            (api / "STATUS.md").unlink()
+            (api / "STATUS.md").symlink_to(identity)
+
+            with self.assertRaisesRegex(CurationError, "symlink"):
+                apply_actions(
+                    root,
+                    batch.batch_id,
+                    {
+                        "actions": [
+                            {
+                                "type": "repo_status",
+                                "repository": "api",
+                                "content": "compromised",
+                                "source_receipt_ids": ["one"],
+                            }
+                        ]
+                    },
+                )
+
+            self.assertEqual(original_identity, identity.read_bytes())
+            self.assertTrue((root / ".harness/memory/inbox/one.json").exists())
+
+    def test_profile_memory_directory_symlink_cannot_escape_its_exact_scope(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root, _, _ = self.make_profile(Path(temporary_directory))
+            self.add_receipt(root, "one")
+            batch = prepare_curation(root)
+            semantic = root / ".harness/memory/semantic"
+            semantic.rmdir()
+            os.symlink(root, semantic, target_is_directory=True)
+
+            with self.assertRaisesRegex(CurationError, "symlink"):
+                apply_actions(
+                    root,
+                    batch.batch_id,
+                    {
+                        "actions": [
+                            {
+                                "type": "profile_memory",
+                                "kind": "semantic",
+                                "title": "Escaped Memory",
+                                "content": "compromised",
+                                "source_receipt_ids": ["one"],
+                            }
+                        ]
+                    },
+                )
+
+            self.assertFalse((root / "escaped-memory.md").exists())
             self.assertTrue((root / ".harness/memory/inbox/one.json").exists())
 
 

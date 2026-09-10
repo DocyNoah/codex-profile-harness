@@ -35,6 +35,24 @@ def atomic_write_text(path: Path, content: str) -> None:
         raise
 
 
+def atomic_write_bytes(path: Path, content: bytes) -> None:
+    """Atomically replace *path* with flushed same-directory bytes."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        dir=path.parent, prefix=f".{path.name}.", suffix=".tmp"
+    )
+    temporary_path = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, path)
+    except BaseException:
+        temporary_path.unlink(missing_ok=True)
+        raise
+
+
 def atomic_write_text_if_missing(path: Path, content: str) -> None:
     """Create state atomically when absent and leave existing state untouched."""
     exclusive_write_text(path, content)

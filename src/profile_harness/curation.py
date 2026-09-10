@@ -13,13 +13,16 @@ import uuid
 from typing import Any
 
 from .config import PLUGIN_ROOT, load_profile
-from .fs import atomic_write_text
+from .fs import atomic_write_bytes, atomic_write_text
 from .journal import append_entry
 
 
 MAX_ACTIONS = 100
+MAX_ARRAY_ITEMS = 100
 MAX_CONTENT_CHARS = 64_000
+MAX_IDENTIFIER_CHARS = 128
 MAX_PROMPT_CHARS = 500_000
+MAX_RESULT_BYTES = 1024 * 1024
 ACTION_TYPES = frozenset(
     {
         "profile_memory",
@@ -72,7 +75,12 @@ def _valid_receipt(path: Path) -> dict[str, Any]:
     }:
         raise CurationError("receipt must be an allowed JSON object")
     receipt_id = receipt.get("id")
-    if not isinstance(receipt_id, str) or not receipt_id or path.stem != receipt_id:
+    if (
+        not isinstance(receipt_id, str)
+        or _RECEIPT_ID.fullmatch(receipt_id) is None
+        or len(receipt_id) > MAX_IDENTIFIER_CHARS
+        or path.stem != receipt_id
+    ):
         raise CurationError("receipt ID must match its filename")
     if receipt.get("event") not in {"Stop", "SessionEnd"}:
         raise CurationError("receipt event is unsupported")
@@ -221,9 +229,14 @@ def validate_actions(
             raise CurationError(f"{action_type} contains missing or forbidden fields")
         sources = action.get("source_receipt_ids")
         if not isinstance(sources, list) or any(
-            not isinstance(item, str) for item in sources
+            not isinstance(item, str)
+            or not item
+            or len(item) > MAX_IDENTIFIER_CHARS
+            for item in sources
         ):
             raise CurationError("source receipt IDs must be an array of strings")
+        if len(sources) > MAX_ARRAY_ITEMS:
+            raise CurationError("source receipt IDs must be a bounded array")
         if action_type != "discard" and not sources:
             raise CurationError("non-discard actions require source receipt IDs")
         if len(sources) != len(set(sources)) or not set(sources) <= batch_receipt_ids:
@@ -240,14 +253,27 @@ def validate_actions(
             raise CurationError("profile memory kind must be semantic or procedural")
         if action_type.startswith("repo_"):
             repository = action.get("repository")
+            if (
+                not isinstance(repository, str)
+                or not repository
+                or len(repository) > MAX_IDENTIFIER_CHARS
+            ):
+                raise CurationError("repository name must be a bounded string")
             if repository not in registered_repositories:
                 raise CurationError("action references an unknown registered repository")
         if action_type == "repo_decision":
             supersedes = action.get("supersedes")
             if not isinstance(supersedes, list) or any(
-                not isinstance(value, str) or not value.isdigit() for value in supersedes
+                not isinstance(value, str)
+                or len(value) > 20
+                or not value.isdigit()
+                for value in supersedes
             ):
                 raise CurationError("supersedes must contain only numeric ADR IDs")
+            if len(supersedes) > MAX_ARRAY_ITEMS:
+                raise CurationError("supersedes must be a bounded array")
+            if len(supersedes) != len(set(supersedes)):
+                raise CurationError("supersedes must contain unique ADR IDs")
         validated.append(action)
     return tuple(validated)
 
@@ -267,25 +293,44 @@ def _read_batch(batch_path: Path) -> tuple[str, ...]:
         "batch_id", "receipt_ids", "created_at"
     }:
         raise CurationError("processing batch manifest has an invalid shape")
+    if manifest["batch_id"] != batch_path.name:
+        raise CurationError("processing manifest batch ID does not match its directory")
     ids = manifest.get("receipt_ids")
     if not isinstance(ids, list) or any(
         not isinstance(item, str) or _RECEIPT_ID.fullmatch(item) is None
         for item in ids
     ):
         raise CurationError("processing batch receipt IDs are invalid")
+    if len(ids) != len(set(ids)):
+        raise CurationError("processing batch receipt IDs must be unique")
+    actual_paths = {
+        path.stem: path
+        for path in batch_path.glob("*.json")
+        if path.name not in {"batch.json", "result.json"}
+    }
+    if set(ids) != set(actual_paths):
+        raise CurationError("processing manifest receipt set does not match its files")
     for item in ids:
-        receipt_path = batch_path / f"{item}.json"
-        if not receipt_path.is_file():
-            raise CurationError("processing batch is missing a claimed receipt")
-        _valid_receipt(receipt_path)
+        _valid_receipt(actual_paths[item])
     return tuple(ids)
 
 
 def load_result(path: Path) -> dict[str, Any]:
     """Load a strict JSON result object for deterministic application."""
     try:
-        result = _strict_json(Path(path))
-    except (OSError, ValueError, json.JSONDecodeError) as error:
+        with Path(path).open("rb") as handle:
+            raw = handle.read(MAX_RESULT_BYTES + 1)
+        if len(raw) > MAX_RESULT_BYTES:
+            raise CurationError("curation result exceeds the maximum file size")
+        text = raw.decode("utf-8")
+
+        def reject(value: str) -> None:
+            raise ValueError(f"non-standard JSON constant: {value}")
+
+        result = json.loads(text, parse_constant=reject)
+    except CurationError:
+        raise
+    except (OSError, UnicodeDecodeError, ValueError, json.JSONDecodeError) as error:
         raise CurationError(f"curation result is invalid JSON: {error}") from error
     if not isinstance(result, dict):
         raise CurationError("curation result must be a JSON object")
@@ -327,8 +372,27 @@ def _decision_index(active: dict[str, tuple[str, str]]) -> str:
 
 
 def _snapshot_path(root: Path, snapshot_root: Path, target: Path) -> Path:
-    relative = target.resolve().relative_to(root)
+    relative = target.relative_to(root)
     return snapshot_root / relative
+
+
+def _require_safe_target(root: Path, scope: Path, target: Path) -> Path:
+    """Reject link traversal and require one fixed file below the exact scope."""
+    try:
+        scope_relative = scope.relative_to(root)
+        target_relative = target.relative_to(scope)
+    except ValueError as error:
+        raise CurationError("curation target escapes its exact allowed scope") from error
+    if len(target_relative.parts) != 1:
+        raise CurationError("curation target escapes its exact allowed scope")
+    current = root
+    for component in (*scope_relative.parts, *target_relative.parts):
+        current = current / component
+        if current.is_symlink():
+            raise CurationError("curation target path contains a symlink")
+    if scope.resolve() != scope or target.resolve(strict=False).parent != scope:
+        raise CurationError("curation target escapes its exact allowed scope")
+    return target
 
 
 def apply_actions(
@@ -349,6 +413,7 @@ def apply_actions(
     changed: list[Path] = []
     journal = profile.root / ".harness/memory/journal/curation.jsonl"
     journal_before = journal.read_bytes() if journal.exists() else None
+    journal_before_mode = journal.stat().st_mode if journal.exists() else None
     snapshot_root = profile.root / ".harness/memory/archive/snapshots" / batch_id
     repositories = {
         repository.name: repository.path for repository in profile.repositories
@@ -356,20 +421,19 @@ def apply_actions(
     writes = 0
     archived_receipts: list[tuple[Path, Path]] = []
 
-    def write(target: Path, content: str) -> None:
+    def write(target: Path, content: str, allowed_scope: Path) -> None:
         nonlocal writes
-        resolved = target.resolve()
-        resolved.relative_to(profile.root)
-        if resolved not in snapshots and resolved not in created:
-            if resolved.exists():
-                snapshot = _snapshot_path(profile.root, snapshot_root, resolved)
+        safe_target = _require_safe_target(profile.root, allowed_scope, target)
+        if safe_target not in snapshots and safe_target not in created:
+            if safe_target.exists():
+                snapshot = _snapshot_path(profile.root, snapshot_root, safe_target)
                 snapshot.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(resolved, snapshot)
-                snapshots[resolved] = snapshot
+                shutil.copy2(safe_target, snapshot)
+                snapshots[safe_target] = snapshot
             else:
-                created.add(resolved)
-        atomic_write_text(resolved, content)
-        changed.append(resolved)
+                created.add(safe_target)
+        atomic_write_text(safe_target, content)
+        changed.append(safe_target)
         writes += 1
         if fail_after_writes is not None and writes >= fail_after_writes:
             raise RuntimeError("injected write failure")
@@ -401,6 +465,7 @@ def apply_actions(
                 write(
                     target,
                     f"# {action['title'].strip()}\n\n{action['content'].strip()}\n",
+                    target.parent,
                 )
             elif action_type == "profile_proposal":
                 target = (
@@ -410,10 +475,12 @@ def apply_actions(
                 write(
                     target,
                     f"# {action['title'].strip()}\n\n{action['content'].strip()}\n",
+                    target.parent,
                 )
             elif action_type in {"repo_status", "repo_tasks"}:
                 name = "STATUS.md" if action_type == "repo_status" else "TASKS.md"
-                write(repositories[action["repository"]] / name, action["content"])
+                repository = repositories[action["repository"]]
+                write(repository / name, action["content"], repository)
             elif action_type == "repo_decision":
                 repository = repositories[action["repository"]]
                 number = _decision_number(repository)
@@ -424,12 +491,12 @@ def apply_actions(
                     f"# ADR-{number_text}: {action['title'].strip()}\n\n"
                     f"{action['content'].strip()}\n"
                 )
-                write(adr, body)
+                write(adr, body, repository / "docs/decisions")
                 active = _active_decisions(repository)
                 for superseded in action["supersedes"]:
                     active.pop(f"{int(superseded):04d}", None)
                 active[number_text] = (filename, action["title"].strip())
-                write(repository / "DECISIONS.md", _decision_index(active))
+                write(repository / "DECISIONS.md", _decision_index(active), repository)
 
         journal_entry = append_entry(
             journal,
@@ -461,12 +528,15 @@ def apply_actions(
             target.unlink(missing_ok=True)
         for target, snapshot in snapshots.items():
             target.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(snapshot, target)
+            atomic_write_bytes(target, snapshot.read_bytes())
+            target.chmod(snapshot.stat().st_mode)
         if journal_before is None:
             journal.unlink(missing_ok=True)
         else:
             journal.parent.mkdir(parents=True, exist_ok=True)
-            journal.write_bytes(journal_before)
+            atomic_write_bytes(journal, journal_before)
+            if journal_before_mode is not None:
+                journal.chmod(journal_before_mode)
         _return_receipts(profile.root, batch_path)
         raise
 
