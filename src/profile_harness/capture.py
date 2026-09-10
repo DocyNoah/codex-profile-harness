@@ -54,6 +54,12 @@ _KNOWN_TOKEN = re.compile(
     r"\b(?:ghp_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|"
     r"sk-[A-Za-z0-9_-]{16,}|xox[baprs]-[A-Za-z0-9-]{16,})\b"
 )
+_TRANSCRIPT_EVIDENCE_FIELDS = (
+    "user_messages",
+    "assistant_messages",
+    "transcript_digest",
+    "capture_quality",
+)
 
 
 class CaptureError(ValueError):
@@ -170,6 +176,33 @@ def _publish_exclusively(path: Path, content: str) -> bool:
         temporary_path.unlink(missing_ok=True)
 
 
+def _duplicate_published_same_transcript(
+    receipt_path: Path, transcript_payload: dict[str, object]
+) -> bool:
+    """Confirm a duplicate receipt already published this exact delta."""
+    if any(field not in transcript_payload for field in _TRANSCRIPT_EVIDENCE_FIELDS):
+        return False
+    try:
+        if receipt_path.is_symlink() or not receipt_path.is_file():
+            return False
+        with receipt_path.open("rb") as handle:
+            raw = handle.read(MAX_INPUT_BYTES + 1)
+        if len(raw) > MAX_INPUT_BYTES:
+            return False
+
+        def reject_constant(value: str) -> None:
+            raise ValueError(f"non-standard JSON constant: {value}")
+
+        receipt = json.loads(raw.decode("utf-8"), parse_constant=reject_constant)
+    except (OSError, UnicodeDecodeError, ValueError, json.JSONDecodeError):
+        return False
+    existing = receipt.get("payload") if isinstance(receipt, dict) else None
+    return isinstance(existing, dict) and all(
+        existing.get(field) == transcript_payload[field]
+        for field in _TRANSCRIPT_EVIDENCE_FIELDS
+    )
+
+
 def capture_event(payload: dict, cwd: Path | None = None) -> CaptureResult:
     """Validate and persist one immutable Stop or SessionEnd receipt."""
     if os.environ.get("PROFILE_HARNESS_CURATOR") == "1":
@@ -231,7 +264,12 @@ def capture_event(payload: dict, cwd: Path | None = None) -> CaptureResult:
     }
     content = json.dumps(receipt, ensure_ascii=False, sort_keys=True, indent=2) + "\n"
     created = _publish_exclusively(receipt_path, content)
-    if created:
+    cursor_evidence_published = created or (
+        transcript.cursor_path is not None
+        and transcript.cursor is not None
+        and _duplicate_published_same_transcript(receipt_path, transcript.payload)
+    )
+    if cursor_evidence_published:
         try:
             publish_cursor(transcript, profile_root)
         except (OSError, ValueError):

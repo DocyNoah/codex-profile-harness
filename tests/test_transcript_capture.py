@@ -229,17 +229,64 @@ class TranscriptCaptureTests(unittest.TestCase):
     def test_receipt_is_published_before_cursor_and_survives_cursor_failure(self) -> None:
         transcript = self.codex_home / "session.jsonl"
         transcript.write_bytes(jsonl(response_message("assistant", "published")))
+        inbox = self.root / ".harness/memory/inbox"
+        receipt_existed_at_cursor_attempt: list[bool] = []
+
+        def fail_cursor_write(path: Path, content: str) -> None:
+            receipts = list(inbox.glob("*.json"))
+            receipt_existed_at_cursor_attempt.append(
+                len(receipts) == 1
+                and json.loads(receipts[0].read_text())["payload"][
+                    "assistant_messages"
+                ]
+                == ["published"]
+            )
+            raise OSError("cursor failure detail")
 
         with mock.patch(
             "profile_harness.transcript.atomic_write_text",
-            side_effect=OSError("cursor failure detail"),
+            side_effect=fail_cursor_write,
         ):
             result = self.capture(transcript, "turn-1")
 
         self.assertEqual("captured", result.status)
+        self.assertEqual([True], receipt_existed_at_cursor_attempt)
         self.assertTrue(result.receipt_path.is_file())
         self.assertEqual([], self.cursors())
         self.assertNotIn("cursor failure detail", result.receipt_path.read_text())
+
+        redelivery = self.capture(transcript, "turn-1")
+        cursor = json.loads(self.cursors()[0].read_text(encoding="utf-8"))
+        next_stop = self.capture(transcript, "turn-2")
+        next_payload = self.receipt(next_stop)["payload"]
+
+        self.assertEqual("duplicate", redelivery.status)
+        self.assertEqual(transcript.stat().st_size, cursor["offset"])
+        self.assertEqual([], next_payload["user_messages"])
+        self.assertEqual([], next_payload["assistant_messages"])
+        self.assertEqual(
+            hashlib.sha256(b"").hexdigest(),
+            next_payload["transcript_digest"],
+        )
+
+    def test_duplicate_repair_never_advances_over_unpublished_evidence(self) -> None:
+        transcript = self.codex_home / "session.jsonl"
+        transcript.write_bytes(jsonl(response_message("assistant", "published")))
+        with mock.patch(
+            "profile_harness.transcript.atomic_write_text",
+            side_effect=OSError("cursor failure"),
+        ):
+            self.capture(transcript, "turn-1")
+        with transcript.open("ab") as handle:
+            handle.write(jsonl(response_message("user", "not published yet")))
+
+        duplicate = self.capture(transcript, "turn-1")
+
+        self.assertEqual("duplicate", duplicate.status)
+        self.assertEqual([], self.cursors())
+        next_payload = self.receipt(self.capture(transcript, "turn-2"))["payload"]
+        self.assertEqual(["published"], next_payload["assistant_messages"])
+        self.assertEqual(["not published yet"], next_payload["user_messages"])
 
     def test_runtime_schema_and_doctor_enforce_optional_enrichment_contract(self) -> None:
         transcript = self.codex_home / "session.jsonl"
