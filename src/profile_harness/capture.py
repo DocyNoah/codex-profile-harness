@@ -12,6 +12,7 @@ import re
 import tempfile
 from typing import Any
 
+from . import fs as fs_operations
 from .config import DEFAULT_MAX_TEXT_CHARS, find_profile_root, load_profile_config
 from .fs import require_safe_path
 from .receipt import ReceiptValidationError, validate_receipt
@@ -147,6 +148,7 @@ def _receipt_id(
     session_id: str,
     discriminator: str,
     normalized_message: str,
+    transcript_payload: dict[str, Any] | None = None,
 ) -> str:
     message_digest = hashlib.sha256(normalized_message.encode("utf-8")).hexdigest()
     identity = json.dumps(
@@ -154,7 +156,21 @@ def _receipt_id(
         ensure_ascii=False,
         separators=(",", ":"),
     )
-    return hashlib.sha256(identity.encode("utf-8")).hexdigest()
+    legacy_id = hashlib.sha256(identity.encode("utf-8")).hexdigest()
+    if transcript_payload is None or any(
+        field not in transcript_payload for field in _TRANSCRIPT_EVIDENCE_FIELDS
+    ):
+        return legacy_id
+    evidence = {
+        field: transcript_payload[field] for field in _TRANSCRIPT_EVIDENCE_FIELDS
+    }
+    enriched_identity = json.dumps(
+        [legacy_id, evidence],
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(enriched_identity.encode("utf-8")).hexdigest()
 
 
 def _publish_exclusively(path: Path, content: str) -> bool:
@@ -171,7 +187,9 @@ def _publish_exclusively(path: Path, content: str) -> bool:
         try:
             os.link(temporary_path, path)
         except FileExistsError:
+            fs_operations.fsync_directory(path.parent)
             return False
+        fs_operations.fsync_directory(path.parent)
         return True
     finally:
         temporary_path.unlink(missing_ok=True)
@@ -256,12 +274,28 @@ def capture_event(payload: dict, cwd: Path | None = None) -> CaptureResult:
     discriminator_value = payload.get("turn_id") or payload.get("reason") or ""
     if not isinstance(discriminator_value, str):
         raise CaptureError("turn_id and reason must be strings")
-    receipt_id = _receipt_id(
+    delivery_digest = _receipt_id(
         event,
         session_id.strip(),
         discriminator_value.strip(),
         normalized.get("last_assistant_message", ""),
     )
+    receipt_id = _receipt_id(
+        event,
+        session_id.strip(),
+        discriminator_value.strip(),
+        normalized.get("last_assistant_message", ""),
+        normalized,
+    )
+    if (
+        not transcript.has_complete_delta
+        and transcript.previous_delivery_digest == delivery_digest
+        and transcript.previous_receipt_id is not None
+    ):
+        receipt_id = transcript.previous_receipt_id
+    if transcript.cursor is not None:
+        transcript.cursor["receipt_id"] = receipt_id
+        transcript.cursor["delivery_digest"] = delivery_digest
     receipt_path = profile_root / ".harness/memory/inbox" / f"{receipt_id}.json"
     try:
         require_safe_path(

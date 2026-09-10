@@ -15,9 +15,11 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from profile_harness.capture import capture_event  # noqa: E402
+from profile_harness import capture as capture_module  # noqa: E402
 from profile_harness.config import init_profile  # noqa: E402
 from profile_harness.curation import CurationError, _valid_receipt  # noqa: E402
 from profile_harness import doctor as doctor_module  # noqa: E402
+from profile_harness import fs as fs_module  # noqa: E402
 from profile_harness.packaging import build_local_marketplace  # noqa: E402
 
 
@@ -50,15 +52,23 @@ class TranscriptCaptureTests(unittest.TestCase):
         self.codex_home.mkdir()
         init_profile(self.root, "Work")
 
-    def capture(self, transcript: Path, turn: str, *, last: str = "fallback"):
+    def capture(
+        self,
+        transcript: Path,
+        turn: str | None,
+        *,
+        last: str = "fallback",
+        session: str = "session-one",
+    ):
         payload = {
             "hook_event_name": "Stop",
-            "session_id": "session-one",
-            "turn_id": turn,
+            "session_id": session,
             "cwd": str(self.root),
             "transcript_path": str(transcript),
             "last_assistant_message": last,
         }
+        if turn is not None:
+            payload["turn_id"] = turn
         with mock.patch.dict(os.environ, {"CODEX_HOME": str(self.codex_home)}):
             return capture_event(payload)
 
@@ -92,6 +102,110 @@ class TranscriptCaptureTests(unittest.TestCase):
         self.assertEqual(64, len(self.receipt(second)["payload"]["transcript_digest"]))
         cursor = json.loads(self.cursors()[0].read_text(encoding="utf-8"))
         self.assertEqual(transcript.stat().st_size, cursor["offset"])
+
+    def test_receipt_directory_fsync_precedes_cursor_replace(self) -> None:
+        transcript = self.codex_home / "ordered.jsonl"
+        transcript.write_bytes(jsonl(response_message("assistant", "ordered")))
+        inbox = self.root / ".harness/memory/inbox"
+        events: list[str] = []
+        real_link = capture_module.os.link
+        real_replace = fs_module.os.replace
+        real_directory_fsync = fs_module.fsync_directory
+
+        def observed_link(source: Path, destination: Path) -> None:
+            events.append("receipt_link")
+            real_link(source, destination)
+
+        def observed_replace(source: Path, destination: Path) -> None:
+            if Path(destination).parent.name == "transcript-cursors":
+                events.append("cursor_replace")
+            real_replace(source, destination)
+
+        def observed_directory_fsync(path: Path) -> None:
+            if Path(path).resolve() == inbox.resolve():
+                events.append("receipt_directory_fsync")
+            elif Path(path).name == "transcript-cursors":
+                events.append("cursor_directory_fsync")
+            real_directory_fsync(path)
+
+        with (
+            mock.patch.object(capture_module.os, "link", side_effect=observed_link),
+            mock.patch.object(fs_module.os, "replace", side_effect=observed_replace),
+            mock.patch.object(
+                fs_module,
+                "fsync_directory",
+                side_effect=observed_directory_fsync,
+            ),
+        ):
+            self.capture(transcript, "turn-1")
+
+        self.assertIn("receipt_directory_fsync", events)
+        self.assertLess(
+            events.index("receipt_link"), events.index("receipt_directory_fsync")
+        )
+        self.assertLess(
+            events.index("receipt_directory_fsync"), events.index("cursor_replace")
+        )
+        self.assertLess(
+            events.index("cursor_replace"), events.index("cursor_directory_fsync")
+        )
+
+    def test_receipt_directory_fsync_failure_never_advances_cursor(self) -> None:
+        transcript = self.codex_home / "durable.jsonl"
+        transcript.write_bytes(jsonl(response_message("assistant", "durable")))
+        inbox = self.root / ".harness/memory/inbox"
+        real_directory_fsync = fs_module.fsync_directory
+
+        def fail_inbox_fsync(path: Path) -> None:
+            if Path(path).resolve() == inbox.resolve():
+                raise OSError("injected inbox fsync failure")
+            real_directory_fsync(path)
+
+        with (
+            mock.patch.object(
+                fs_module, "fsync_directory", side_effect=fail_inbox_fsync
+            ),
+            self.assertRaisesRegex(OSError, "injected inbox fsync failure"),
+        ):
+            self.capture(transcript, "turn-1")
+
+        self.assertEqual(1, len(list(inbox.glob("*.json"))))
+        self.assertEqual([], self.cursors())
+
+        retry = self.capture(transcript, "turn-1")
+        cursor = json.loads(self.cursors()[0].read_text(encoding="utf-8"))
+        next_payload = self.receipt(self.capture(transcript, "turn-2"))["payload"]
+
+        self.assertEqual("duplicate", retry.status)
+        self.assertEqual(transcript.stat().st_size, cursor["offset"])
+        self.assertEqual([], next_payload["assistant_messages"])
+
+    def test_receipt_identity_distinguishes_new_delta_with_missing_or_reused_turn(self) -> None:
+        for index, turn in enumerate((None, "reused-turn"), start=1):
+            with self.subTest(turn=turn):
+                transcript = self.codex_home / f"identity-{index}.jsonl"
+                transcript.write_bytes(
+                    jsonl(response_message("assistant", f"first-{index}"))
+                )
+                session = f"identity-session-{index}"
+                first = self.capture(transcript, turn, session=session)
+                with transcript.open("ab") as handle:
+                    handle.write(
+                        jsonl(response_message("assistant", f"second-{index}"))
+                    )
+
+                second = self.capture(transcript, turn, session=session)
+                exact_redelivery = self.capture(transcript, turn, session=session)
+
+                self.assertEqual("captured", first.status)
+                self.assertEqual("captured", second.status)
+                self.assertNotEqual(first.receipt_id, second.receipt_id)
+                self.assertEqual(
+                    [f"second-{index}"],
+                    self.receipt(second)["payload"]["assistant_messages"],
+                )
+                self.assertEqual("duplicate", exact_redelivery.status)
+                self.assertEqual(second.receipt_id, exact_redelivery.receipt_id)
 
     def test_redelivery_is_duplicate_and_does_not_move_cursor(self) -> None:
         transcript = self.codex_home / "session.jsonl"
@@ -269,24 +383,29 @@ class TranscriptCaptureTests(unittest.TestCase):
             next_payload["transcript_digest"],
         )
 
-    def test_duplicate_repair_never_advances_over_unpublished_evidence(self) -> None:
+    def test_changed_delta_after_cursor_failure_publishes_without_skipping(self) -> None:
         transcript = self.codex_home / "session.jsonl"
         transcript.write_bytes(jsonl(response_message("assistant", "published")))
         with mock.patch(
             "profile_harness.transcript.atomic_write_text",
             side_effect=OSError("cursor failure"),
         ):
-            self.capture(transcript, "turn-1")
+            first = self.capture(transcript, "turn-1")
         with transcript.open("ab") as handle:
             handle.write(jsonl(response_message("user", "not published yet")))
 
-        duplicate = self.capture(transcript, "turn-1")
+        changed = self.capture(transcript, "turn-1")
 
-        self.assertEqual("duplicate", duplicate.status)
-        self.assertEqual([], self.cursors())
+        self.assertEqual("captured", changed.status)
+        self.assertNotEqual(first.receipt_id, changed.receipt_id)
+        cursor = json.loads(self.cursors()[0].read_text(encoding="utf-8"))
+        self.assertEqual(transcript.stat().st_size, cursor["offset"])
+        changed_payload = self.receipt(changed)["payload"]
+        self.assertEqual(["published"], changed_payload["assistant_messages"])
+        self.assertEqual(["not published yet"], changed_payload["user_messages"])
         next_payload = self.receipt(self.capture(transcript, "turn-2"))["payload"]
-        self.assertEqual(["published"], next_payload["assistant_messages"])
-        self.assertEqual(["not published yet"], next_payload["user_messages"])
+        self.assertEqual([], next_payload["assistant_messages"])
+        self.assertEqual([], next_payload["user_messages"])
 
     def test_duplicate_repair_rejects_invalid_receipt_with_matching_evidence(self) -> None:
         transcript = self.codex_home / "session.jsonl"

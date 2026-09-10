@@ -23,6 +23,9 @@ class TranscriptDelta:
     payload: dict[str, object]
     cursor_path: Path | None = None
     cursor: dict[str, object] | None = None
+    previous_receipt_id: str | None = None
+    previous_delivery_digest: str | None = None
+    has_complete_delta: bool = False
 
 
 class TranscriptUnavailable(ValueError):
@@ -51,13 +54,20 @@ def _load_cursor(profile_root: Path, path: Path) -> dict[str, object] | None:
         value = json.loads(raw.decode("utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
         raise TranscriptUnavailable("unreadable cursor") from error
-    if not isinstance(value, dict) or set(value) != {
+    required_fields = {
         "device",
         "inode",
         "offset",
         "prefix_length",
         "prefix_sha256",
-    }:
+    }
+    optional_fields = {"receipt_id", "delivery_digest"}
+    if (
+        not isinstance(value, dict)
+        or not required_fields <= set(value)
+        or set(value) - required_fields - optional_fields
+        or ("receipt_id" in value) != ("delivery_digest" in value)
+    ):
         raise TranscriptUnavailable("invalid cursor")
     integer_fields = ("device", "inode", "offset", "prefix_length")
     if any(
@@ -76,6 +86,13 @@ def _load_cursor(profile_root: Path, path: Path) -> dict[str, object] | None:
         or value["prefix_length"] > value["offset"]
     ):
         raise TranscriptUnavailable("invalid cursor")
+    for field in optional_fields:
+        if field in value and (
+            not isinstance(value[field], str)
+            or len(value[field]) != 64
+            or any(character not in "0123456789abcdef" for character in value[field])
+        ):
+            raise TranscriptUnavailable("invalid cursor")
     return value
 
 
@@ -161,6 +178,8 @@ def prepare_transcript_delta(
             prefix_length = 0
             prefix_digest = hashlib.sha256(b"").hexdigest()
             quality = "complete"
+            previous_receipt_id = None
+            previous_delivery_digest = None
             if cursor is not None:
                 prefix_length = int(cursor["prefix_length"])
                 os.lseek(descriptor, 0, os.SEEK_SET)
@@ -176,6 +195,8 @@ def prepare_transcript_delta(
                 if matches:
                     offset = int(cursor["offset"])
                     prefix_digest = str(cursor["prefix_sha256"])
+                    previous_receipt_id = cursor.get("receipt_id")
+                    previous_delivery_digest = cursor.get("delivery_digest")
                 else:
                     prefix_length = 0
                     quality = "partial"
@@ -237,6 +258,9 @@ def prepare_transcript_delta(
                 },
                 cursor_path,
                 next_cursor,
+                previous_receipt_id,
+                previous_delivery_digest,
+                bool(complete),
             )
         finally:
             os.close(descriptor)
