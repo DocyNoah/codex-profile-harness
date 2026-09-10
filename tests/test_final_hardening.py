@@ -510,6 +510,139 @@ class FinalHardeningTests(unittest.TestCase):
             self.assertFalse(descriptor.exists())
             self.assertEqual("# committed", (repo / "STATUS.md").read_text())
 
+    def test_partial_batch_rmtree_is_recoverable_for_precommit_and_committed(self) -> None:
+        for stage, committed in (("after_first_write", False), ("after_commit", True)):
+            with self.subTest(stage=stage), tempfile.TemporaryDirectory() as temporary_directory:
+                root, repo = self.make_profile(Path(temporary_directory))
+                self.add_receipt(root)
+                batch = prepare_curation(root)
+                original = (repo / "STATUS.md").read_bytes()
+                self._crash_apply(root, batch.batch_id, {
+                    "type": "repo_status", "repository": "api", "content": "# changed",
+                    "source_receipt_ids": ["one"],
+                }, stage)
+                descriptor = root / ".harness/state/transactions" / f"{batch.batch_id}.json"
+
+                def partial_rmtree(path: Path) -> None:
+                    (path / "batch.json").unlink(missing_ok=True)
+                    raise OSError("injected partial batch rmtree")
+
+                with mock.patch.object(curation_module.shutil, "rmtree", side_effect=partial_rmtree):
+                    with self.assertRaisesRegex(OSError, "partial batch"):
+                        recover_transactions(root, checkpoint=False)
+
+                self.assertTrue(batch.path.is_dir())
+                self.assertFalse((batch.path / "batch.json").exists())
+                self.assertTrue(descriptor.exists())
+                self.assertEqual((batch.batch_id,), recover_transactions(root, checkpoint=False))
+                if committed:
+                    self.assertEqual("# changed", (repo / "STATUS.md").read_text())
+                    self.assertTrue((root / ".harness/memory/archive/processed/one.json").is_file())
+                else:
+                    self.assertEqual(original, (repo / "STATUS.md").read_bytes())
+                    self.assertTrue((root / ".harness/memory/inbox/one.json").is_file())
+
+    def test_partial_batch_cleanup_rejects_unrecorded_file_or_link_without_mutation(self) -> None:
+        for kind in ("file", "link"):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as temporary_directory:
+                root, _ = self.make_profile(Path(temporary_directory))
+                self.add_receipt(root)
+                batch = prepare_curation(root)
+                self._crash_apply(root, batch.batch_id, {
+                    "type": "profile_proposal", "title": "Partial", "content": "body",
+                    "source_receipt_ids": ["one"],
+                }, "after_first_write")
+                descriptor = root / ".harness/state/transactions" / f"{batch.batch_id}.json"
+
+                def partial_rmtree(path: Path) -> None:
+                    (path / "batch.json").unlink(missing_ok=True)
+                    raise OSError("injected partial batch rmtree")
+
+                with mock.patch.object(curation_module.shutil, "rmtree", side_effect=partial_rmtree):
+                    with self.assertRaises(OSError):
+                        recover_transactions(root, checkpoint=False)
+                unexpected = batch.path / "unrecorded"
+                if kind == "file":
+                    unexpected.write_text("attacker", encoding="utf-8")
+                else:
+                    unexpected.symlink_to(root / "IDENTITY.md")
+                before = {
+                    descriptor: descriptor.read_bytes(),
+                    root / "IDENTITY.md": (root / "IDENTITY.md").read_bytes(),
+                }
+
+                with self.assertRaises(CurationError):
+                    recover_transactions(root, checkpoint=False)
+
+                self.assertEqual(before, {path: path.read_bytes() for path in before})
+
+    def test_collision_archive_recovery_and_doctor_validate_internal_receipt_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root, _ = self.make_profile(Path(temporary_directory))
+            self.add_receipt(root)
+            first = prepare_curation(root)
+            apply_actions(root, first.batch_id, {"actions": []})
+            self.add_receipt(root)
+            batch = prepare_curation(root)
+            self._crash_apply(root, batch.batch_id, {
+                "type": "repo_status", "repository": "api", "content": "# collision",
+                "source_receipt_ids": ["one"],
+            }, "after_commit")
+            descriptor = (root / ".harness/state/transactions" / f"{batch.batch_id}.json").resolve()
+            real_unlink = curation_module._durable_unlink
+
+            def stop_before_descriptor_unlink(path: Path) -> None:
+                if path == descriptor:
+                    raise OSError("injected descriptor unlink failure")
+                real_unlink(path)
+
+            with mock.patch.object(curation_module, "_durable_unlink", side_effect=stop_before_descriptor_unlink):
+                with self.assertRaises(OSError):
+                    recover_transactions(root, checkpoint=False)
+            collision = root / ".harness/memory/archive/processed" / f"one.{batch.batch_id}.json"
+            self.assertTrue(collision.is_file())
+
+            report = diagnose(root)
+
+            self.assertTrue(report.ok, report.format())
+            self.assertFalse(descriptor.exists())
+
+    def test_tampered_collision_archive_fails_closed_in_recovery_and_doctor(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root, _ = self.make_profile(Path(temporary_directory))
+            self.add_receipt(root)
+            first = prepare_curation(root)
+            apply_actions(root, first.batch_id, {"actions": []})
+            self.add_receipt(root)
+            batch = prepare_curation(root)
+            self._crash_apply(root, batch.batch_id, {
+                "type": "repo_status", "repository": "api", "content": "# collision",
+                "source_receipt_ids": ["one"],
+            }, "after_commit")
+            descriptor = (root / ".harness/state/transactions" / f"{batch.batch_id}.json").resolve()
+            real_unlink = curation_module._durable_unlink
+
+            def stop_before_descriptor_unlink(path: Path) -> None:
+                if path == descriptor:
+                    raise OSError("injected descriptor unlink failure")
+                real_unlink(path)
+
+            with mock.patch.object(curation_module, "_durable_unlink", side_effect=stop_before_descriptor_unlink):
+                with self.assertRaises(OSError):
+                    recover_transactions(root, checkpoint=False)
+            collision = root / ".harness/memory/archive/processed" / f"one.{batch.batch_id}.json"
+            receipt = json.loads(collision.read_text())
+            receipt["payload"]["session_id"] = "tampered"
+            collision.write_text(json.dumps(receipt), encoding="utf-8")
+            before = {collision: collision.read_bytes(), descriptor: descriptor.read_bytes()}
+
+            with self.assertRaises(CurationError):
+                recover_transactions(root, checkpoint=False)
+            report = diagnose(root)
+
+            self.assertFalse(report.ok)
+            self.assertEqual(before, {path: path.read_bytes() for path in before})
+
     def test_precommit_receipt_return_resumes_after_each_durable_move(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root, repo = self.make_profile(Path(temporary_directory))
@@ -606,6 +739,7 @@ class FinalHardeningTests(unittest.TestCase):
                 descriptor = root / ".harness/state/transactions" / f"{batch.batch_id}.json"
                 value = json.loads(descriptor.read_text())
                 value["version"] = 1
+                value.pop("batch_files")
                 for target in value["targets"]:
                     target.pop("snapshot_digest", None)
                     target.pop("previous_digest", None)
@@ -647,6 +781,7 @@ class FinalHardeningTests(unittest.TestCase):
             descriptor = root / ".harness/state/transactions" / f"{batch.batch_id}.json"
             value = json.loads(descriptor.read_text())
             value["version"] = 1
+            value.pop("batch_files")
             for target in value["targets"]:
                 target.pop("snapshot_digest", None)
                 target.pop("previous_digest", None)

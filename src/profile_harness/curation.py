@@ -636,6 +636,57 @@ def _transaction_manifest(batch_path: Path, batch_id: str) -> tuple[tuple[str, .
     return tuple(receipt_ids), digests
 
 
+def _batch_file_digests(batch_path: Path, receipt_ids: tuple[str, ...]) -> dict[str, str]:
+    allowed = {"batch.json", "prompt.md", "result.json"} | {
+        f"{receipt_id}.json" for receipt_id in receipt_ids
+    }
+    records: dict[str, str] = {}
+    for path in batch_path.iterdir():
+        if path.name not in allowed or path.is_symlink() or not path.is_file():
+            raise CurationError("processing batch contains an unrecordable member")
+        records[path.name] = _file_digest(path)
+    required = {"batch.json", "prompt.md"} | {f"{receipt_id}.json" for receipt_id in receipt_ids}
+    if not required <= set(records):
+        raise CurationError("processing batch is missing a required member")
+    return dict(sorted(records.items()))
+
+
+def _validate_remaining_batch_files(
+    batch_path: Path, recorded: object, receipt_ids: tuple[str, ...]
+) -> dict[str, str]:
+    allowed = {"batch.json", "prompt.md", "result.json"} | {
+        f"{receipt_id}.json" for receipt_id in receipt_ids
+    }
+    required = {"batch.json", "prompt.md"} | {f"{receipt_id}.json" for receipt_id in receipt_ids}
+    if (
+        not isinstance(recorded, dict)
+        or not required <= set(recorded)
+        or set(recorded) - allowed
+        or any(not isinstance(name, str) or not _is_digest(digest) for name, digest in recorded.items())
+    ):
+        raise CurationError("transaction batch file evidence is invalid")
+    if not batch_path.exists():
+        return recorded
+    for path in batch_path.iterdir():
+        if (
+            path.name not in recorded
+            or path.is_symlink()
+            or not path.is_file()
+            or _file_digest(path) != recorded[path.name]
+        ):
+            raise CurationError("remaining processing batch member is invalid")
+    return recorded
+
+
+def _transaction_receipt_digest(path: Path, receipt_id: str) -> str:
+    try:
+        receipt = _valid_receipt(path, expected_id=receipt_id)
+    except CurationError:
+        raise
+    canonical = _canonical_bytes(receipt)
+    return hashlib.sha256(canonical).hexdigest()
+
+
 def _allowed_transaction_target(root: Path, profile: object, relative: Path) -> Path:
     if relative.is_absolute() or ".." in relative.parts:
         raise CurationError("transaction target escapes its exact allowed scope")
@@ -699,12 +750,14 @@ def _target_has_batch_marker(path: Path, batch_id: str) -> bool:
 def _validate_transaction(root: Path, transaction_path: Path, transaction: object) -> dict[str, Any]:
     fields = {"version", "batch_id", "state", "batch_path", "targets", "archives", "journal"}
     if (
-        not isinstance(transaction, dict) or set(transaction) != fields
-        or transaction.get("version") not in {1, 2}
+        not isinstance(transaction, dict)
+        or transaction.get("version") not in {1, 2, 3}
+        or set(transaction) != (fields | {"batch_files"} if transaction.get("version") == 3 else fields)
         or transaction.get("state") not in {"applying", "committed"}
     ):
         raise CurationError(f"invalid transaction descriptor: {transaction_path.name}")
     legacy = transaction["version"] == 1
+    self_contained = transaction["version"] == 3
     batch_id = transaction.get("batch_id")
     if (
         not isinstance(batch_id, str) or _BATCH_ID.fullmatch(batch_id) is None
@@ -716,7 +769,32 @@ def _validate_transaction(root: Path, transaction_path: Path, transaction: objec
     archives = transaction.get("archives")
     if not isinstance(archives, list) or not archives:
         raise CurationError("transaction archive members are invalid")
-    if batch_path.exists():
+    if self_contained:
+        derived_ids: list[str] = []
+        manifest_digests = {}
+        prefix = f".harness/memory/processing/{batch_id}/"
+        for member in archives:
+            if not isinstance(member, dict) or set(member) != {"source", "destination", "digest"}:
+                raise CurationError("transaction archive member is invalid")
+            source = member.get("source")
+            if not isinstance(source, str) or not source.startswith(prefix) or not source.endswith(".json"):
+                raise CurationError("transaction archive provenance is invalid")
+            receipt_id = source[len(prefix):-5]
+            if _RECEIPT_ID.fullmatch(receipt_id) is None or not _is_digest(member.get("digest")):
+                raise CurationError("transaction archive provenance is invalid")
+            derived_ids.append(receipt_id)
+            manifest_digests[receipt_id] = member["digest"]
+        if len(derived_ids) != len(set(derived_ids)):
+            raise CurationError("transaction archive receipt IDs are not unique")
+        receipt_ids = tuple(derived_ids)
+        batch_files = _validate_remaining_batch_files(batch_path, transaction["batch_files"], receipt_ids)
+        if batch_path.exists() and (batch_path / "batch.json").exists():
+            manifest_ids, recorded_digests = _transaction_manifest(batch_path, batch_id)
+            if manifest_ids != receipt_ids or recorded_digests != manifest_digests:
+                raise CurationError("transaction batch manifest evidence is inconsistent")
+            if _file_digest(batch_path / "batch.json") != batch_files["batch.json"]:
+                raise CurationError("transaction batch manifest digest is invalid")
+    elif batch_path.exists():
         receipt_ids, manifest_digests = _transaction_manifest(batch_path, batch_id)
     elif transaction["state"] == "committed":
         derived_ids: list[str] = []
@@ -766,7 +844,7 @@ def _validate_transaction(root: Path, transaction_path: Path, transaction: objec
             raise CurationError("applying transaction receipt state is invalid")
         if transaction["state"] == "committed" and existing not in ([source], [destination]):
             raise CurationError("committed transaction archive state is invalid")
-        if not existing or _receipt_record(existing[0])["sha256"] != member["digest"]:
+        if not existing or _transaction_receipt_digest(existing[0], receipt_id) != member["digest"]:
             raise CurationError("transaction archive digest is invalid")
 
     targets = transaction.get("targets")
@@ -1078,10 +1156,11 @@ def apply_actions(
                 raise CurationError("immutable receipt archive destination already exists")
             archives.append({"source": str(source.relative_to(profile.root)), "destination": str(destination.relative_to(profile.root)), "digest": _receipt_record(source)["sha256"]})
         transaction = {
-            "version": 2,
+            "version": 3,
             "batch_id": batch_id,
             "state": "applying",
             "batch_path": str(batch_path.relative_to(profile.root)),
+            "batch_files": _batch_file_digests(batch_path, receipt_ids),
             "targets": [],
             "archives": archives,
             "journal": {
