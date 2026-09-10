@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import stat
 import uuid
 from typing import Any
 
@@ -21,7 +22,7 @@ from .fs import (
     fsync_directory,
     require_safe_path,
 )
-from .journal import append_entry
+from .journal import append_entry, verify_journal
 from .receipt import (
     MAX_IDENTIFIER_CHARS,
     MAX_RECEIPT_BYTES,
@@ -604,6 +605,243 @@ def _transaction_member(root: Path, value: object, *, directory: bool | None = N
         raise CurationError(str(error)) from error
 
 
+def _transaction_manifest(batch_path: Path, batch_id: str) -> tuple[tuple[str, ...], dict[str, str]]:
+    try:
+        manifest = _strict_json(batch_path / "batch.json")
+    except (OSError, ValueError, json.JSONDecodeError) as error:
+        raise CurationError("transaction batch manifest is invalid") from error
+    if not isinstance(manifest, dict) or set(manifest) != {
+        "batch_id", "receipt_ids", "receipts", "created_at"
+    } or manifest.get("batch_id") != batch_id:
+        raise CurationError("transaction batch manifest is invalid")
+    receipt_ids = manifest.get("receipt_ids")
+    records = manifest.get("receipts")
+    if (
+        not isinstance(receipt_ids, list) or not receipt_ids
+        or len(receipt_ids) != len(set(receipt_ids))
+        or any(not isinstance(item, str) or _RECEIPT_ID.fullmatch(item) is None for item in receipt_ids)
+        or not isinstance(records, list) or len(records) != len(receipt_ids)
+    ):
+        raise CurationError("transaction receipt manifest is invalid")
+    digests: dict[str, str] = {}
+    for receipt_id, record in zip(receipt_ids, records):
+        if (
+            not isinstance(record, dict) or set(record) != {"id", "sha256", "size"}
+            or record.get("id") != receipt_id or not _is_digest(record.get("sha256"))
+            or isinstance(record.get("size"), bool) or not isinstance(record.get("size"), int)
+            or record["size"] < 1
+        ):
+            raise CurationError("transaction receipt manifest is invalid")
+        digests[receipt_id] = record["sha256"]
+    return tuple(receipt_ids), digests
+
+
+def _allowed_transaction_target(root: Path, profile: object, relative: Path) -> Path:
+    if relative.is_absolute() or ".." in relative.parts:
+        raise CurationError("transaction target escapes its exact allowed scope")
+    target = _transaction_member(root, str(relative), directory=False)
+    fixed_roots = (
+        Path(".harness/memory/semantic"),
+        Path(".harness/memory/procedural"),
+        Path(".harness/improvements/proposed"),
+    )
+    if relative.parent in fixed_roots and re.fullmatch(r"[a-z0-9-]+\.md", relative.name):
+        return target
+    for repository in profile.repositories:
+        repository_relative = repository.path.relative_to(root)
+        if relative in {
+            repository_relative / "STATUS.md",
+            repository_relative / "TASKS.md",
+            repository_relative / "DECISIONS.md",
+        }:
+            return target
+        if relative.parent == repository_relative / "docs/decisions" and _ADR.fullmatch(relative.name):
+            return target
+    raise CurationError("transaction target escapes its exact allowed scope")
+
+
+def _journal_entry_binds_transaction(
+    entry: dict[str, Any], transaction: dict[str, Any], receipt_ids: tuple[str, ...]
+) -> bool:
+    target_digests = {
+        item["path"]: item["intended_digest"] for item in transaction["targets"]
+    }
+    receipt_digests = {
+        receipt_id: item["digest"]
+        for receipt_id, item in zip(receipt_ids, transaction["archives"])
+    }
+    archived = [
+        {
+            "filename": Path(item["destination"]).name,
+            "receipt_id": receipt_id,
+            "digest": item["digest"],
+        }
+        for receipt_id, item in zip(receipt_ids, transaction["archives"])
+    ]
+    return (
+        entry.get("batch_id") == transaction["batch_id"]
+        and entry.get("receipt_ids") == list(receipt_ids)
+        and entry.get("receipt_digests") == receipt_digests
+        and entry.get("archived_receipts") == archived
+        and entry.get("target_digests") == target_digests
+        and set(entry.get("changed_paths", [])) == set(target_digests)
+    )
+
+
+def _target_has_batch_marker(path: Path, batch_id: str) -> bool:
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            return handle.readline(256) == f"<!-- profile-harness-curation-batch: {batch_id} -->\n"
+    except (OSError, UnicodeError):
+        return False
+
+
+def _validate_transaction(root: Path, transaction_path: Path, transaction: object) -> dict[str, Any]:
+    fields = {"version", "batch_id", "state", "batch_path", "targets", "archives", "journal"}
+    if (
+        not isinstance(transaction, dict) or set(transaction) != fields
+        or transaction.get("version") != 1
+        or transaction.get("state") not in {"applying", "committed"}
+    ):
+        raise CurationError(f"invalid transaction descriptor: {transaction_path.name}")
+    batch_id = transaction.get("batch_id")
+    if (
+        not isinstance(batch_id, str) or _BATCH_ID.fullmatch(batch_id) is None
+        or transaction_path.name != f"{batch_id}.json"
+        or transaction.get("batch_path") != f".harness/memory/processing/{batch_id}"
+    ):
+        raise CurationError(f"invalid transaction identity: {transaction_path.name}")
+    batch_path = _transaction_member(root, transaction["batch_path"], directory=True)
+    receipt_ids, manifest_digests = _transaction_manifest(batch_path, batch_id)
+    profile = load_profile(root)
+    snapshot_root = Path(f".harness/memory/archive/snapshots/{batch_id}")
+
+    archives = transaction.get("archives")
+    if not isinstance(archives, list) or len(archives) != len(receipt_ids):
+        raise CurationError("transaction archive members are invalid")
+    for receipt_id, member in zip(receipt_ids, archives):
+        if not isinstance(member, dict) or set(member) != {"source", "destination", "digest"}:
+            raise CurationError("transaction archive member is invalid")
+        plain = f".harness/memory/archive/processed/{receipt_id}.json"
+        collision = f".harness/memory/archive/processed/{receipt_id}.{batch_id}.json"
+        expected_source = f".harness/memory/processing/{batch_id}/{receipt_id}.json"
+        if (
+            member.get("source") != expected_source
+            or member.get("destination") not in {plain, collision}
+            or member.get("digest") != manifest_digests[receipt_id]
+        ):
+            raise CurationError("transaction archive provenance is invalid")
+        plain_path = _transaction_member(root, plain, directory=False)
+        if member["destination"] == collision and not plain_path.is_file():
+            raise CurationError("transaction archive collision provenance is invalid")
+        source = _transaction_member(root, member["source"], directory=False)
+        destination = _transaction_member(root, member["destination"], directory=False)
+        existing = [path for path in (source, destination) if path.exists()]
+        if transaction["state"] == "applying" and existing != [source]:
+            raise CurationError("applying transaction archive state is invalid")
+        if transaction["state"] == "committed" and len(existing) != 1:
+            raise CurationError("committed transaction archive state is invalid")
+        if not existing or _receipt_record(existing[0])["sha256"] != member["digest"]:
+            raise CurationError("transaction archive digest is invalid")
+
+    targets = transaction.get("targets")
+    if not isinstance(targets, list) or len(targets) > MAX_ACTIONS * 2:
+        raise CurationError("transaction target members are invalid")
+    seen_targets: set[str] = set()
+    for member in targets:
+        if not isinstance(member, dict) or set(member) != {
+            "path", "existed", "snapshot", "snapshot_digest", "mode", "intended_digest"
+        }:
+            raise CurationError("transaction target member is invalid")
+        relative_text = member.get("path")
+        relative = Path(relative_text) if isinstance(relative_text, str) else Path("/")
+        if (
+            not isinstance(relative_text, str)
+            or relative_text != relative.as_posix()
+            or relative_text in seen_targets
+        ):
+            raise CurationError("transaction target member is invalid")
+        target = _allowed_transaction_target(root, profile, relative)
+        if not _is_digest(member.get("intended_digest")) or not isinstance(member.get("existed"), bool):
+            raise CurationError("transaction target digest is invalid")
+        if member["existed"]:
+            expected_snapshot = str(snapshot_root / Path(relative_text))
+            if (
+                member.get("snapshot") != expected_snapshot
+                or not _is_digest(member.get("snapshot_digest"))
+                or isinstance(member.get("mode"), bool) or not isinstance(member.get("mode"), int)
+                or not stat.S_ISREG(member["mode"])
+            ):
+                raise CurationError("transaction target snapshot provenance is invalid")
+            snapshot = _transaction_member(root, member["snapshot"], directory=False)
+            if (
+                not snapshot.is_file() or snapshot.stat().st_nlink != 1
+                or _file_digest(snapshot) != member["snapshot_digest"]
+            ):
+                raise CurationError("transaction target snapshot is invalid")
+        elif member.get("snapshot") is not None or member.get("snapshot_digest") is not None or member.get("mode") is not None:
+            raise CurationError("transaction target snapshot provenance is invalid")
+        if transaction["state"] == "committed":
+            if not target.is_file() or _file_digest(target) != member["intended_digest"]:
+                raise CurationError("committed transaction target is invalid")
+        elif target.exists():
+            allowed_digests = {member["intended_digest"]}
+            if member["existed"]:
+                allowed_digests.add(member["snapshot_digest"])
+            if target.stat().st_nlink != 1 or _file_digest(target) not in allowed_digests:
+                raise CurationError("applying transaction target is invalid")
+        if not member["existed"] and target.exists() and not _target_has_batch_marker(target, batch_id):
+            raise CurationError("transaction-created target ownership is invalid")
+        seen_targets.add(relative_text)
+
+    journal_data = transaction.get("journal")
+    if not isinstance(journal_data, dict) or set(journal_data) != {
+        "existed", "snapshot", "snapshot_digest", "mode"
+    } or not isinstance(journal_data.get("existed"), bool):
+        raise CurationError("transaction journal member is invalid")
+    prior_entries: list[dict[str, Any]] = []
+    if journal_data["existed"]:
+        expected_snapshot = str(snapshot_root / "journal.before")
+        if (
+            journal_data.get("snapshot") != expected_snapshot
+            or not _is_digest(journal_data.get("snapshot_digest"))
+            or isinstance(journal_data.get("mode"), bool) or not isinstance(journal_data.get("mode"), int)
+            or not stat.S_ISREG(journal_data["mode"])
+        ):
+            raise CurationError("transaction journal snapshot provenance is invalid")
+        snapshot = _transaction_member(root, journal_data["snapshot"], directory=False)
+        if (
+            not snapshot.is_file() or snapshot.stat().st_nlink != 1
+            or _file_digest(snapshot) != journal_data["snapshot_digest"]
+        ):
+            raise CurationError("transaction journal snapshot is invalid")
+        try:
+            prior_entries = verify_journal(snapshot)
+        except (OSError, UnicodeError, ValueError) as error:
+            raise CurationError("transaction journal snapshot chain is invalid") from error
+    elif journal_data.get("snapshot") is not None or journal_data.get("snapshot_digest") is not None or journal_data.get("mode") is not None:
+        raise CurationError("transaction journal snapshot provenance is invalid")
+    journal = _transaction_member(root, ".harness/memory/journal/curation.jsonl", directory=False)
+    try:
+        current_entries = verify_journal(journal)
+    except (OSError, UnicodeError, ValueError) as error:
+        raise CurationError("transaction journal chain is invalid") from error
+    if any(entry.get("batch_id") == batch_id for entry in prior_entries):
+        raise CurationError("transaction batch is already present in journal history")
+    prior_hashes = [entry["entry_hash"] for entry in prior_entries]
+    current_hashes = [entry["entry_hash"] for entry in current_entries]
+    unchanged = current_hashes == prior_hashes
+    appended = len(current_entries) == len(prior_entries) + 1 and current_hashes[:-1] == prior_hashes
+    if appended:
+        validate_curation_journal_entry(current_entries[-1])
+        appended = _journal_entry_binds_transaction(current_entries[-1], transaction, receipt_ids)
+    if transaction["state"] == "committed" and not appended:
+        raise CurationError("committed transaction journal binding is invalid")
+    if transaction["state"] == "applying" and not (unchanged or appended):
+        raise CurationError("applying transaction journal provenance is invalid")
+    return transaction
+
+
 def _restore_transaction(root: Path, transaction_path: Path, transaction: dict[str, Any]) -> None:
     batch_path = _transaction_member(root, transaction["batch_path"], directory=True)
     for archive in reversed(transaction.get("archives", [])):
@@ -659,15 +897,16 @@ def recover_transactions(root: Path, *, checkpoint: bool = True) -> tuple[str, .
         raise CurationError(str(error)) from error
     if not directory.exists():
         return ()
+    transaction_paths = sorted(directory.glob("*.json"))
+    if len(transaction_paths) > 1:
+        raise CurationError("multiple interrupted transaction descriptors are unsafe")
+    validated: list[tuple[Path, dict[str, Any]]] = []
+    for transaction_path in transaction_paths:
+        transaction = _strict_json(transaction_path)
+        validated.append((transaction_path, _validate_transaction(profile_root, transaction_path, transaction)))
     recovered: list[str] = []
     recovered_committed_state = False
-    for transaction_path in sorted(directory.glob("*.json")):
-        transaction = _strict_json(transaction_path)
-        if not isinstance(transaction, dict) or transaction.get("version") != 1:
-            raise CurationError(f"invalid transaction descriptor: {transaction_path.name}")
-        batch_id = transaction.get("batch_id")
-        if not isinstance(batch_id, str) or _BATCH_ID.fullmatch(batch_id) is None or transaction_path.name != f"{batch_id}.json":
-            raise CurationError(f"invalid transaction identity: {transaction_path.name}")
+    for transaction_path, transaction in validated:
         if transaction.get("state") == "committed":
             recovered_committed_state = True
             _complete_transaction(profile_root, transaction_path, transaction)
@@ -726,6 +965,10 @@ def apply_actions(
         nonlocal writes
         safe_target = _require_safe_target(profile.root, allowed_scope, target)
         assert transaction is not None
+        if not safe_target.exists():
+            if safe_target.name in {"STATUS.md", "TASKS.md", "DECISIONS.md"}:
+                raise CurationError("fixed repository target must already exist")
+            content = f"<!-- profile-harness-curation-batch: {batch_id} -->\n{content}"
         known = {item["path"] for item in transaction["targets"]}
         relative_target = str(safe_target.relative_to(profile.root))
         if relative_target not in known:
@@ -733,9 +976,17 @@ def apply_actions(
                 snapshot = _snapshot_path(profile.root, snapshot_root, safe_target)
                 ensure_safe_directory(profile.root, snapshot.parent)
                 atomic_copy_file(safe_target, snapshot)
-                record = {"path": relative_target, "existed": True, "snapshot": str(snapshot.relative_to(profile.root)), "mode": safe_target.stat().st_mode}
+                record = {
+                    "path": relative_target, "existed": True,
+                    "snapshot": str(snapshot.relative_to(profile.root)),
+                    "snapshot_digest": _file_digest(snapshot),
+                    "mode": safe_target.stat().st_mode,
+                }
             else:
-                record = {"path": relative_target, "existed": False, "snapshot": None, "mode": None}
+                record = {
+                    "path": relative_target, "existed": False, "snapshot": None,
+                    "snapshot_digest": None, "mode": None,
+                }
             transaction["targets"].append(record)
         record = next(item for item in transaction["targets"] if item["path"] == relative_target)
         record["intended_digest"] = hashlib.sha256(content.encode("utf-8")).hexdigest()
@@ -761,6 +1012,8 @@ def apply_actions(
             destination = archive / source.name
             if destination.exists():
                 destination = archive / f"{receipt_id}.{batch_id}.json"
+            if destination.exists():
+                raise CurationError("immutable receipt archive destination already exists")
             archives.append({"source": str(source.relative_to(profile.root)), "destination": str(destination.relative_to(profile.root)), "digest": _receipt_record(source)["sha256"]})
         transaction = {
             "version": 1,
@@ -769,7 +1022,12 @@ def apply_actions(
             "batch_path": str(batch_path.relative_to(profile.root)),
             "targets": [],
             "archives": archives,
-            "journal": {"existed": journal.exists(), "snapshot": str(journal_snapshot.relative_to(profile.root)) if journal.exists() else None, "mode": journal.stat().st_mode if journal.exists() else None},
+            "journal": {
+                "existed": journal.exists(),
+                "snapshot": str(journal_snapshot.relative_to(profile.root)) if journal.exists() else None,
+                "snapshot_digest": _file_digest(journal_snapshot) if journal.exists() else None,
+                "mode": journal.stat().st_mode if journal.exists() else None,
+            },
         }
         _publish_transaction(transaction_path, transaction)
         projects_root = (profile.root / "projects").resolve()
@@ -883,6 +1141,7 @@ def apply_actions(
         return applied
     except BaseException:
         if transaction is not None and transaction_path.exists():
+            transaction = _validate_transaction(profile.root, transaction_path, transaction)
             if transaction.get("state") == "committed":
                 _complete_transaction(profile.root, transaction_path, transaction)
             else:

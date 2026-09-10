@@ -379,6 +379,103 @@ class FinalHardeningTests(unittest.TestCase):
             self.assertLess(events.index(("fsync", proposal_parent)), descriptor_index)
             self.assertLess(events.index(("fsync", journal_parent)), descriptor_index)
 
+    def test_curation_recovery_validates_every_wal_member_before_mutation(self) -> None:
+        def archive_escape(value: dict, root: Path) -> None:
+            value["archives"][0]["destination"] = "IDENTITY.md"
+
+        def target_escape(value: dict, root: Path) -> None:
+            value["targets"][0].update({
+                "path": "IDENTITY.md", "existed": False,
+                "snapshot": None, "mode": None,
+            })
+
+        def snapshot_escape(value: dict, root: Path) -> None:
+            value["targets"][0]["snapshot"] = "AGENTS.md"
+
+        def missing_snapshot(value: dict, root: Path) -> None:
+            (root / value["targets"][0]["snapshot"]).unlink()
+
+        def symlink_snapshot(value: dict, root: Path) -> None:
+            snapshot = root / value["targets"][0]["snapshot"]
+            snapshot.unlink()
+            snapshot.symlink_to(root / "IDENTITY.md")
+
+        def digest_mismatch(value: dict, root: Path) -> None:
+            value["archives"][0]["digest"] = "0" * 64
+
+        def claim_existing_allowed_target(value: dict, root: Path) -> None:
+            legitimate = root / ".harness/memory/semantic/legitimate.md"
+            legitimate.write_text("# Existing\n", encoding="utf-8")
+            value["targets"][0].update({
+                "path": str(legitimate.relative_to(root)), "existed": False,
+                "snapshot": None, "snapshot_digest": None, "mode": None,
+                "intended_digest": __import__("hashlib").sha256(legitimate.read_bytes()).hexdigest(),
+            })
+
+        mutations = {
+            "archive destination escape": archive_escape,
+            "target escape": target_escape,
+            "snapshot escape": snapshot_escape,
+            "missing snapshot": missing_snapshot,
+            "symlink snapshot": symlink_snapshot,
+            "digest mismatch": digest_mismatch,
+            "existing allowed target ownership": claim_existing_allowed_target,
+        }
+        for label, mutate in mutations.items():
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as temporary_directory:
+                root, repo = self.make_profile(Path(temporary_directory))
+                self.add_receipt(root)
+                batch = prepare_curation(root)
+                self._crash_apply(root, batch.batch_id, {
+                    "type": "repo_status", "repository": "api", "content": "# crashed",
+                    "source_receipt_ids": ["one"],
+                }, "after_first_write")
+                descriptor = root / ".harness/state/transactions" / f"{batch.batch_id}.json"
+                value = json.loads(descriptor.read_text())
+                mutate(value, root)
+                descriptor.write_text(json.dumps(value), encoding="utf-8")
+                receipt = batch.path / "one.json"
+                protected = {
+                    root / "IDENTITY.md": (root / "IDENTITY.md").read_bytes(),
+                    repo / "STATUS.md": (repo / "STATUS.md").read_bytes(),
+                    receipt: receipt.read_bytes(),
+                    descriptor: descriptor.read_bytes(),
+                }
+                legitimate = root / ".harness/memory/semantic/legitimate.md"
+                if legitimate.exists():
+                    protected[legitimate] = legitimate.read_bytes()
+
+                with self.assertRaises(CurationError):
+                    recover_transactions(root)
+
+                self.assertEqual(protected, {path: path.read_bytes() for path in protected})
+
+    def test_curation_recovery_rejects_unbound_journal_and_doctor_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root, repo = self.make_profile(Path(temporary_directory))
+            self.add_receipt(root)
+            batch = prepare_curation(root)
+            self._crash_apply(root, batch.batch_id, {
+                "type": "repo_status", "repository": "api", "content": "# crashed",
+                "source_receipt_ids": ["one"],
+            }, "after_journal")
+            journal = root / ".harness/memory/journal/curation.jsonl"
+            from profile_harness.journal import append_entry
+            append_entry(journal, {"unexpected": "unbound"})
+            descriptor = root / ".harness/state/transactions" / f"{batch.batch_id}.json"
+            protected = {
+                root / "IDENTITY.md": (root / "IDENTITY.md").read_bytes(),
+                repo / "STATUS.md": (repo / "STATUS.md").read_bytes(),
+                batch.path / "one.json": (batch.path / "one.json").read_bytes(),
+                journal: journal.read_bytes(), descriptor: descriptor.read_bytes(),
+            }
+
+            report = diagnose(root)
+
+            self.assertFalse(report.ok)
+            self.assertIn("recovery failed", report.format())
+            self.assertEqual(protected, {path: path.read_bytes() for path in protected})
+
     def test_recovery_fsyncs_archive_and_processing_before_committed_descriptor(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root, _ = self.make_profile(Path(temporary_directory))
