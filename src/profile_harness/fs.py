@@ -7,8 +7,8 @@ from pathlib import Path
 import tempfile
 
 
-def atomic_write_text(path: Path, content: str) -> None:
-    """Atomically replace *path* with UTF-8 text from a same-directory temp file."""
+def _write_temporary_file(path: Path, content: str) -> Path:
+    """Write and flush complete content to a same-directory temporary file."""
     path.parent.mkdir(parents=True, exist_ok=True)
     descriptor, temporary_name = tempfile.mkstemp(
         dir=path.parent, prefix=f".{path.name}.", suffix=".tmp"
@@ -19,6 +19,16 @@ def atomic_write_text(path: Path, content: str) -> None:
             handle.write(content)
             handle.flush()
             os.fsync(handle.fileno())
+        return temporary_path
+    except BaseException:
+        temporary_path.unlink(missing_ok=True)
+        raise
+
+
+def atomic_write_text(path: Path, content: str) -> None:
+    """Atomically replace *path* with UTF-8 text from a same-directory temp file."""
+    temporary_path = _write_temporary_file(path, content)
+    try:
         os.replace(temporary_path, path)
     except BaseException:
         temporary_path.unlink(missing_ok=True)
@@ -27,15 +37,15 @@ def atomic_write_text(path: Path, content: str) -> None:
 
 def atomic_write_text_if_missing(path: Path, content: str) -> None:
     """Create state atomically when absent and leave existing state untouched."""
-    if not path.exists():
-        atomic_write_text(path, content)
+    exclusive_write_text(path, content)
 
 
 def exclusive_write_text(path: Path, content: str) -> None:
-    """Create a user-owned UTF-8 file, preserving any existing file."""
-    path.parent.mkdir(parents=True, exist_ok=True)
+    """Atomically publish a complete UTF-8 file unless the target already exists."""
+    temporary_path = _write_temporary_file(path, content)
     try:
-        with path.open("x", encoding="utf-8", newline="\n") as handle:
-            handle.write(content)
+        os.link(temporary_path, path)
     except FileExistsError:
         return
+    finally:
+        temporary_path.unlink(missing_ok=True)

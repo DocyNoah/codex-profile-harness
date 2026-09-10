@@ -6,6 +6,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -17,6 +18,83 @@ from profile_harness.config import (  # noqa: E402
     load_profile,
     register_repo,
 )
+from profile_harness.fs import atomic_write_text_if_missing, exclusive_write_text  # noqa: E402
+
+
+class SafeFileCreationTests(unittest.TestCase):
+    def test_exclusive_creation_never_leaves_partial_destination(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            destination = Path(temporary_directory) / "AGENTS.md"
+            complete_content = "complete template\n"
+            original_open = Path.open
+
+            class InterruptedDestinationWriter:
+                def __init__(self, handle):
+                    self.handle = handle
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, exception_type, exception, traceback):
+                    self.handle.close()
+
+                def write(self, content: str) -> int:
+                    self.handle.write(content[:4])
+                    self.handle.flush()
+                    raise OSError("simulated interrupted write")
+
+            def interrupt_direct_destination_write(path, *args, **kwargs):
+                handle = original_open(path, *args, **kwargs)
+                if Path(path) == destination:
+                    return InterruptedDestinationWriter(handle)
+                return handle
+
+            with mock.patch.object(Path, "open", interrupt_direct_destination_write):
+                try:
+                    exclusive_write_text(destination, complete_content)
+                except OSError:
+                    pass
+
+            if destination.exists():
+                self.assertEqual(
+                    complete_content, destination.read_text(encoding="utf-8")
+                )
+
+    def test_atomic_creation_preserves_file_created_by_competing_writer(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            destination = Path(temporary_directory) / "config.toml"
+            competing_content = 'version = 1\nname = "competitor"\n'
+            original_atomic_write = __import__(
+                "profile_harness.fs", fromlist=["atomic_write_text"]
+            ).atomic_write_text
+            original_link = os.link
+
+            def compete_before_old_commit(path: Path, content: str) -> None:
+                destination.write_text(competing_content, encoding="utf-8")
+                original_atomic_write(path, content)
+
+            def compete_before_exclusive_publish(source, target, *args, **kwargs):
+                if Path(target) == destination and not destination.exists():
+                    destination.write_text(competing_content, encoding="utf-8")
+                return original_link(source, target, *args, **kwargs)
+
+            with (
+                mock.patch(
+                    "profile_harness.fs.atomic_write_text",
+                    side_effect=compete_before_old_commit,
+                ),
+                mock.patch(
+                    "profile_harness.fs.os.link",
+                    side_effect=compete_before_exclusive_publish,
+                ),
+            ):
+                atomic_write_text_if_missing(
+                    destination, 'version = 1\nname = "initializer"\n'
+                )
+
+            self.assertEqual(
+                competing_content, destination.read_text(encoding="utf-8")
+            )
 
 
 class ProfileInitializationTests(unittest.TestCase):
