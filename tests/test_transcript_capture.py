@@ -82,7 +82,12 @@ class TranscriptCaptureTests(unittest.TestCase):
 
     def downgrade_capture_to_legacy_cursor(self, transcript: Path) -> tuple[Path, Path]:
         captured = self.capture(transcript, "turn-1")
-        legacy_id = "3908883c113a968d0ada05bbe0737f8be7bd2547f69b017d7ecc9aea099e32dd"
+        return self.make_capture_legacy(
+            captured,
+            "3908883c113a968d0ada05bbe0737f8be7bd2547f69b017d7ecc9aea099e32dd",
+        )
+
+    def make_capture_legacy(self, captured, legacy_id: str) -> tuple[Path, Path]:
         legacy_path = captured.receipt_path.with_name(f"{legacy_id}.json")
         receipt = self.receipt(captured)
         receipt["id"] = legacy_id
@@ -238,21 +243,77 @@ class TranscriptCaptureTests(unittest.TestCase):
         self.assertEqual(legacy_path.stem, promoted["receipt_id"])
         self.assertEqual(legacy_path.stem, promoted["delivery_digest"])
 
+    def test_legacy_receipt_is_not_reused_without_a_matching_legacy_cursor(self) -> None:
+        transcript = self.codex_home / "legacy-no-cursor.jsonl"
+        transcript.write_bytes(b"")
+        legacy_path, cursor_path = self.downgrade_capture_to_legacy_cursor(transcript)
+        cursor_path.unlink()
+
+        redelivery = self.capture(transcript, "turn-1")
+
+        self.assertEqual("captured", redelivery.status)
+        self.assertNotEqual(legacy_path, redelivery.receipt_path)
+
+    def test_legacy_cursor_reuses_last_receipt_after_multiple_megabyte_captures(
+        self,
+    ) -> None:
+        transcript = self.codex_home / "legacy-large.jsonl"
+        session = f" {'s' * 5000} "
+        fallback = "API_KEY=top-secret-value " + "z" * 5000
+        transcript.write_bytes(
+            jsonl(response_message("assistant", "a" * 600_000))
+        )
+        self.capture(
+            transcript,
+            "turn-1",
+            last=fallback,
+            session=session,
+        )
+        with transcript.open("ab") as handle:
+            handle.write(jsonl(response_message("assistant", "b" * 600_000)))
+        second = self.capture(
+            transcript,
+            "turn-2",
+            last=fallback,
+            session=session,
+        )
+        legacy_path, cursor_path = self.make_capture_legacy(
+            second,
+            "cd2c4df30a689e004c3fa9b79e7ec67fafed92f62a1b3885948f9c59712959de",
+        )
+
+        redelivery = self.capture(
+            transcript,
+            "turn-2",
+            last=fallback,
+            session=session,
+        )
+
+        self.assertGreater(transcript.stat().st_size, 1024 * 1024)
+        self.assertEqual("duplicate", redelivery.status)
+        self.assertEqual(legacy_path, redelivery.receipt_path)
+        self.assertEqual(2, len(list(legacy_path.parent.glob("*.json"))))
+        promoted = json.loads(cursor_path.read_text(encoding="utf-8"))
+        self.assertEqual(legacy_path.stem, promoted["receipt_id"])
+        self.assertEqual(legacy_path.stem, promoted["delivery_digest"])
+
     def test_legacy_cursor_rejects_tampered_receipt_payload(self) -> None:
         transcript = self.codex_home / "legacy-tampered.jsonl"
         transcript.write_bytes(jsonl(response_message("assistant", "legacy evidence")))
         legacy_path, cursor_path = self.downgrade_capture_to_legacy_cursor(transcript)
         tampered = json.loads(legacy_path.read_text(encoding="utf-8"))
-        tampered["payload"]["assistant_messages"] = ["tampered but schema-valid"]
+        tampered["payload"]["last_assistant_message"] = "mismatched fallback"
         legacy_path.write_text(json.dumps(tampered), encoding="utf-8")
 
         redelivery = self.capture(transcript, "turn-1")
 
         self.assertEqual("captured", redelivery.status)
         self.assertNotEqual(legacy_path, redelivery.receipt_path)
+        recovery_payload = self.receipt(redelivery)["payload"]
+        self.assertEqual([], recovery_payload["assistant_messages"])
         self.assertEqual(
-            ["legacy evidence"],
-            self.receipt(redelivery)["payload"]["assistant_messages"],
+            hashlib.sha256(b"").hexdigest(),
+            recovery_payload["transcript_digest"],
         )
         promoted = json.loads(cursor_path.read_text(encoding="utf-8"))
         self.assertEqual(redelivery.receipt_id, promoted["receipt_id"])

@@ -25,7 +25,7 @@ class TranscriptDelta:
     cursor: dict[str, object] | None = None
     previous_receipt_id: str | None = None
     previous_delivery_digest: str | None = None
-    legacy_evidence: dict[str, object] | None = None
+    legacy_cursor: bool = False
     has_complete_delta: bool = False
 
 
@@ -219,7 +219,7 @@ def prepare_transcript_delta(
             quality = "complete"
             previous_receipt_id = None
             previous_delivery_digest = None
-            loaded_legacy_cursor = False
+            legacy_cursor = False
             prefix = b""
             if cursor is not None:
                 prefix_length = int(cursor["prefix_length"])
@@ -238,7 +238,7 @@ def prepare_transcript_delta(
                     prefix_digest = str(cursor["prefix_sha256"])
                     previous_receipt_id = cursor.get("receipt_id")
                     previous_delivery_digest = cursor.get("delivery_digest")
-                    loaded_legacy_cursor = previous_receipt_id is None
+                    legacy_cursor = previous_receipt_id is None
                 else:
                     prefix_length = 0
                     quality = "partial"
@@ -262,25 +262,13 @@ def prepare_transcript_delta(
                 "prefix_length": prefix_length,
                 "prefix_sha256": prefix_digest,
             }
-            legacy_evidence = None
-            if (
-                loaded_legacy_cursor
-                and not complete
-                and metadata.st_size <= MAX_TRANSCRIPT_BYTES
-            ):
-                os.lseek(descriptor, prefix_length, os.SEEK_SET)
-                prior = prefix + _read_at_most(
-                    descriptor, offset - prefix_length
-                )
-                if len(prior) == offset:
-                    legacy_evidence = _evidence_payload(prior, normalize)
             return TranscriptDelta(
                 payload=evidence,
                 cursor_path=cursor_path,
                 cursor=next_cursor,
                 previous_receipt_id=previous_receipt_id,
                 previous_delivery_digest=previous_delivery_digest,
-                legacy_evidence=legacy_evidence,
+                legacy_cursor=legacy_cursor,
                 has_complete_delta=bool(complete),
             )
         finally:

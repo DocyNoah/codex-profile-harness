@@ -195,20 +195,16 @@ def _publish_exclusively(path: Path, content: str) -> bool:
         temporary_path.unlink(missing_ok=True)
 
 
-def _duplicate_published_same_transcript(
-    receipt_path: Path, expected_receipt: dict[str, Any]
-) -> bool:
-    """Confirm a duplicate receipt already published this exact delta."""
-    expected_payload = expected_receipt["payload"]
-    if any(field not in expected_payload for field in _TRANSCRIPT_EVIDENCE_FIELDS):
-        return False
+def _read_valid_receipt(
+    receipt_path: Path, expected_id: str
+) -> dict[str, Any] | None:
     try:
         if receipt_path.is_symlink() or not receipt_path.is_file():
-            return False
+            return None
         with receipt_path.open("rb") as handle:
             raw = handle.read(MAX_INPUT_BYTES + 1)
         if len(raw) > MAX_INPUT_BYTES:
-            return False
+            return None
 
         def reject_constant(value: str) -> None:
             raise ValueError(f"non-standard JSON constant: {value}")
@@ -217,7 +213,7 @@ def _duplicate_published_same_transcript(
         receipt = validate_receipt(
             receipt,
             receipt_path,
-            expected_id=expected_receipt["id"],
+            expected_id=expected_id,
         )
     except (
         OSError,
@@ -226,6 +222,19 @@ def _duplicate_published_same_transcript(
         json.JSONDecodeError,
         ReceiptValidationError,
     ):
+        return None
+    return receipt
+
+
+def _duplicate_published_same_transcript(
+    receipt_path: Path, expected_receipt: dict[str, Any]
+) -> bool:
+    """Confirm a duplicate receipt already published this exact delta."""
+    expected_payload = expected_receipt["payload"]
+    if any(field not in expected_payload for field in _TRANSCRIPT_EVIDENCE_FIELDS):
+        return False
+    receipt = _read_valid_receipt(receipt_path, expected_receipt["id"])
+    if receipt is None:
         return False
     return (
         receipt_path.stem == expected_receipt["id"]
@@ -233,6 +242,30 @@ def _duplicate_published_same_transcript(
         and receipt["event"] == expected_receipt["event"]
         and receipt["cwd"] == expected_receipt["cwd"]
         and receipt["payload"] == expected_payload
+    )
+
+
+def _duplicate_published_legacy_delivery(
+    receipt_path: Path, expected_receipt: dict[str, Any]
+) -> bool:
+    """Confirm a valid legacy receipt matches the current hook delivery."""
+    receipt = _read_valid_receipt(receipt_path, expected_receipt["id"])
+    if receipt is None:
+        return False
+    receipt_payload = receipt["payload"]
+    if any(field not in receipt_payload for field in _TRANSCRIPT_EVIDENCE_FIELDS):
+        return False
+    base_payload = {
+        key: value
+        for key, value in receipt_payload.items()
+        if key not in _TRANSCRIPT_EVIDENCE_FIELDS
+    }
+    return (
+        receipt_path.stem == expected_receipt["id"]
+        and receipt["id"] == expected_receipt["id"]
+        and receipt["event"] == expected_receipt["event"]
+        and receipt["cwd"] == expected_receipt["cwd"]
+        and base_payload == expected_receipt["payload"]
     )
 
 
@@ -262,6 +295,7 @@ def capture_event(payload: dict, cwd: Path | None = None) -> CaptureResult:
 
     maximum = _max_text_chars(profile_root)
     normalized = _normalized_payload(payload, maximum)
+    base_payload = dict(normalized)
     transcript = prepare_transcript_delta(
         profile_root,
         session_id.strip(),
@@ -298,35 +332,25 @@ def capture_event(payload: dict, cwd: Path | None = None) -> CaptureResult:
     receipt_cwd = _normalize_text(str(Path(start).expanduser().resolve()), maximum)
     captured_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     legacy_expected_receipt = None
+    reused_legacy_receipt = False
     if (
         not transcript.has_complete_delta
         and transcript.previous_receipt_id is None
         and transcript.previous_delivery_digest is None
-        and transcript.legacy_evidence is not None
+        and transcript.legacy_cursor
     ):
-        legacy_payload = dict(normalized)
-        legacy_payload.update(transcript.legacy_evidence)
         legacy_path = inbox / f"{delivery_digest}.json"
         legacy_expected_receipt = {
             "id": delivery_digest,
             "event": event,
-            "captured_at": captured_at,
             "cwd": receipt_cwd,
-            "payload": legacy_payload,
+            "payload": base_payload,
         }
-        if _duplicate_published_same_transcript(
+        if _duplicate_published_legacy_delivery(
             legacy_path, legacy_expected_receipt
         ):
             receipt_id = delivery_digest
-        else:
-            normalized = legacy_payload
-            receipt_id = _receipt_id(
-                event,
-                session_id.strip(),
-                discriminator_value.strip(),
-                normalized.get("last_assistant_message", ""),
-                normalized,
-            )
+            reused_legacy_receipt = True
     if transcript.cursor is not None:
         transcript.cursor["receipt_id"] = receipt_id
         transcript.cursor["delivery_digest"] = delivery_digest
@@ -348,15 +372,19 @@ def capture_event(payload: dict, cwd: Path | None = None) -> CaptureResult:
     content = json.dumps(receipt, ensure_ascii=False, sort_keys=True, indent=2) + "\n"
     created = _publish_exclusively(receipt_path, content)
     published_receipt_expectation = (
-        legacy_expected_receipt
-        if receipt_id == delivery_digest and legacy_expected_receipt is not None
-        else receipt
+        legacy_expected_receipt if reused_legacy_receipt else receipt
     )
     cursor_evidence_published = created or (
         transcript.cursor_path is not None
         and transcript.cursor is not None
-        and _duplicate_published_same_transcript(
-            receipt_path, published_receipt_expectation
+        and (
+            _duplicate_published_legacy_delivery(
+                receipt_path, published_receipt_expectation
+            )
+            if reused_legacy_receipt
+            else _duplicate_published_same_transcript(
+                receipt_path, published_receipt_expectation
+            )
         )
     )
     if cursor_evidence_published:
