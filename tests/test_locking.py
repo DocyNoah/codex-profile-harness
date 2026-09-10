@@ -8,6 +8,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -31,6 +32,30 @@ class ProfileLeaseTests(unittest.TestCase):
                         root, owner={"worker": "second"}, stale_timeout=60
                     ):
                         self.fail("the second owner acquired a live lease")
+
+    def test_guard_loser_is_busy_when_owner_metadata_disappears(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory) / "profile"
+            init_profile(root, "Work")
+            first = ProfileLease(root, owner={"worker": "first"}, stale_timeout=60)
+            first.acquire()
+            owner_path = first.path / "owner.json"
+            original_exists = Path.exists
+
+            def remove_owner_after_exists(path: Path) -> bool:
+                exists = original_exists(path)
+                if path == owner_path and exists:
+                    path.unlink()
+                return exists
+
+            try:
+                with patch.object(Path, "exists", remove_owner_after_exists):
+                    with self.assertRaises(LeaseBusyError):
+                        ProfileLease(
+                            root, owner={"worker": "second"}, stale_timeout=60
+                        ).acquire()
+            finally:
+                first.release()
 
     def test_stale_profile_lease_is_quarantined_and_replaced(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

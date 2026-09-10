@@ -100,7 +100,10 @@ class ProfileLease:
             fcntl.flock(guard.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as error:
             guard.close()
-            metadata = self._existing_metadata()
+            try:
+                metadata = self._existing_metadata()
+            except ValueError:
+                metadata = {}
             owner = json.dumps(metadata.get("owner", {}), sort_keys=True)
             raise LeaseBusyError(f"curation lease is live: {owner}") from error
         try:
