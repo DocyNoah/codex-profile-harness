@@ -72,7 +72,51 @@ the shipped runtime remains Python 3.11+ standard-library-only.
 - Automatic hook discovery and trust prompts require installation in a Codex
   host. Local tests validate the hook manifest and capture command, but do not
   simulate the host application's trust UI.
-- The package intentionally contains no marketplace metadata. Documentation
-  treats source installation as the tested default and describes app-managed
-  plugin installation only when an operator already has a trusted local plugin
-  source configured.
+- At the initial implementation commit, the package contained no marketplace
+  metadata and used source installation as the tested default. Fix Round 1 below
+  supersedes that limitation with a generated local marketplace artifact.
+
+## Fix Round 1
+
+Implementation commit: `f2215f90acd77ced90a579c308c4fe6c735b997c`
+
+### Review changes
+
+- Doctor now validates the minimum executable contracts of the plugin manifest,
+  both lifecycle hook registrations, and both JSON schemas instead of accepting
+  parseable but unusable JSON.
+- Profile configuration has one shared semantic loader for capture, curation,
+  profile loading, and doctor. `doctor --profile` and durable profile-marker
+  discovery allow missing or corrupt configuration to be diagnosed with a
+  nonzero result.
+- Installation now builds an allowlisted local marketplace artifact. The
+  builder excludes repository metadata, arbitrary untracked files, credentials,
+  tests, caches, bytecode, and profile state, and refuses to overwrite output.
+- The generated marketplace fixes the name
+  `codex-profile-harness-local` and the exact plugin selector
+  `codex-profile-harness@codex-profile-harness-local`. Install, upgrade,
+  uninstall, troubleshooting, README, and security guidance use those exact
+  values and do not imply remote marketplace publication.
+
+### TDD and verification
+
+The focused RED run first produced six assertion failures and one import error:
+semantic plugin corruption was accepted, broken-profile CLI diagnosis was
+unavailable, invalid runtime configuration was not reported, and the packaging
+module did not exist. After the minimal fixes:
+
+- `python3 -m unittest discover -s tests -v` — 70 tests, 0 failures.
+- Plugin validator — source tree and generated marketplace plugin both passed.
+- Skill quick validator — passed.
+- `python3 -m compileall -q src tests scripts` — exit 0.
+- CLI smoke — built a local marketplace, initialized a profile, registered a
+  nested repository, generated a dashboard, returned healthy doctor output,
+  and returned diagnostic errors for an explicitly selected broken config.
+- `git diff --check` and artifact hygiene scans — passed.
+
+### Remaining concern
+
+Codex hook discovery and the trust prompt are host UI behavior and were not
+automated. The hook contract and exact local marketplace metadata were validated
+locally, and the relevant `codex plugin marketplace` and `codex plugin` command
+forms were checked against the installed CLI help.
