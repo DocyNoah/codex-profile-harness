@@ -18,6 +18,8 @@ from .curation import (
     load_result,
     prepare_curation,
 )
+from .dashboard import generate_dashboard
+from .doctor import diagnose
 from .locking import ProfileLease
 from .runner import run_codex
 
@@ -48,6 +50,16 @@ def _parser() -> argparse.ArgumentParser:
     mode.add_argument("--run", action="store_true", help="prepare, invoke Codex, and apply")
     curate.add_argument("--limit", type=int)
     curate.add_argument("--batch", dest="batch_id")
+
+    commands.add_parser(
+        "dashboard", help="regenerate DASHBOARD.md from repository indexes"
+    )
+    doctor = commands.add_parser("doctor", help="diagnose plugin and profile integrity")
+    doctor.add_argument(
+        "--check-codex",
+        action="store_true",
+        help="also require the configured Codex executable",
+    )
     return parser
 
 
@@ -173,6 +185,20 @@ def main(argv: list[str] | None = None) -> int:
             return _capture_from_stdin()
         elif arguments.command == "curate":
             return _curate(arguments)
+        elif arguments.command == "dashboard":
+            root = find_profile_root(Path.cwd())
+            print(generate_dashboard(root))
+        elif arguments.command == "doctor":
+            root = find_profile_root(Path.cwd())
+            command, _, stale_timeout = _curation_settings(root)
+            report = diagnose(
+                root,
+                stale_timeout=stale_timeout,
+                check_codex=arguments.check_codex,
+                codex_command=command,
+            )
+            print(report.format())
+            return 0 if report.ok else 1
     except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
         parser.error(str(error))
     return 0

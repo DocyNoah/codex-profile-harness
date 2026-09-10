@@ -18,6 +18,8 @@ from .curation import (
     prepare_curation,
     validate_actions,
 )
+from .dashboard import generate_dashboard
+from .doctor import DoctorReport, Finding, diagnose
 from .journal import append_entry, verify_journal
 from .locking import LeaseBusyError, ProfileLease
 from .runner import run_codex
@@ -30,13 +32,17 @@ __all__ = [
     "ApplyResult",
     "CurationBatch",
     "CurationError",
+    "DoctorReport",
+    "Finding",
     "LeaseBusyError",
     "ProfileLease",
     "append_entry",
     "apply_actions",
     "claim_receipts",
+    "diagnose",
     "find_profile_root",
     "capture_event",
+    "generate_dashboard",
     "init_profile",
     "load_profile",
     "prepare_curation",
