@@ -163,3 +163,57 @@ implemented.
 
 - No new concerns. Git and guard waits are bounded; public-release work remains
   deferred to Task 4.
+
+## Final fix C: Hook-safe scheduled checkpoints
+
+### Commit
+
+- `2fd9605e73bcbfa5bbcbcad5996488372b565694` — `fix: move hook checkpoints to maintenance`
+
+### RED evidence
+
+- A real hook subprocess test installed a fake `git` that records invocation and
+  sleeps for five seconds. Before the fix, capture entered Git, exceeded its
+  subprocess bound, and the focused run reported one error plus two expected
+  maintenance assertion failures in 6.326 seconds.
+- The no-op and injected-failure maintenance tests both found only
+  `harness: initialize profile` at `HEAD`, proving pending managed documents were
+  not checkpointed on those paths.
+- A deterministic termination test injected `EPERM` for process-group kill.
+  Before the defensive fix, the reader leaked `PermissionError` and the command
+  exceeded its deadline instead of returning a bounded Git error.
+
+### Behavior
+
+- Stop and SessionEnd capture finish after durable receipt publication and
+  ordered cursor publication. They never invoke Git, so a slow or wedged Git
+  executable cannot consume the three-second hook envelope. Receipt/inbox data
+  remains runtime evidence outside the Git allowlist.
+- `maintain` performs one generic pending-managed-document checkpoint in a
+  `finally` block while still holding the profile lease. This covers due, empty,
+  not-due, and maintenance-failure paths without replacing the original error.
+- Existing curation, improvement, and recovery checkpoints remain at their
+  post-durable boundaries. If a specific checkpoint already committed the diff,
+  the final generic checkpoint is a no-op; real tests assert there is no
+  duplicate commit and the specific subjects remain intact.
+- Group termination falls back to killing the direct Git child if the platform
+  refuses process-group signaling, preventing exceptions from escaping bounded
+  reader threads.
+- README, security guidance, the profile skill, implementation plan, and design
+  specification consistently describe hook-only evidence publication and
+  scheduled maintenance checkpoints.
+
+### Verification
+
+- Focused suite: 76 tests passed in 13.778s with `ResourceWarning` promoted to
+  errors.
+- Full suite: 193 tests passed in 46.774s with `ResourceWarning` promoted to
+  errors.
+- `python3 -m compileall -q src tests` — exit 0.
+- `git diff --check` — exit 0.
+
+### Concerns
+
+- Automatic checkpoint latency is now bounded by the external 15-minute
+  maintenance schedule rather than each lifecycle hook. Runtime receipts and
+  cursors remain intentionally untracked and require whole-profile backup.
