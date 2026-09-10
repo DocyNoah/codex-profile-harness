@@ -58,3 +58,47 @@
   boundary review instead.
 - Git checkpointing and public-release documentation remain intentionally
   deferred to Tasks 3 and 4.
+
+## Fix round 1
+
+### Commit
+
+- `2aa97a4` — `fix: harden maintenance recovery and scheduling`
+
+### RED evidence
+
+- Malicious improvement descriptors with `journal_snapshot = "AGENTS.md"`
+  completed recovery without error, replacing the improvement journal from the
+  policy file and deleting the named source. An exact-path malicious snapshot,
+  a wrong snapshot digest, and a target outside the proposal directory now all
+  fail before any file mutation.
+- Ten hash-valid rows marked `status = "failed"` were incorrectly eligible for
+  improvement. Curation rows now require the complete successful-event contract
+  covering type, status, batch provenance, receipt/archive evidence, result and
+  target digests, action count, changed paths, and UTC time. Doctor applies the
+  same semantic validator to every row.
+- Hash-valid malformed JSON values such as list receipt IDs and object changed
+  paths raised `TypeError` instead of producing an integrity finding. Runtime
+  type checks now precede set and mapping membership operations.
+- A literal `2026-09-11T12:00:00Z` maintenance clock produced a curation journal
+  time from the wall clock. The optional clock now reaches `apply_actions`, while
+  ordinary curation still defaults to the current UTC time.
+- TOML `nan` and `inf` values passed positive-number validation. Every numeric
+  configuration field now rejects non-finite values; integer-only fields also
+  reject non-integer non-finite values.
+- Symlinked curation and improvement journals were read during forced
+  improvement; one path reached the fake Codex executable. Both exact journal
+  paths are now safety-checked before journal reads and before any model call.
+
+### Verification
+
+- `python3 -m unittest tests.test_improvement tests.test_maintenance -v` — 20
+  focused tests passed in 5.337s.
+- `python3 -m unittest discover -s tests` — 122 tests passed in 9.063s.
+- `python3 -m compileall -q src tests` — exit 0.
+- `git diff --check` — exit 0, no output.
+
+### Concerns
+
+- No subagent review was run because this fix round explicitly prohibited
+  subagents.
