@@ -18,6 +18,9 @@ def run_codex(
     output_path: Path,
     *,
     command: str = "codex",
+    model: str = "gpt-5.6-sol",
+    reasoning_effort: str = "medium",
+    schema_path: Path = RESULT_SCHEMA,
     timeout: float = 300,
 ) -> Path:
     """Run Codex with a prompt on stdin, never exposing prompt data in argv."""
@@ -28,10 +31,14 @@ def run_codex(
     arguments = [
         str(command),
         "exec",
+        "--model",
+        model,
+        "-c",
+        f'model_reasoning_effort="{reasoning_effort}"',
         "--sandbox",
         "read-only",
         "--output-schema",
-        str(RESULT_SCHEMA.resolve()),
+        str(Path(schema_path).resolve()),
         "-o",
         str(output),
         "-",

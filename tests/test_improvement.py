@@ -1,0 +1,381 @@
+from __future__ import annotations
+
+from datetime import datetime, timedelta, timezone
+import json
+import os
+from pathlib import Path
+import stat
+import subprocess
+import sys
+import tempfile
+import unittest
+
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "src"))
+
+from profile_harness.config import init_profile  # noqa: E402
+from profile_harness.doctor import diagnose  # noqa: E402
+import profile_harness.doctor as doctor_module  # noqa: E402
+from profile_harness.improvement import (  # noqa: E402
+    ImprovementError,
+    improvement_due,
+    recover_improvement_transaction,
+    run_improvement,
+)
+from profile_harness.journal import append_entry, verify_journal  # noqa: E402
+from profile_harness.packaging import build_local_marketplace  # noqa: E402
+
+
+NOW = datetime(2026, 9, 11, 12, 0, 0, tzinfo=timezone.utc)
+
+
+class ImprovementTests(unittest.TestCase):
+    def make_profile(self, parent: Path) -> Path:
+        root = parent / "profile"
+        init_profile(root, "Work")
+        return root
+
+    def add_curations(self, root: Path, count: int, *, start: datetime) -> list[dict]:
+        journal = root / ".harness/memory/journal/curation.jsonl"
+        entries = []
+        for index in range(count):
+            entries.append(append_entry(journal, {
+                "batch_id": f"batch-{index}",
+                "actions": 0,
+                "applied_at": (start + timedelta(minutes=index)).isoformat().replace("+00:00", "Z"),
+            }))
+        return entries
+
+    def add_improvement_success(self, root: Path, curation_head: str, at: datetime) -> dict:
+        return append_entry(root / ".harness/memory/journal/improvement.jsonl", {
+            "event": "improvement",
+            "model": "gpt-6-astra",
+            "reasoning_effort": "high",
+            "source_journal_hashes": [curation_head],
+            "curation_head_hash": curation_head,
+            "result_digest": "1" * 64,
+            "proposal_digests": {},
+            "applied_at": at.isoformat().replace("+00:00", "Z"),
+        })
+
+    def make_fake(self, parent: Path, result: dict, invocation: Path | None = None) -> Path:
+        fake = parent / "fake-codex"
+        lines = ["#!/usr/bin/env python3", "import json,os,pathlib,sys"]
+        if invocation is not None:
+            lines.append(
+                f"pathlib.Path({str(invocation)!r}).write_text(json.dumps({{'argv':sys.argv[1:],'stdin':sys.stdin.read(),'cwd':os.getcwd()}}))"
+            )
+        else:
+            lines.append("sys.stdin.read()")
+        lines.append(
+            f"pathlib.Path(sys.argv[sys.argv.index('-o')+1]).write_text({json.dumps(json.dumps(result))})"
+        )
+        fake.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        fake.chmod(fake.stat().st_mode | stat.S_IXUSR)
+        return fake
+
+    def configure_fake(self, root: Path, fake: Path) -> None:
+        path = root / ".harness/config.toml"
+        text = path.read_text()
+        line = f'codex_command = {json.dumps(str(fake))}'
+        if "codex_command = " in text:
+            import re
+            text = re.sub(r"codex_command = .+", line, text)
+        else:
+            text += f"\n[curation]\n{line}\n"
+        path.write_text(text, encoding="utf-8")
+
+    def test_improvement_thresholds_and_cooldown_have_inclusive_boundaries(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = self.make_profile(Path(temporary_directory))
+            entries = self.add_curations(root, 10, start=NOW - timedelta(hours=1))
+            self.assertTrue(improvement_due(root, now=NOW).due)
+            self.assertEqual("high_threshold", improvement_due(root, now=NOW).reason)
+            self.add_improvement_success(root, entries[-1]["entry_hash"], NOW - timedelta(hours=24))
+            self.add_curations(root, 10, start=NOW - timedelta(hours=1))
+            self.assertTrue(improvement_due(root, now=NOW).due)
+            self.assertEqual(10, improvement_due(root, now=NOW).new_curations)
+
+            too_soon = improvement_due(root, now=NOW - timedelta(seconds=1))
+            self.assertFalse(too_soon.due)
+            self.assertEqual("cooldown", too_soon.reason)
+            self.assertEqual(1.0, too_soon.seconds_until_cooldown)
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = self.make_profile(Path(temporary_directory))
+            self.add_curations(root, 3, start=NOW - timedelta(hours=72))
+            due = improvement_due(root, now=NOW)
+            self.assertTrue(due.due)
+            self.assertEqual("low_interval", due.reason)
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = self.make_profile(Path(temporary_directory))
+            self.add_curations(root, 2, start=NOW - timedelta(days=10))
+            self.assertFalse(improvement_due(root, now=NOW).due)
+            self.assertEqual("curation_count", improvement_due(root, now=NOW).reason)
+
+    def test_force_invokes_exact_improvement_model_and_creates_only_proposals(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            parent = Path(temporary_directory)
+            root = self.make_profile(parent)
+            entries = self.add_curations(root, 1, start=NOW)
+            invocation = parent / "invocation.json"
+            result = {"proposals": [{
+                "title": "Safer review",
+                "content": "Require a review before policy changes.",
+                "source_journal_hashes": [entries[0]["entry_hash"]],
+            }]}
+            fake = self.make_fake(parent, result, invocation)
+            self.configure_fake(root, fake)
+            protected = {name: (root / name).read_bytes() for name in (
+                "AGENTS.md", "IDENTITY.md", "USER.md", "CONTEXT.md", "MEMORY.md", "PROJECTS.toml", ".harness/config.toml"
+            )}
+
+            output = run_improvement(root, now=NOW, force=True)
+
+            self.assertEqual("performed", output["status"])
+            proposals = list((root / ".harness/improvements/proposed").glob("*.md"))
+            self.assertEqual(1, len(proposals))
+            self.assertEqual("# Safer review\n\nRequire a review before policy changes.\n", proposals[0].read_text())
+            self.assertEqual(protected, {name: (root / name).read_bytes() for name in protected})
+            call = json.loads(invocation.read_text())
+            self.assertEqual(str(root.resolve()), call["cwd"])
+            self.assertIn('"batch_id": "batch-0"', call["stdin"])
+            self.assertNotIn("session_id", call["stdin"])
+            self.assertEqual([
+                "exec", "--model", "gpt-6-astra", "-c", 'model_reasoning_effort="high"',
+                "--sandbox", "read-only", "--output-schema",
+                str((ROOT / "schemas/improvement-result.schema.json").resolve()),
+                "-o", str((root / ".harness/state/improvement-result.json").resolve()), "-",
+            ], call["argv"])
+            journal = verify_journal(root / ".harness/memory/journal/improvement.jsonl")
+            self.assertEqual(1, len(journal))
+            self.assertEqual("gpt-6-astra", journal[0]["model"])
+            self.assertEqual("high", journal[0]["reasoning_effort"])
+            self.assertEqual([entries[0]["entry_hash"]], journal[0]["source_journal_hashes"])
+            self.assertEqual(64, len(journal[0]["result_digest"]))
+            self.assertEqual(1, len(journal[0]["proposal_digests"]))
+
+    def test_improvement_bounds_journal_metadata_to_one_hundred_recent_sources(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            parent = Path(temporary_directory)
+            root = self.make_profile(parent)
+            entries = self.add_curations(root, 101, start=NOW - timedelta(hours=2))
+            invocation = parent / "invocation.json"
+            fake = self.make_fake(parent, {"proposals": [{
+                "title": "Bounded", "content": "Recent evidence only.",
+                "source_journal_hashes": [entries[-1]["entry_hash"]],
+            }]}, invocation)
+            self.configure_fake(root, fake)
+
+            run_improvement(root, now=NOW, force=True)
+
+            prompt = json.loads(invocation.read_text())["stdin"]
+            self.assertNotIn(entries[0]["entry_hash"], prompt)
+            self.assertIn(entries[-1]["entry_hash"], prompt)
+            journal = verify_journal(root / ".harness/memory/journal/improvement.jsonl")
+            self.assertEqual(100, len(journal[0]["source_journal_hashes"]))
+            self.assertEqual(entries[-1]["entry_hash"], journal[0]["curation_head_hash"])
+
+    def test_not_due_and_failed_results_leave_no_success_artifacts_and_retry(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            parent = Path(temporary_directory)
+            root = self.make_profile(parent)
+            entries = self.add_curations(root, 1, start=NOW)
+            called = parent / "called"
+            fake = parent / "fake"
+            fake.write_text(f"#!/bin/sh\ntouch {str(called)!r}\n", encoding="utf-8")
+            fake.chmod(fake.stat().st_mode | stat.S_IXUSR)
+            self.configure_fake(root, fake)
+            self.assertEqual("no_op", run_improvement(root, now=NOW)["status"])
+            self.assertFalse(called.exists())
+            self.assertFalse((root / ".harness/memory/journal/improvement.jsonl").exists())
+
+            bad = self.make_fake(parent, {"proposals": [{
+                "title": "Bad", "content": "Bad", "source_journal_hashes": ["f" * 64]
+            }]})
+            self.configure_fake(root, bad)
+            with self.assertRaises(ImprovementError):
+                run_improvement(root, now=NOW, force=True)
+            self.assertFalse(list((root / ".harness/improvements/proposed").iterdir()))
+            self.assertFalse((root / ".harness/memory/journal/improvement.jsonl").exists())
+
+            good = self.make_fake(parent, {"proposals": [{
+                "title": "Retry", "content": "Succeeded", "source_journal_hashes": [entries[0]["entry_hash"]]
+            }]})
+            self.configure_fake(root, good)
+            self.assertEqual("performed", run_improvement(root, now=NOW, force=True)["status"])
+
+    def test_force_does_not_bypass_disabled_setting_and_cli_run_force_is_available(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            parent = Path(temporary_directory)
+            root = self.make_profile(parent)
+            entries = self.add_curations(root, 1, start=NOW)
+            called = parent / "called"
+            fake = parent / "fake-codex"
+            fake.write_text(f"#!/bin/sh\ntouch {str(called)!r}\n", encoding="utf-8")
+            fake.chmod(fake.stat().st_mode | stat.S_IXUSR)
+            config = root / ".harness/config.toml"
+            config.write_text(
+                config.read_text() + f'\n[curation]\ncodex_command = {json.dumps(str(fake))}\n'
+                + "\n[improvement]\nenabled = false\n",
+                encoding="utf-8",
+            )
+            output = run_improvement(root, now=NOW, force=True)
+            self.assertEqual("no_op", output["status"])
+            self.assertEqual("disabled", output["reason"])
+            self.assertFalse(called.exists())
+
+            cli_fake = self.make_fake(parent, {"proposals": [{
+                "title": "CLI", "content": "Works",
+                "source_journal_hashes": [entries[0]["entry_hash"]],
+            }]})
+            config.write_text(
+                f'version = 1\nname = "Work"\n\n[curation]\ncodex_command = {json.dumps(str(cli_fake))}\n',
+                encoding="utf-8",
+            )
+            result = subprocess.run(
+                [sys.executable, str(ROOT / "bin/profile-harness"), "improve", "--run", "--force"],
+                cwd=root, text=True, capture_output=True, check=False,
+            )
+            self.assertEqual(0, result.returncode, result.stderr)
+            self.assertEqual("performed", json.loads(result.stdout)["status"])
+
+    def test_duplicate_titles_are_unique_and_result_paths_are_forbidden(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            parent = Path(temporary_directory)
+            root = self.make_profile(parent)
+            entries = self.add_curations(root, 1, start=NOW)
+            result = {"proposals": [
+                {"title": "Same", "content": "First", "source_journal_hashes": [entries[0]["entry_hash"]]},
+                {"title": "Same", "content": "Second", "source_journal_hashes": [entries[0]["entry_hash"]]},
+            ]}
+            fake = self.make_fake(parent, result)
+            self.configure_fake(root, fake)
+            run_improvement(root, now=NOW, force=True)
+            proposals = list((root / ".harness/improvements/proposed").glob("*.md"))
+            self.assertEqual(2, len(proposals))
+            self.assertEqual(2, len({path.name for path in proposals}))
+
+            unsafe = self.make_fake(parent, {"proposals": [{
+                "title": "No", "content": "No", "path": "../IDENTITY.md",
+                "source_journal_hashes": [entries[0]["entry_hash"]]
+            }]})
+            self.configure_fake(root, unsafe)
+            with self.assertRaises(ImprovementError):
+                run_improvement(root, now=NOW, force=True)
+
+    def test_symlink_escape_and_injected_failure_roll_back_proposals_and_journal(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            parent = Path(temporary_directory)
+            root = self.make_profile(parent)
+            entries = self.add_curations(root, 1, start=NOW)
+            result = {"proposals": [{
+                "title": "Safe", "content": "Body", "source_journal_hashes": [entries[0]["entry_hash"]]
+            }]}
+            outside = parent / "outside"
+            outside.mkdir()
+            proposed = root / ".harness/improvements/proposed"
+            proposed.rmdir()
+            proposed.symlink_to(outside, target_is_directory=True)
+            fake = self.make_fake(parent, result)
+            self.configure_fake(root, fake)
+            with self.assertRaises(ImprovementError):
+                run_improvement(root, now=NOW, force=True)
+            self.assertFalse(list(outside.iterdir()))
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            parent = Path(temporary_directory)
+            root = self.make_profile(parent)
+            entries = self.add_curations(root, 1, start=NOW)
+            fake = self.make_fake(parent, {"proposals": [{
+                "title": "Rollback", "content": "Body", "source_journal_hashes": [entries[0]["entry_hash"]]
+            }]})
+            self.configure_fake(root, fake)
+            with self.assertRaisesRegex(RuntimeError, "injected"):
+                run_improvement(root, now=NOW, force=True, fail_after_writes=1)
+            self.assertFalse(list((root / ".harness/improvements/proposed").iterdir()))
+            self.assertFalse((root / ".harness/memory/journal/improvement.jsonl").exists())
+            self.assertFalse((root / ".harness/state/improvement-transaction.json").exists())
+
+    def test_recovery_obeys_precommit_and_committed_wal_states(self) -> None:
+        for state, keep in (("applying", False), ("committed", True)):
+            with self.subTest(state=state), tempfile.TemporaryDirectory() as temporary_directory:
+                root = self.make_profile(Path(temporary_directory))
+                proposal = root / ".harness/improvements/proposed/p.md"
+                proposal.write_text("proposal", encoding="utf-8")
+                journal = root / ".harness/memory/journal/improvement.jsonl"
+                append_entry(journal, {"event": "improvement"})
+                descriptor = root / ".harness/state/improvement-transaction.json"
+                descriptor.write_text(json.dumps({
+                    "version": 1, "state": state,
+                    "targets": [str(proposal.relative_to(root))],
+                    "journal_existed": False,
+                }), encoding="utf-8")
+                recover_improvement_transaction(root)
+                self.assertEqual(keep, proposal.exists())
+                self.assertEqual(keep, journal.exists())
+                self.assertFalse(descriptor.exists())
+
+    def test_real_process_crashes_recover_precommit_or_finish_committed_state(self) -> None:
+        for stage, keep in (("after_journal", False), ("after_commit", True)):
+            with self.subTest(stage=stage), tempfile.TemporaryDirectory() as temporary_directory:
+                parent = Path(temporary_directory)
+                root = self.make_profile(parent)
+                entries = self.add_curations(root, 1, start=NOW)
+                fake = self.make_fake(parent, {"proposals": [{
+                    "title": "Crash", "content": "Body",
+                    "source_journal_hashes": [entries[0]["entry_hash"]],
+                }]})
+                self.configure_fake(root, fake)
+                script = (
+                    "import sys;from datetime import datetime,timezone;from pathlib import Path;"
+                    f"sys.path.insert(0,{str(ROOT / 'src')!r});"
+                    "from profile_harness.improvement import run_improvement;"
+                    f"run_improvement(Path({str(root)!r}),now=datetime(2026,9,11,12,tzinfo=timezone.utc),force=True,crash_after_stage={stage!r})"
+                )
+                crashed = subprocess.run([sys.executable, "-c", script], check=False)
+                self.assertEqual(91, crashed.returncode)
+
+                recover_improvement_transaction(root)
+
+                self.assertEqual(keep, bool(list((root / ".harness/improvements/proposed").glob("*.md"))))
+                self.assertEqual(keep, (root / ".harness/memory/journal/improvement.jsonl").exists())
+                self.assertFalse((root / ".harness/state/improvement-transaction.json").exists())
+
+    def test_invalid_new_config_schema_weakening_and_packaging_are_detected(self) -> None:
+        invalid_fragments = (
+            "\n[improvement]\nautomatic_apply = true\n",
+            "\n[improvement]\nreasoning_effort = \"extreme\"\n",
+            "\n[curation]\nmaintenance_receipt_threshold = 0\n",
+            "\n[curation]\nmaintenance_max_receipts = 31\n",
+        )
+        for fragment in invalid_fragments:
+            with self.subTest(fragment=fragment), tempfile.TemporaryDirectory() as temporary_directory:
+                root = self.make_profile(Path(temporary_directory))
+                config = root / ".harness/config.toml"
+                config.write_text(config.read_text() + fragment, encoding="utf-8")
+                report = diagnose(root)
+                self.assertFalse(report.ok)
+                self.assertIn("configuration", report.format())
+
+        schema = json.loads((ROOT / "schemas/improvement-result.schema.json").read_text())
+        weakened = json.loads(json.dumps(schema))
+        weakened["properties"]["proposals"]["maxItems"] = 10_000
+        with self.assertRaises(ValueError):
+            doctor_module._validate_improvement_schema(weakened)
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            output = Path(temporary_directory) / "marketplace"
+            build_local_marketplace(ROOT, output)
+            plugin = output / "plugins/codex-profile-harness"
+            for relative in (
+                "src/profile_harness/maintenance.py", "src/profile_harness/improvement.py",
+                "schemas/improvement-result.schema.json", "templates/prompts/improve.md",
+            ):
+                self.assertTrue((plugin / relative).is_file(), relative)
+
+
+if __name__ == "__main__":
+    unittest.main()

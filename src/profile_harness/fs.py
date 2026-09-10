@@ -160,12 +160,14 @@ def atomic_write_text_if_missing(path: Path, content: str) -> None:
     exclusive_write_text(path, content)
 
 
-def exclusive_write_text(path: Path, content: str) -> None:
+def exclusive_write_text(path: Path, content: str) -> bool:
     """Atomically publish a complete UTF-8 file unless the target already exists."""
     temporary_path = _write_temporary_file(path, content)
     try:
         os.link(temporary_path, path)
+        fsync_directory(path.parent)
     except FileExistsError:
-        return
+        return False
     finally:
         temporary_path.unlink(missing_ok=True)
+    return True

@@ -340,6 +340,10 @@ class CurationTests(unittest.TestCase):
             self.assertEqual(
                 [
                     "exec",
+                    "--model",
+                    "gpt-5.6-sol",
+                    "-c",
+                    'model_reasoning_effort="medium"',
                     "--sandbox",
                     "read-only",
                     "--output-schema",

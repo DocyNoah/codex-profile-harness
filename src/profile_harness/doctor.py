@@ -35,6 +35,13 @@ from .curation import (
 )
 from .journal import verify_journal
 from .fs import require_safe_path
+from .improvement import (
+    MAX_CONTENT_CHARS as MAX_IMPROVEMENT_CONTENT_CHARS,
+    MAX_PROPOSALS,
+    MAX_SOURCE_HASHES,
+    MAX_TITLE_CHARS,
+    recover_improvement_transaction,
+)
 from .locking import LeaseBusyError, ProfileLease
 
 
@@ -44,12 +51,16 @@ REQUIRED_PLUGIN_FILES = (
     "hooks/hooks.json",
     "schemas/hook-receipt.schema.json",
     "schemas/curation-result.schema.json",
+    "schemas/improvement-result.schema.json",
     "skills/profile-harness/SKILL.md",
     "scripts/build_local_marketplace.py",
     "src/profile_harness/packaging.py",
+    "src/profile_harness/maintenance.py",
+    "src/profile_harness/improvement.py",
     "src/profile_harness/receipt.py",
     "src/profile_harness/transcript.py",
     "templates/prompts/curate.md",
+    "templates/prompts/improve.md",
     "templates/profile/AGENTS.md",
     "templates/profile/CONTEXT.md",
     "templates/profile/DASHBOARD.md",
@@ -527,11 +538,43 @@ def _validate_curation_schema(value: object) -> None:
     )
 
 
+def _validate_improvement_schema(value: object) -> None:
+    properties = _object_contract(value, {"proposals"}, "improvement result")
+    proposals = properties["proposals"]
+    if not isinstance(proposals, dict) or proposals.get("type") != "array":
+        raise ValueError("improvement proposals must be an array")
+    _exact_integer(proposals, "maxItems", MAX_PROPOSALS, "improvement proposals")
+    _reference_contract(proposals.get("items"), "#/$defs/proposal", "improvement proposals.items")
+    definitions = value.get("$defs") if isinstance(value, dict) else None
+    if not isinstance(definitions, dict) or set(definitions) != {"proposal"}:
+        raise ValueError("improvement schema must contain only the proposal definition")
+    proposal = _object_contract(
+        definitions["proposal"], {"title", "content", "source_journal_hashes"}, "improvement proposal"
+    )
+    _string_contract(
+        proposal["title"], minimum=1, maximum=MAX_TITLE_CHARS,
+        pattern="^[\\s\\S]*\\S[\\s\\S]*$", label="improvement proposal.title",
+    )
+    _string_contract(
+        proposal["content"], minimum=1, maximum=MAX_IMPROVEMENT_CONTENT_CHARS,
+        pattern="^[\\s\\S]*\\S[\\s\\S]*$", label="improvement proposal.content",
+    )
+    hashes = _array_contract(
+        proposal["source_journal_hashes"], minimum=1, maximum=MAX_SOURCE_HASHES,
+        unique=True, label="improvement proposal.source_journal_hashes",
+    )
+    _string_contract(
+        hashes, minimum=64, maximum=64, pattern="^[a-f0-9]{64}$",
+        label="improvement proposal.source_journal_hashes.items",
+    )
+
+
 JSON_VALIDATORS = {
     ".codex-plugin/plugin.json": _validate_manifest,
     "hooks/hooks.json": _validate_hooks,
     "schemas/hook-receipt.schema.json": _validate_receipt_schema,
     "schemas/curation-result.schema.json": _validate_curation_schema,
+    "schemas/improvement-result.schema.json": _validate_improvement_schema,
 }
 
 
@@ -793,6 +836,20 @@ def diagnose(
         else:
             findings.append(Finding("OK", "transaction", f"recovered {len(recovered)} interrupted transaction(s) while holding the profile lease"))
 
+    improvement_transaction = profile_root / ".harness/state/improvement-transaction.json"
+    if improvement_transaction.is_symlink():
+        findings.append(Finding("ERROR", "transaction", "improvement transaction descriptor is a symlink"))
+    elif improvement_transaction.exists():
+        try:
+            with ProfileLease(profile_root, stale_timeout=effective_stale_timeout):
+                recover_improvement_transaction(profile_root)
+        except LeaseBusyError:
+            findings.append(Finding("ERROR", "transaction", "interrupted improvement is actively locked; recovery was not attempted"))
+        except (OSError, ValueError) as error:
+            findings.append(Finding("ERROR", "transaction", f"improvement recovery failed: {error}"))
+        else:
+            findings.append(Finding("OK", "transaction", "recovered interrupted improvement while holding the profile lease"))
+
     for relative in RUNTIME_DIRECTORIES:
         path = profile_root / relative
         if path.is_symlink():
@@ -905,6 +962,27 @@ def diagnose(
                 "OK", "journal", f"hash chain verified ({len(entries)} entries)"
             )
         )
+
+    improvement_journal = profile_root / ".harness/memory/journal/improvement.jsonl"
+    try:
+        require_safe_path(profile_root, improvement_journal, directory=False)
+        improvement_entries = verify_journal(improvement_journal)
+    except (OSError, UnicodeError, ValueError) as error:
+        findings.append(Finding("ERROR", "journal", f"improvement journal: {error}"))
+    else:
+        for entry in improvement_entries:
+            if (
+                entry.get("event") != "improvement"
+                or not isinstance(entry.get("model"), str)
+                or not isinstance(entry.get("reasoning_effort"), str)
+                or not isinstance(entry.get("source_journal_hashes"), list)
+                or any(not isinstance(item, str) or re.fullmatch(r"[a-f0-9]{64}", item) is None for item in entry.get("source_journal_hashes", []))
+                or not isinstance(entry.get("result_digest"), str)
+                or re.fullmatch(r"[a-f0-9]{64}", entry.get("result_digest", "")) is None
+                or not isinstance(entry.get("proposal_digests"), dict)
+            ):
+                findings.append(Finding("ERROR", "journal", "improvement journal entry contract is invalid"))
+        findings.append(Finding("OK", "journal", f"improvement hash chain verified ({len(improvement_entries)} entries)"))
 
     lock = profile_root / ".harness/state/curation.lock"
     if lock.exists():

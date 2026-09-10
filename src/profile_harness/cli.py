@@ -26,6 +26,8 @@ from .curation import (
 from .dashboard import generate_dashboard
 from .doctor import diagnose
 from .locking import ProfileLease
+from .maintenance import run_maintenance
+from .improvement import run_improvement
 from .runner import run_codex
 
 
@@ -55,6 +57,12 @@ def _parser() -> argparse.ArgumentParser:
     mode.add_argument("--run", action="store_true", help="prepare, invoke Codex, and apply")
     curate.add_argument("--limit", type=int)
     curate.add_argument("--batch", dest="batch_id")
+
+    commands.add_parser("maintain", help="run deterministic due maintenance")
+
+    improve = commands.add_parser("improve", help="run proposal-only profile improvement")
+    improve.add_argument("--run", action="store_true", required=True)
+    improve.add_argument("--force", action="store_true")
 
     commands.add_parser(
         "dashboard", help="regenerate DASHBOARD.md from repository indexes"
@@ -104,18 +112,20 @@ def _capture_from_stdin() -> int:
     return exit_code
 
 
-def _curation_settings(root: Path) -> tuple[str, float, float]:
+def _curation_settings(root: Path) -> tuple[str, float, float, str, str]:
     config = load_profile_config(root).curation
     return (
         config.codex_command,
         config.codex_timeout_seconds,
         config.stale_timeout_seconds,
+        config.model,
+        config.reasoning_effort,
     )
 
 
 def _curate(arguments: argparse.Namespace) -> int:
     root = find_profile_root(Path.cwd())
-    command, timeout, stale_timeout = _curation_settings(root)
+    command, timeout, stale_timeout, model, reasoning_effort = _curation_settings(root)
     with ProfileLease(root, stale_timeout=stale_timeout):
         recover_transactions(root)
         if arguments.prepare:
@@ -152,6 +162,8 @@ def _curate(arguments: argparse.Namespace) -> int:
                     batch.prompt_path,
                     result_path,
                     command=command,
+                    model=model,
+                    reasoning_effort=reasoning_effort,
                     timeout=timeout,
                 )
                 applied = apply_actions(root, batch.batch_id, load_result(result_path))
@@ -185,6 +197,12 @@ def main(argv: list[str] | None = None) -> int:
             return _capture_from_stdin()
         elif arguments.command == "curate":
             return _curate(arguments)
+        elif arguments.command == "maintain":
+            root = find_profile_root(Path.cwd())
+            print(json.dumps(run_maintenance(root), ensure_ascii=False, sort_keys=True))
+        elif arguments.command == "improve":
+            root = find_profile_root(Path.cwd())
+            print(json.dumps(run_improvement(root, force=arguments.force), ensure_ascii=False, sort_keys=True))
         elif arguments.command == "dashboard":
             root = find_profile_root(Path.cwd())
             print(generate_dashboard(root))

@@ -45,6 +45,18 @@ DEFAULT_MAX_TEXT_CHARS = 4096
 DEFAULT_CODEX_COMMAND = "codex"
 DEFAULT_CODEX_TIMEOUT_SECONDS = 300.0
 DEFAULT_STALE_TIMEOUT_SECONDS = 300.0
+DEFAULT_CURATION_MODEL = "gpt-5.6-sol"
+DEFAULT_CURATION_REASONING_EFFORT = "medium"
+DEFAULT_MAINTENANCE_RECEIPT_THRESHOLD = 30
+DEFAULT_MAINTENANCE_MAX_RECEIPTS = 30
+DEFAULT_MAINTENANCE_MAX_AGE_SECONDS = 4 * 60 * 60
+DEFAULT_IMPROVEMENT_MODEL = "gpt-6-astra"
+DEFAULT_IMPROVEMENT_REASONING_EFFORT = "high"
+DEFAULT_IMPROVEMENT_COOLDOWN_SECONDS = 24 * 60 * 60
+DEFAULT_IMPROVEMENT_HIGH_THRESHOLD = 10
+DEFAULT_IMPROVEMENT_LOW_INTERVAL_SECONDS = 72 * 60 * 60
+DEFAULT_IMPROVEMENT_LOW_MINIMUM = 3
+REASONING_EFFORTS = frozenset({"low", "medium", "high", "xhigh", "max", "ultra"})
 
 
 @dataclass(frozen=True)
@@ -70,6 +82,23 @@ class CurationConfig:
     codex_command: str = DEFAULT_CODEX_COMMAND
     codex_timeout_seconds: float = DEFAULT_CODEX_TIMEOUT_SECONDS
     stale_timeout_seconds: float = DEFAULT_STALE_TIMEOUT_SECONDS
+    model: str = DEFAULT_CURATION_MODEL
+    reasoning_effort: str = DEFAULT_CURATION_REASONING_EFFORT
+    maintenance_receipt_threshold: int = DEFAULT_MAINTENANCE_RECEIPT_THRESHOLD
+    maintenance_max_receipts: int = DEFAULT_MAINTENANCE_MAX_RECEIPTS
+    maintenance_max_age_seconds: float = DEFAULT_MAINTENANCE_MAX_AGE_SECONDS
+
+
+@dataclass(frozen=True)
+class ImprovementConfig:
+    enabled: bool = True
+    model: str = DEFAULT_IMPROVEMENT_MODEL
+    reasoning_effort: str = DEFAULT_IMPROVEMENT_REASONING_EFFORT
+    cooldown_seconds: float = DEFAULT_IMPROVEMENT_COOLDOWN_SECONDS
+    high_threshold: int = DEFAULT_IMPROVEMENT_HIGH_THRESHOLD
+    low_interval_seconds: float = DEFAULT_IMPROVEMENT_LOW_INTERVAL_SECONDS
+    low_minimum: int = DEFAULT_IMPROVEMENT_LOW_MINIMUM
+    automatic_apply: bool = False
 
 
 @dataclass(frozen=True)
@@ -77,6 +106,7 @@ class HarnessConfig:
     name: str
     capture: CaptureConfig
     curation: CurationConfig
+    improvement: ImprovementConfig
 
 
 def _toml_string(value: str) -> str:
@@ -124,6 +154,27 @@ def _positive_number(value: object, field: str, errors: list[str]) -> float:
     return float(value)
 
 
+def _positive_integer(value: object, field: str, errors: list[str]) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        errors.append(f"{field} must be a positive integer")
+        return 1
+    return value
+
+
+def _nonempty_string(value: object, field: str, default: str, errors: list[str]) -> str:
+    if not isinstance(value, str) or not value.strip():
+        errors.append(f"{field} must be a non-empty string")
+        return default
+    return value.strip()
+
+
+def _reasoning_effort(value: object, field: str, default: str, errors: list[str]) -> str:
+    if not isinstance(value, str) or value not in REASONING_EFFORTS:
+        errors.append(f"{field} must be one of {', '.join(sorted(REASONING_EFFORTS))}")
+        return default
+    return value
+
+
 def load_profile_config(root: Path) -> HarnessConfig:
     """Load the complete validated harness configuration."""
     profile_root = Path(root).expanduser().resolve()
@@ -156,10 +207,10 @@ def load_profile_config(root: Path) -> HarnessConfig:
     if not isinstance(curation, dict):
         errors.append("curation configuration must be a TOML table")
         curation = {}
-    codex_command = curation.get("codex_command", DEFAULT_CODEX_COMMAND)
-    if not isinstance(codex_command, str) or not codex_command.strip():
-        errors.append("curation.codex_command must be a non-empty string")
-        codex_command = DEFAULT_CODEX_COMMAND
+    codex_command = _nonempty_string(
+        curation.get("codex_command", DEFAULT_CODEX_COMMAND),
+        "curation.codex_command", DEFAULT_CODEX_COMMAND, errors,
+    )
     codex_timeout = _positive_number(
         curation.get("codex_timeout_seconds", DEFAULT_CODEX_TIMEOUT_SECONDS),
         "curation.codex_timeout_seconds",
@@ -170,12 +221,80 @@ def load_profile_config(root: Path) -> HarnessConfig:
         "curation.stale_timeout_seconds",
         errors,
     )
+    curation_model = _nonempty_string(
+        curation.get("model", DEFAULT_CURATION_MODEL),
+        "curation.model", DEFAULT_CURATION_MODEL, errors,
+    )
+    curation_reasoning = _reasoning_effort(
+        curation.get("reasoning_effort", DEFAULT_CURATION_REASONING_EFFORT),
+        "curation.reasoning_effort", DEFAULT_CURATION_REASONING_EFFORT, errors,
+    )
+    receipt_threshold = _positive_integer(
+        curation.get("maintenance_receipt_threshold", DEFAULT_MAINTENANCE_RECEIPT_THRESHOLD),
+        "curation.maintenance_receipt_threshold", errors,
+    )
+    max_receipts = _positive_integer(
+        curation.get("maintenance_max_receipts", DEFAULT_MAINTENANCE_MAX_RECEIPTS),
+        "curation.maintenance_max_receipts", errors,
+    )
+    if max_receipts > DEFAULT_MAINTENANCE_MAX_RECEIPTS:
+        errors.append(
+            f"curation.maintenance_max_receipts must not exceed {DEFAULT_MAINTENANCE_MAX_RECEIPTS}"
+        )
+    max_age = _positive_number(
+        curation.get("maintenance_max_age_seconds", DEFAULT_MAINTENANCE_MAX_AGE_SECONDS),
+        "curation.maintenance_max_age_seconds", errors,
+    )
+
+    improvement = config.get("improvement", {})
+    if not isinstance(improvement, dict):
+        errors.append("improvement configuration must be a TOML table")
+        improvement = {}
+    enabled = improvement.get("enabled", True)
+    if not isinstance(enabled, bool):
+        errors.append("improvement.enabled must be boolean")
+        enabled = True
+    improvement_model = _nonempty_string(
+        improvement.get("model", DEFAULT_IMPROVEMENT_MODEL),
+        "improvement.model", DEFAULT_IMPROVEMENT_MODEL, errors,
+    )
+    improvement_reasoning = _reasoning_effort(
+        improvement.get("reasoning_effort", DEFAULT_IMPROVEMENT_REASONING_EFFORT),
+        "improvement.reasoning_effort", DEFAULT_IMPROVEMENT_REASONING_EFFORT, errors,
+    )
+    cooldown = _positive_number(
+        improvement.get("cooldown_seconds", DEFAULT_IMPROVEMENT_COOLDOWN_SECONDS),
+        "improvement.cooldown_seconds", errors,
+    )
+    high_threshold = _positive_integer(
+        improvement.get("high_threshold", DEFAULT_IMPROVEMENT_HIGH_THRESHOLD),
+        "improvement.high_threshold", errors,
+    )
+    low_interval = _positive_number(
+        improvement.get("low_interval_seconds", DEFAULT_IMPROVEMENT_LOW_INTERVAL_SECONDS),
+        "improvement.low_interval_seconds", errors,
+    )
+    low_minimum = _positive_integer(
+        improvement.get("low_minimum", DEFAULT_IMPROVEMENT_LOW_MINIMUM),
+        "improvement.low_minimum", errors,
+    )
+    automatic_apply = improvement.get("automatic_apply", False)
+    if automatic_apply is not False:
+        errors.append("improvement.automatic_apply must remain false")
+        automatic_apply = False
     if errors:
         raise ValueError("invalid profile configuration: " + "; ".join(errors))
     return HarnessConfig(
         name.strip(),
         CaptureConfig(max_text_chars),
-        CurationConfig(codex_command.strip(), codex_timeout, stale_timeout),
+        CurationConfig(
+            codex_command, codex_timeout, stale_timeout, curation_model,
+            curation_reasoning, receipt_threshold, max_receipts, max_age,
+        ),
+        ImprovementConfig(
+            enabled, improvement_model, improvement_reasoning, cooldown,
+            high_threshold, low_interval, low_minimum, automatic_apply,
+        ),
     )
 
 
