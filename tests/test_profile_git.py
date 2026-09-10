@@ -1,30 +1,37 @@
 from __future__ import annotations
 
 import json
+import fcntl
 import os
 from pathlib import Path
 import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from profile_harness.config import init_profile, register_repo  # noqa: E402
+from profile_harness.capture import capture_event  # noqa: E402
 from profile_harness.dashboard import generate_dashboard  # noqa: E402
 from profile_harness.doctor import diagnose  # noqa: E402
 from profile_harness.profile_git import (  # noqa: E402
     CHECKPOINT_SUBJECT,
+    CheckpointResult,
     CURATION_SUBJECT,
     INITIALIZE_SUBJECT,
     REGISTRY_SUBJECT,
     checkpoint_profile,
     inspect_profile_git,
     profile_git_log,
+    tracked_forbidden_paths,
 )
+import profile_harness.profile_git as profile_git_module  # noqa: E402
 
 
 def git(root: Path, *arguments: str, check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -42,6 +49,222 @@ def subjects(root: Path) -> list[str]:
 
 
 class ProfileGitTests(unittest.TestCase):
+    def test_hostile_git_environment_cannot_redirect_profile_checkpoint(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            parent = Path(temporary_directory)
+            profile = parent / "profile"
+            external = parent / "external"
+            init_profile(profile, "Work")
+            external.mkdir()
+            git(external, "init")
+            (external / "external.txt").write_text("untouched\n", encoding="utf-8")
+            git(external, "add", "external.txt")
+            git(external, "-c", "user.name=X", "-c", "user.email=x@x", "commit", "-m", "external")
+            external_index = external / ".git/index"
+            before = {
+                path.relative_to(external): path.read_bytes()
+                for path in external.rglob("*") if path.is_file()
+            }
+            (profile / "MEMORY.md").write_text("profile only\n", encoding="utf-8")
+            hostile = {
+                "GIT_DIR": str(external / ".git"),
+                "GIT_WORK_TREE": str(external),
+                "GIT_INDEX_FILE": str(external_index),
+                "GIT_OBJECT_DIRECTORY": str(external / ".git/objects"),
+                "GIT_ALTERNATE_OBJECT_DIRECTORIES": str(external / ".git/objects"),
+                "GIT_COMMON_DIR": str(external / ".git"),
+                "GIT_CONFIG_COUNT": "1",
+                "GIT_CONFIG_KEY_0": "core.hooksPath",
+                "GIT_CONFIG_VALUE_0": str(external),
+                "GIT_SSH_COMMAND": "false",
+                "GIT_ASKPASS": str(external / "external.txt"),
+            }
+
+            with mock.patch.dict(os.environ, hostile, clear=False):
+                result = checkpoint_profile(profile, CHECKPOINT_SUBJECT)
+
+            self.assertTrue(result.committed, result.error)
+            self.assertEqual(
+                before,
+                {path.relative_to(external): path.read_bytes() for path in external.rglob("*") if path.is_file()},
+            )
+            self.assertEqual("profile only\n", git(profile, "show", "HEAD:MEMORY.md").stdout)
+
+    def test_add_and_commit_hooks_signing_filters_and_fsmonitor_never_execute(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            profile = Path(temporary_directory) / "profile"
+            init_profile(profile, "Work")
+            markers = [profile / name for name in ("post-index-ran", "pre-commit-ran", "filter-ran", "fsmonitor-ran")]
+            scripts = {
+                ".git/hooks/post-index-change": f"#!/bin/sh\ntouch {markers[0]}\n",
+                ".git/hooks/pre-commit": f"#!/bin/sh\ntouch {markers[1]}\nexit 1\n",
+                "filter-command": f"#!/bin/sh\ntouch {markers[2]}\ncat\n",
+                "fsmonitor-command": f"#!/bin/sh\ntouch {markers[3]}\nexit 1\n",
+            }
+            for relative, content in scripts.items():
+                path = profile / relative
+                path.write_text(content, encoding="utf-8")
+                path.chmod(0o755)
+            git(profile, "config", "commit.gpgSign", "true")
+            git(profile, "config", "core.fsmonitor", str(profile / "fsmonitor-command"))
+            git(profile, "config", "filter.evil.clean", str(profile / "filter-command"))
+            git(profile, "config", "filter.evil.required", "true")
+            (profile / ".gitattributes").write_text("MEMORY.md filter=evil\n", encoding="utf-8")
+            (profile / "MEMORY.md").write_text("safe bytes\n", encoding="utf-8")
+
+            result = checkpoint_profile(profile, CHECKPOINT_SUBJECT)
+
+            self.assertTrue(result.committed, result.error)
+            self.assertFalse([path for path in markers if path.exists()])
+            self.assertEqual("safe bytes\n", git(profile, "show", "HEAD:MEMORY.md").stdout)
+
+    def test_disabled_hooks_directory_must_remain_empty(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            profile = Path(temporary_directory) / "profile"
+            init_profile(profile, "Work")
+            marker = profile / "unsafe-hook-ran"
+            hook = profile / ".harness/state/profile-git-disabled-hooks/pre-commit"
+            hook.write_text(f"#!/bin/sh\ntouch {marker}\n", encoding="utf-8")
+            hook.chmod(0o755)
+            (profile / "MEMORY.md").write_text("change\n", encoding="utf-8")
+
+            result = checkpoint_profile(profile, CHECKPOINT_SUBJECT)
+
+            self.assertFalse(result.committed)
+            self.assertIsNotNone(result.error)
+            self.assertFalse(marker.exists())
+
+    def test_allowlist_root_repository_and_dangling_or_parent_symlinks_are_rejected(self) -> None:
+        if not hasattr(os, "symlink"):
+            self.skipTest("symlinks unavailable")
+        for variant in ("root-repo", "dangling", "parent"):
+            with self.subTest(variant=variant), tempfile.TemporaryDirectory() as temporary_directory:
+                parent = Path(temporary_directory)
+                profile = parent / "profile"
+                init_profile(profile, "Work")
+                semantic = profile / ".harness/memory/semantic"
+                if variant == "root-repo":
+                    git(semantic, "init")
+                    (semantic / "inside.md").write_text("nested\n", encoding="utf-8")
+                elif variant == "dangling":
+                    (semantic / "dangling.md").symlink_to(parent / "missing.md")
+                else:
+                    (semantic / "before.md").write_text("tracked\n", encoding="utf-8")
+                    self.assertTrue(checkpoint_profile(profile, CHECKPOINT_SUBJECT).committed)
+                    moved = parent / "semantic-real"
+                    semantic.rename(moved)
+                    semantic.symlink_to(moved, target_is_directory=True)
+
+                result = checkpoint_profile(profile, CHECKPOINT_SUBJECT)
+
+                self.assertFalse(result.committed)
+                self.assertIsNotNone(result.error)
+
+    def test_failure_record_is_guarded_and_later_subprocess_success_clears_it(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            profile = Path(temporary_directory) / "profile"
+            init_profile(profile, "Work")
+            (profile / "MEMORY.md").write_text("later success\n", encoding="utf-8")
+            original = profile_git_module._record_failure
+            lock_observed = []
+
+            def observe(root: Path, subject: str, error: str) -> None:
+                with (root / ".harness/state/profile-git.guard").open("a+b") as guard:
+                    try:
+                        fcntl.flock(guard.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    except BlockingIOError:
+                        lock_observed.append(True)
+                    else:
+                        lock_observed.append(False)
+                        fcntl.flock(guard.fileno(), fcntl.LOCK_UN)
+                original(root, subject, error)
+
+            with mock.patch.object(profile_git_module, "_safe_git_directory", side_effect=profile_git_module.ProfileGitError("injected")), mock.patch.object(profile_git_module, "_record_failure", side_effect=observe):
+                thread = threading.Thread(target=lambda: checkpoint_profile(profile, CHECKPOINT_SUBJECT))
+                thread.start()
+                thread.join()
+            succeeded = subprocess.run(
+                [sys.executable, str(ROOT / "bin/profile-harness"), "git", "checkpoint"],
+                cwd=profile, text=True, capture_output=True, check=False,
+            )
+
+            self.assertEqual([True], lock_observed)
+            self.assertEqual(0, succeeded.returncode, succeeded.stderr)
+            self.assertFalse((profile / ".harness/state/profile-git-failure.json").exists())
+
+    def test_read_only_git_uses_optional_locks_zero_and_hard_bounds_output(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            parent = Path(temporary_directory)
+            profile = parent / "profile"
+            init_profile(profile, "Work")
+            index = profile / ".git/index"
+            before = index.stat().st_mtime_ns
+            inspect_profile_git(profile)
+            profile_git_log(profile)
+            self.assertEqual(before, index.stat().st_mtime_ns)
+
+            fake_root = parent / "fake-bin"
+            fake_root.mkdir()
+            fake = fake_root / "git"
+            env_dump = parent / "env.json"
+            fake.write_text(
+                f"#!{sys.executable}\n"
+                "import json,os,sys\n"
+                f"open({str(env_dump)!r},'w').write(json.dumps(dict(os.environ)))\n"
+                "sys.stdout.write('x' * 1000000)\n",
+                encoding="utf-8",
+            )
+            fake.chmod(0o755)
+            with mock.patch.dict(os.environ, {"PATH": str(fake_root)}, clear=False):
+                with self.assertRaisesRegex(profile_git_module.ProfileGitError, "bounded"):
+                    profile_git_module._git(profile, "status", read_only=True)
+            observed = json.loads(env_dump.read_text(encoding="utf-8"))
+            self.assertEqual("0", observed.get("GIT_OPTIONAL_LOCKS"))
+
+    def test_forbidden_file_matching_does_not_flag_backup_or_example_names(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            profile = Path(temporary_directory) / "profile"
+            init_profile(profile, "Work")
+            paths = (
+                "DASHBOARD.md.backup",
+                ".harness/config.local.toml.example",
+                "projects-backup/readme.md",
+            )
+            for relative in paths:
+                path = profile / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("allowed foreign path\n", encoding="utf-8")
+            git(profile, "add", "--", *paths)
+            git(profile, "-c", "user.name=X", "-c", "user.email=x@x", "commit", "-m", "foreign examples")
+
+            self.assertEqual((), tracked_forbidden_paths(profile))
+
+    def test_real_commit_lock_failure_is_retried_and_capture_survives_git_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            profile = Path(temporary_directory) / "profile"
+            init_profile(profile, "Work")
+            (profile / "MEMORY.md").write_text("retry after commit stage\n", encoding="utf-8")
+            branch = git(profile, "symbolic-ref", "--short", "HEAD").stdout.strip()
+            ref_lock = profile / ".git/refs/heads" / f"{branch}.lock"
+            ref_lock.write_text("block commit\n", encoding="utf-8")
+
+            failed = checkpoint_profile(profile, CHECKPOINT_SUBJECT)
+            ref_lock.unlink()
+            retried = checkpoint_profile(profile, CHECKPOINT_SUBJECT)
+
+            self.assertFalse(failed.committed)
+            self.assertIsNotNone(failed.error)
+            self.assertTrue(retried.committed, retried.error)
+            git_dir = profile / ".git"
+            git_dir.rename(profile / ".git-disabled")
+            captured = capture_event({
+                "hook_event_name": "Stop",
+                "session_id": "git-failure",
+                "cwd": str(profile),
+                "last_assistant_message": "receipt survives",
+            })
+            self.assertTrue(captured.success)
+            self.assertTrue(captured.receipt_path and captured.receipt_path.is_file())
     def test_init_creates_nested_repository_and_initial_commit(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             outer = Path(temporary_directory)
@@ -283,6 +506,27 @@ class ProfileGitTests(unittest.TestCase):
             register_repo(profile, "api", repository)
 
             self.assertEqual(REGISTRY_SUBJECT, subjects(profile)[0])
+
+    def test_registry_checkpoint_observes_durable_registry_and_repo_templates(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            profile = Path(temporary_directory) / "profile"
+            init_profile(profile, "Work")
+            repository = profile / "projects/api"
+            repository.mkdir()
+            observed = []
+
+            def checkpoint(root: Path, subject: str) -> CheckpointResult:
+                observed.append((
+                    subject,
+                    "api" in (root / "PROJECTS.toml").read_text(encoding="utf-8"),
+                    (repository / "STATUS.md").is_file(),
+                ))
+                return CheckpointResult(False)
+
+            with mock.patch.object(profile_git_module, "checkpoint_profile", side_effect=checkpoint):
+                register_repo(profile, "api", repository)
+
+            self.assertEqual([(REGISTRY_SUBJECT, True, True)], observed)
 
 
 if __name__ == "__main__":

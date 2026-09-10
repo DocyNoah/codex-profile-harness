@@ -25,6 +25,8 @@ from profile_harness.curation import (  # noqa: E402
 )
 from profile_harness.journal import append_entry, verify_journal  # noqa: E402
 from profile_harness.runner import run_codex  # noqa: E402
+from profile_harness.profile_git import CheckpointResult, CURATION_SUBJECT  # noqa: E402
+import profile_harness.profile_git as profile_git_module  # noqa: E402
 
 
 class CurationTests(unittest.TestCase):
@@ -76,6 +78,33 @@ class CurationTests(unittest.TestCase):
             self.assertTrue(
                 list((root / ".harness/memory/archive/dead-letter").glob("bad*.reason"))
             )
+
+    def test_checkpoint_runs_after_curation_journal_and_cleanup_are_durable(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root, _, _ = self.make_profile(Path(temporary_directory))
+            self.add_receipt(root, "one")
+            batch = prepare_curation(root)
+            observed = []
+
+            def checkpoint(profile_root: Path, subject: str) -> CheckpointResult:
+                observed.append((
+                    subject,
+                    (profile_root / ".harness/memory/journal/curation.jsonl").is_file(),
+                    not batch.path.exists(),
+                    not (profile_root / ".harness/state/transactions" / f"{batch.batch_id}.json").exists(),
+                ))
+                return CheckpointResult(False)
+
+            with mock.patch.object(profile_git_module, "checkpoint_profile", side_effect=checkpoint):
+                apply_actions(root, batch.batch_id, {"actions": [{
+                    "type": "profile_memory",
+                    "kind": "semantic",
+                    "title": "Durable",
+                    "content": "Committed before checkpoint.",
+                    "source_receipt_ids": ["one"],
+                }]})
+
+            self.assertEqual([(CURATION_SUBJECT, True, True, True)], observed)
 
     def test_prepare_writes_bounded_prompt_and_batch_manifest(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

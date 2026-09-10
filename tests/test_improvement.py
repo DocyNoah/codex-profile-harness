@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -25,6 +26,8 @@ from profile_harness.improvement import (  # noqa: E402
 )
 from profile_harness.journal import append_entry, verify_journal  # noqa: E402
 from profile_harness.packaging import build_local_marketplace  # noqa: E402
+from profile_harness.profile_git import CheckpointResult, IMPROVEMENT_SUBJECT  # noqa: E402
+import profile_harness.profile_git as profile_git_module  # noqa: E402
 
 
 NOW = datetime(2026, 9, 11, 12, 0, 0, tzinfo=timezone.utc)
@@ -187,6 +190,34 @@ class ImprovementTests(unittest.TestCase):
             self.assertEqual(1, len(journal[0]["proposal_digests"]))
             self.assertRegex(journal[0]["transaction_id"], r"^[a-f0-9]{32}$")
             self.assertTrue(proposals[0].name.startswith(journal[0]["transaction_id"] + "-"))
+
+    def test_improvement_checkpoint_observes_transaction_and_runtime_cleanup(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            parent = Path(temporary_directory)
+            root = self.make_profile(parent)
+            entries = self.add_curations(root, 1, start=NOW)
+            fake = self.make_fake(parent, {"proposals": [{
+                "title": "Ordered",
+                "content": "Cleanup first.",
+                "source_journal_hashes": [entries[0]["entry_hash"]],
+            }]})
+            self.configure_fake(root, fake)
+            observed = []
+
+            def checkpoint(profile_root: Path, subject: str) -> CheckpointResult:
+                observed.append((
+                    subject,
+                    not (profile_root / ".harness/state/improvement-transaction.json").exists(),
+                    not (profile_root / ".harness/state/improvement-prompt.md").exists(),
+                    not (profile_root / ".harness/state/improvement-result.json").exists(),
+                    (profile_root / ".harness/memory/journal/improvement.jsonl").is_file(),
+                ))
+                return CheckpointResult(False)
+
+            with mock.patch.object(profile_git_module, "checkpoint_profile", side_effect=checkpoint):
+                run_improvement(root, now=NOW, force=True)
+
+            self.assertEqual([(IMPROVEMENT_SUBJECT, True, True, True, True)], observed)
 
     def test_improvement_bounds_journal_metadata_to_one_hundred_recent_sources(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

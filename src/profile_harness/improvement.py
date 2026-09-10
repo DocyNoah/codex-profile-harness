@@ -451,6 +451,11 @@ def _run_locked(
     result_path = root / ".harness/state/improvement-result.json"
     require_safe_path(root, prompt_path, directory=False)
     require_safe_path(root, result_path, directory=False)
+
+    def cleanup_runtime_files() -> None:
+        prompt_path.unlink(missing_ok=True)
+        result_path.unlink(missing_ok=True)
+
     atomic_write_text(prompt_path, _bounded_state(root, source_entries))
     try:
         run_codex(
@@ -533,6 +538,7 @@ def _run_locked(
             }
             from .profile_git import IMPROVEMENT_SUBJECT, checkpoint_profile
 
+            cleanup_runtime_files()
             checkpoint_profile(root, IMPROVEMENT_SUBJECT)
             return output
         except BaseException:
@@ -540,8 +546,7 @@ def _run_locked(
                 recover_improvement_transaction(root)
             raise
     finally:
-        prompt_path.unlink(missing_ok=True)
-        result_path.unlink(missing_ok=True)
+        cleanup_runtime_files()
 
 
 def run_improvement(

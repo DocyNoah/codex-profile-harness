@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import threading
 from typing import Any, BinaryIO
 
 from .fs import atomic_write_text, ensure_safe_directory, require_safe_path
@@ -50,15 +51,17 @@ MANAGED_FILES = frozenset(path for path in MANAGED_PATHS if "." in Path(path).na
 MANAGED_DIRECTORIES = tuple(
     path for path in MANAGED_PATHS if path not in MANAGED_FILES
 )
-FORBIDDEN_TRACKED_PREFIXES = (
+FORBIDDEN_TRACKED_DIRECTORIES = (
     "projects/",
-    "DASHBOARD.md",
     ".harness/memory/inbox/",
     ".harness/memory/processing/",
     ".harness/memory/archive/",
     ".harness/memory/episodes/",
     ".harness/state/",
     ".harness/logs/",
+)
+FORBIDDEN_TRACKED_FILES = (
+    "DASHBOARD.md",
     ".harness/config.local.toml",
 )
 REQUIRED_IGNORE_RULES = (
@@ -81,6 +84,7 @@ _MAX_OUTPUT = 16_384
 _TIMEOUT = 10
 _MAX_MANAGED_FILES = 2_000
 _MAX_PATH_CHARS = 4_096
+_DISABLED_HOOKS = ".harness/state/profile-git-disabled-hooks"
 
 
 @dataclass(frozen=True)
@@ -120,32 +124,111 @@ def _git(
     check: bool = True,
     input_text: str | None = None,
     literal_pathspecs: bool = True,
+    read_only: bool = False,
+    filter_names: tuple[str, ...] = (),
 ) -> subprocess.CompletedProcess[str]:
-    environment = os.environ.copy()
+    environment = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith("GIT_") and key != "SSH_ASKPASS"
+    }
     environment.update({
         "GIT_TERMINAL_PROMPT": "0",
         "GIT_ASKPASS": "",
+        "SSH_ASKPASS": "",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_ATTR_NOSYSTEM": "1",
+        "GIT_OPTIONAL_LOCKS": "0" if read_only else "1",
         "LC_ALL": "C",
     })
+    git_dir = root / ".git"
+    hooks = root / _DISABLED_HOOKS
     try:
-        command = ["git"]
+        command = [
+            "git",
+            f"--git-dir={git_dir}",
+            f"--work-tree={root}",
+            "-c", f"core.hooksPath={hooks}",
+            "-c", "core.fsmonitor=false",
+            "-c", "commit.gpgSign=false",
+            "-c", "tag.gpgSign=false",
+        ]
+        for name in filter_names:
+            command.extend((
+                "-c", f"filter.{name}.clean=",
+                "-c", f"filter.{name}.smudge=",
+                "-c", f"filter.{name}.process=",
+                "-c", f"filter.{name}.required=false",
+            ))
         if literal_pathspecs:
             command.append("--literal-pathspecs")
-        command.extend(("-C", str(root), *arguments))
-        result = subprocess.run(
+        command.extend(arguments)
+        process = subprocess.Popen(
             command,
-            input=input_text if input_text is not None else "",
-            text=True,
-            capture_output=True,
-            check=False,
-            timeout=_TIMEOUT,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            cwd=root,
             env=environment,
         )
-    except (OSError, subprocess.TimeoutExpired) as error:
+    except OSError as error:
         raise ProfileGitError(f"Git command failed: {error}") from error
+    chunks: dict[str, list[bytes]] = {"stdout": [], "stderr": []}
+    output_size = 0
+    output_lock = threading.Lock()
+    overflow = threading.Event()
+
+    def read_bounded(stream, destination: str) -> None:
+        nonlocal output_size
+        while True:
+            chunk = stream.read(4096)
+            if not chunk:
+                break
+            with output_lock:
+                remaining = _MAX_OUTPUT - output_size
+                if remaining > 0:
+                    kept = chunk[:remaining]
+                    chunks[destination].append(kept)
+                    output_size += len(kept)
+                if len(chunk) > remaining:
+                    overflow.set()
+                    process.kill()
+                    break
+
+    readers = [
+        threading.Thread(target=read_bounded, args=(process.stdout, "stdout")),
+        threading.Thread(target=read_bounded, args=(process.stderr, "stderr")),
+    ]
+    for reader in readers:
+        reader.start()
+    try:
+        assert process.stdin is not None
+        try:
+            process.stdin.write((input_text or "").encode("utf-8"))
+            process.stdin.close()
+        except BrokenPipeError:
+            pass
+        try:
+            returncode = process.wait(timeout=_TIMEOUT)
+        except subprocess.TimeoutExpired as error:
+            process.kill()
+            process.wait()
+            raise ProfileGitError("Git command exceeded the bounded time limit") from error
+    finally:
+        for reader in readers:
+            reader.join()
+        assert process.stdout is not None and process.stderr is not None
+        process.stdout.close()
+        process.stderr.close()
+    if overflow.is_set():
+        raise ProfileGitError("Git output exceeded the bounded size limit")
+    stdout = b"".join(chunks["stdout"]).decode("utf-8", "surrogateescape")
+    stderr = b"".join(chunks["stderr"]).decode("utf-8", "surrogateescape")
+    result = subprocess.CompletedProcess(command, returncode, stdout, stderr)
     if check and result.returncode != 0:
         detail = (result.stderr or result.stdout or "Git command failed").strip()
-        raise ProfileGitError(detail[:_MAX_OUTPUT])
+        raise ProfileGitError(detail)
     return result
 
 
@@ -176,7 +259,7 @@ def _contains_nested_git(root: Path, relative: Path) -> bool:
 
 
 def _tracked_paths(root: Path) -> tuple[str, ...]:
-    output = _git(root, "ls-files", "-z").stdout
+    output = _git(root, "ls-files", "-z", read_only=True).stdout
     paths = tuple(item for item in output.split("\0") if item)
     if len(paths) > _MAX_MANAGED_FILES * 10 or any(len(path) > _MAX_PATH_CHARS for path in paths):
         raise ProfileGitError("tracked path inventory exceeds the bounded safety limit")
@@ -190,29 +273,44 @@ def _managed_candidates(root: Path) -> tuple[str, ...]:
             continue
         path = root / relative_text
         relative = Path(relative_text)
-        if path.exists() and (
-            path.is_symlink()
-            or _contains_nested_git(root, relative)
-            or not path.is_file()
+        current = root
+        unsafe_component = False
+        for component in relative.parts:
+            current = current / component
+            if current.is_symlink():
+                unsafe_component = True
+                break
+        if unsafe_component or (
+            path.exists()
+            and (_contains_nested_git(root, relative) or not path.is_file())
         ):
             raise ProfileGitError(f"managed Git path is unsafe: {relative_text}")
         candidates.add(relative_text)
     for relative_text in MANAGED_FILES:
         path = root / relative_text
-        if path.is_file() and not path.is_symlink():
+        if path.is_symlink():
+            raise ProfileGitError(f"managed Git path is unsafe: {relative_text}")
+        if path.is_file():
             require_safe_path(root, path, directory=False)
             candidates.add(relative_text)
     for relative_text in MANAGED_DIRECTORIES:
         directory = root / relative_text
+        if directory.is_symlink():
+            raise ProfileGitError(f"managed Git path is unsafe: {relative_text}")
         if not directory.exists():
             continue
         require_safe_path(root, directory, directory=True)
+        if (directory / ".git").exists() or (directory / ".git").is_symlink():
+            raise ProfileGitError(f"managed Git path is unsafe: {relative_text}/.git")
         for current_text, directories, filenames in os.walk(directory, followlinks=False):
             current = Path(current_text)
-            directories[:] = [
-                name for name in directories
-                if name != ".git" and not (current / name).is_symlink()
-            ]
+            for name in (*directories, *filenames):
+                child = current / name
+                if child.is_symlink():
+                    raise ProfileGitError(
+                        f"managed Git path is unsafe: {child.relative_to(root).as_posix()}"
+                    )
+            directories[:] = [name for name in directories if name != ".git"]
             if (current / ".git").exists() and current != directory:
                 directories[:] = []
                 continue
@@ -237,6 +335,7 @@ def _managed_candidates(root: Path) -> tuple[str, ...]:
         check=False,
         input_text="\0".join(ordered) + "\0",
         literal_pathspecs=False,
+        read_only=True,
     )
     if ignored_result.returncode not in {0, 1}:
         detail = (ignored_result.stderr or "cannot inspect ignored managed paths").strip()
@@ -250,7 +349,8 @@ def _dirty_paths(root: Path, candidates: tuple[str, ...] | None = None) -> tuple
     if not paths:
         return ()
     output = _git(
-        root, "status", "--porcelain=v1", "-z", "--untracked-files=all", "--", *paths
+        root, "status", "--porcelain=v1", "-z", "--untracked-files=all", "--", *paths,
+        read_only=True,
     ).stdout
     dirty: set[str] = set()
     records = output.split("\0")
@@ -286,6 +386,13 @@ class _GitGuard:
             self.handle.close()
 
 
+def _safe_hooks_directory(root: Path) -> Path:
+    hooks = ensure_safe_directory(root, root / _DISABLED_HOOKS)
+    if any(hooks.iterdir()):
+        raise ProfileGitError("disabled Git hooks directory is not empty")
+    return hooks
+
+
 def _failure_path(root: Path) -> Path:
     return require_safe_path(root, root / _FAILURE_PATH, directory=False)
 
@@ -302,20 +409,47 @@ def _record_failure(root: Path, subject: str, error: str) -> None:
         pass
 
 
+def _configured_filter_names(root: Path) -> tuple[str, ...]:
+    result = _git(
+        root,
+        "config", "--local", "--name-only", "--get-regexp",
+        r"^filter\..*\.(clean|smudge|process|required)$",
+        check=False,
+        read_only=True,
+    )
+    if result.returncode not in {0, 1}:
+        raise ProfileGitError(result.stderr.strip() or "cannot inspect Git filters")
+    names = set()
+    for key in result.stdout.splitlines():
+        if not key.startswith("filter."):
+            continue
+        name, separator, _field = key[len("filter."):].rpartition(".")
+        if separator and name and "\n" not in name and "\0" not in name:
+            names.add(name)
+    if len(names) > 100:
+        raise ProfileGitError("configured Git filter inventory exceeds the bounded safety limit")
+    return tuple(sorted(names))
+
+
 def initialize_profile_git(root: Path) -> CheckpointResult:
     """Initialize a nested repository if needed and make the initial checkpoint."""
     profile_root = Path(root).expanduser().resolve()
     git_path = profile_root / ".git"
-    if git_path.is_symlink() or (git_path.exists() and not git_path.is_dir()):
-        error = "profile .git path is unsafe"
-        _record_failure(profile_root, INITIALIZE_SUBJECT, error)
-        return CheckpointResult(False, error=error)
-    if not git_path.exists():
-        try:
-            _git(profile_root, "init", "--quiet")
-        except ProfileGitError as error:
-            _record_failure(profile_root, INITIALIZE_SUBJECT, str(error))
-            return CheckpointResult(False, error=str(error))
+    try:
+        with _GitGuard(profile_root):
+            _safe_hooks_directory(profile_root)
+            if git_path.is_symlink() or (git_path.exists() and not git_path.is_dir()):
+                error = "profile .git path is unsafe"
+                _record_failure(profile_root, INITIALIZE_SUBJECT, error)
+                return CheckpointResult(False, error=error)
+            if not git_path.exists():
+                try:
+                    _git(profile_root, "init", "--quiet")
+                except ProfileGitError as error:
+                    _record_failure(profile_root, INITIALIZE_SUBJECT, str(error))
+                    return CheckpointResult(False, error=str(error))
+    except (OSError, ValueError, ProfileGitError) as error:
+        return CheckpointResult(False, error=str(error))
     return checkpoint_profile(profile_root, INITIALIZE_SUBJECT)
 
 
@@ -326,27 +460,31 @@ def checkpoint_profile(root: Path, subject: str = CHECKPOINT_SUBJECT) -> Checkpo
         raise ValueError("checkpoint subject is not an approved deterministic subject")
     try:
         with _GitGuard(profile_root):
-            _safe_git_directory(profile_root)
-            candidates = _managed_candidates(profile_root)
-            dirty = _dirty_paths(profile_root, candidates)
-            if not dirty:
+            try:
+                _safe_hooks_directory(profile_root)
+                _safe_git_directory(profile_root)
+                candidates = _managed_candidates(profile_root)
+                dirty = _dirty_paths(profile_root, candidates)
+                if not dirty:
+                    _failure_path(profile_root).unlink(missing_ok=True)
+                    return CheckpointResult(False)
+                filters = _configured_filter_names(profile_root)
+                _git(root, "add", "--", *candidates, filter_names=filters)
+                _git(
+                    root,
+                    "-c", "user.name=Codex Profile Harness",
+                    "-c", "user.email=profile-harness@localhost",
+                    "commit", "--only", "--no-verify", "--quiet", "-m", subject,
+                    "--", *candidates,
+                    filter_names=filters,
+                )
+                sha = _git(root, "rev-parse", "HEAD", read_only=True).stdout.strip()
                 _failure_path(profile_root).unlink(missing_ok=True)
-                return CheckpointResult(False)
-            _git(root, "add", "--", *candidates)
-            commit = _git(
-                root,
-                "-c", "user.name=Codex Profile Harness",
-                "-c", "user.email=profile-harness@localhost",
-                "-c", "core.hooksPath=/dev/null",
-                "commit", "--only", "--no-verify", "--quiet", "-m", subject,
-                "--", *candidates,
-            )
-            del commit
-            sha = _git(root, "rev-parse", "HEAD").stdout.strip()
-            _failure_path(profile_root).unlink(missing_ok=True)
-            return CheckpointResult(True, sha, dirty)
+                return CheckpointResult(True, sha, dirty)
+            except (OSError, ValueError, ProfileGitError) as error:
+                _record_failure(profile_root, subject, str(error))
+                return CheckpointResult(False, error=str(error))
     except (OSError, ValueError, ProfileGitError) as error:
-        _record_failure(profile_root, subject, str(error))
         return CheckpointResult(False, error=str(error))
 
 
@@ -355,22 +493,29 @@ def inspect_profile_git(root: Path) -> ProfileGitStatus:
     profile_root = Path(root).expanduser().resolve()
     try:
         _safe_git_directory(profile_root)
-        if _git(profile_root, "rev-parse", "--is-inside-work-tree").stdout.strip() != "true":
+        if _git(
+            profile_root, "rev-parse", "--is-inside-work-tree", read_only=True
+        ).stdout.strip() != "true":
             raise ProfileGitError("profile .git is not a working repository")
-        branch_result = _git(profile_root, "symbolic-ref", "--quiet", "--short", "HEAD", check=False)
+        branch_result = _git(
+            profile_root, "symbolic-ref", "--quiet", "--short", "HEAD",
+            check=False, read_only=True,
+        )
         branch = branch_result.stdout.strip() or None
         detached = branch_result.returncode != 0 and _git(
-            profile_root, "rev-parse", "--verify", "HEAD", check=False
+            profile_root, "rev-parse", "--verify", "HEAD",
+            check=False, read_only=True,
         ).returncode == 0
         log_result = _git(
-            profile_root, "log", "-1", "--format=%H%x00%s%x00%cI", check=False
+            profile_root, "log", "-1", "--format=%H%x00%s%x00%cI",
+            check=False, read_only=True,
         )
         sha = subject = committed_at = None
         if log_result.returncode == 0 and log_result.stdout:
             values = log_result.stdout.rstrip("\n").split("\0")
             if len(values) == 3:
                 sha, subject, committed_at = values
-        remotes = _git(profile_root, "remote").stdout.splitlines()
+        remotes = _git(profile_root, "remote", read_only=True).stdout.splitlines()
         return ProfileGitStatus(
             True, branch, detached, sha, subject, committed_at,
             _dirty_paths(profile_root), bool(remotes), None,
@@ -386,7 +531,8 @@ def profile_git_log(root: Path, limit: int = 20) -> list[dict[str, str]]:
     profile_root = Path(root).expanduser().resolve()
     _safe_git_directory(profile_root)
     result = _git(
-        profile_root, "log", f"-{limit}", "--format=%H%x00%s%x00%cI%x1e", check=False
+        profile_root, "log", f"-{limit}", "--format=%H%x00%s%x00%cI%x1e",
+        check=False, read_only=True,
     )
     if result.returncode != 0:
         return []
@@ -403,7 +549,11 @@ def tracked_forbidden_paths(root: Path) -> tuple[str, ...]:
     profile_root = Path(root).expanduser().resolve()
     return tuple(sorted(
         path for path in _tracked_paths(profile_root)
-        if any(path == prefix.rstrip("/") or path.startswith(prefix) for prefix in FORBIDDEN_TRACKED_PREFIXES)
+        if path in FORBIDDEN_TRACKED_FILES
+        or any(
+            path == directory.rstrip("/") or path.startswith(directory)
+            for directory in FORBIDDEN_TRACKED_DIRECTORIES
+        )
     ))
 
 

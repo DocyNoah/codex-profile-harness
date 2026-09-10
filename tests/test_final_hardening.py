@@ -30,6 +30,8 @@ import profile_harness.curation as curation_module  # noqa: E402
 import profile_harness.doctor as doctor_module  # noqa: E402
 from profile_harness.locking import LeaseBusyError, ProfileLease  # noqa: E402
 from profile_harness.runner import run_codex  # noqa: E402
+from profile_harness.profile_git import CheckpointResult, RECOVERY_SUBJECT  # noqa: E402
+import profile_harness.profile_git as profile_git_module  # noqa: E402
 
 
 class FinalHardeningTests(unittest.TestCase):
@@ -438,6 +440,36 @@ class FinalHardeningTests(unittest.TestCase):
                     text=True, capture_output=True, check=True,
                 ).stdout,
             )
+
+    def test_recovery_checkpoint_observes_committed_cleanup(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root, _ = self.make_profile(Path(temporary_directory))
+            self.add_receipt(root)
+            batch = prepare_curation(root)
+            self._crash_apply(root, batch.batch_id, {
+                "type": "profile_memory",
+                "kind": "semantic",
+                "title": "Recovered",
+                "content": "durable",
+                "source_receipt_ids": ["one"],
+            }, "after_commit")
+            descriptor = root / ".harness/state/transactions" / f"{batch.batch_id}.json"
+            observed = []
+
+            def checkpoint(profile_root: Path, subject: str) -> CheckpointResult:
+                observed.append((
+                    subject,
+                    not descriptor.exists(),
+                    not batch.path.exists(),
+                    bool(list((profile_root / ".harness/memory/archive/processed").glob("*.json"))),
+                    (profile_root / ".harness/memory/journal/curation.jsonl").is_file(),
+                ))
+                return CheckpointResult(False)
+
+            with mock.patch.object(profile_git_module, "checkpoint_profile", side_effect=checkpoint):
+                recover_transactions(root)
+
+            self.assertEqual([(RECOVERY_SUBJECT, True, True, True, True)], observed)
 
 
 if __name__ == "__main__":
