@@ -92,3 +92,90 @@ Result: exit 0; compile succeeded and `git diff --check` produced no output.
 ## Concerns
 
 None.
+
+## Legacy cursor upgrade correction
+
+### Root cause
+
+Version 0.1 cursors contain the transcript position and prefix digest but no
+`receipt_id` or `delivery_digest`. After upgrading, an exact Stop redelivery at
+that position therefore appeared to have an empty delta and received a new
+evidence-bound ID, even when its canonical legacy receipt was already valid and
+immutable.
+
+### RED evidence
+
+The valid-legacy and tampered-receipt regressions were added before production
+changes.
+
+Command:
+
+```text
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_transcript_capture.TranscriptCaptureTests.test_legacy_cursor_reuses_valid_legacy_receipt_and_promotes_metadata tests.test_transcript_capture.TranscriptCaptureTests.test_legacy_cursor_rejects_tampered_receipt_payload -v
+```
+
+Pre-fix result: the valid legacy case failed because exact redelivery returned
+`captured` instead of `duplicate`; the tampered legacy receipt was not reused.
+
+A stronger assertion then required mismatch recovery to preserve the full
+unpublished transcript evidence rather than publish an empty delta.
+
+Command:
+
+```text
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_transcript_capture.TranscriptCaptureTests.test_legacy_cursor_rejects_tampered_receipt_payload -v
+```
+
+Intermediate result: 1 test ran with 1 failure; expected reconstructed assistant
+messages `["legacy evidence"]`, but the recovery receipt contained `[]`.
+
+### Implementation
+
+- A matched legacy cursor with no new complete bytes reconstructs its prior
+  evidence from at most the existing 1 MiB transcript bound, using the same
+  parser, normalization, redaction, message-count bounds, and digest rules as a
+  new delta.
+- The canonical legacy delivery ID is reused only when the receipt at that exact
+  path passes the stable receipt validator and exactly matches expected ID,
+  event, normalized cwd, and the complete normalized payload (including
+  session, hook payload fields, and reconstructed transcript evidence).
+- On a valid match, cursor metadata is atomically promoted with the reused
+  `receipt_id` and `delivery_digest`. A missing, invalid, or mismatched receipt
+  is never trusted: a new evidence-bound receipt containing the reconstructed
+  evidence is durably published before cursor promotion.
+- New-delta evidence-bound identity and inbox-fsync-before-cursor durability are
+  unchanged.
+
+### Verification
+
+Focused GREEN:
+
+```text
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_transcript_capture
+```
+
+Result: 19 tests passed in 2.764s, 0 failures.
+
+Complete suite:
+
+```text
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests
+```
+
+Result: 175 tests passed in 45.795s, 0 failures.
+
+Compile and whitespace verification:
+
+```text
+python3 -m compileall -q src tests && git diff --check
+```
+
+Result: exit 0; compile succeeded and `git diff --check` produced no output.
+
+### Implementation commit
+
+`bcdc9ee`
+
+### Concerns
+
+None.
