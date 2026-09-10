@@ -72,8 +72,33 @@ Run [the cron example](examples/cron.example) every **15 minutes**. Each
   there are at least 3. It only writes proposals.
 
 Empty and not-due runs use no model tokens. Due curation and improvement consume
-Codex model tokens in proportion to bounded evidence and curated state. Defaults
-are explicit in `.harness/config.toml` and may be changed there.
+Codex model tokens in proportion to bounded evidence and curated state. A new
+profile writes only its name and config format version; the values above are
+built-in defaults. Add explicit override tables to `.harness/config.toml` when
+needed, for example:
+
+```toml
+version = 1
+name = "Work"
+
+[curation]
+model = "gpt-5.6-sol"
+reasoning_effort = "medium"
+maintenance_receipt_threshold = 30
+maintenance_max_receipts = 30
+maintenance_max_age_seconds = 14400
+
+[improvement]
+model = "gpt-6-astra"
+reasoning_effort = "high"
+cooldown_seconds = 86400
+high_threshold = 10
+low_interval_seconds = 259200
+low_minimum = 3
+automatic_apply = false
+```
+
+Unknown, invalid, non-finite, or unsafe configuration values are rejected.
 
 ## Local Git, status, and backup
 

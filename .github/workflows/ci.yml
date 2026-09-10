@@ -13,7 +13,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.11", "3.13"]
+        python-version: ["3.11", "3.14"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -30,7 +30,7 @@ jobs:
           python -m compileall -q -f bin scripts src tests
           find bin scripts src tests -type f \( -name '*.pyc' -o -name '*.pyo' \) -delete
           find bin scripts src tests -type d -name '__pycache__' -empty -delete
-      - name: Plugin, skill, release, and artifact validation
+      - name: Standalone plugin and skill contract validation with release smoke
         env:
           PYTHONDONTWRITEBYTECODE: "1"
         run: python scripts/validate_release.py

@@ -19,7 +19,8 @@ marketplace to a timestamped `.previous.*` directory, registers marketplace
 `codex-profile-harness@codex-profile-harness-local`, and atomically updates the
 executable symlink. It never bypasses hook trust, copies arbitrary source files,
 deletes a profile, or deletes the previous installation. On failure it restores
-the previous marketplace and retains the failed generated tree when possible.
+the previous marketplace, executable link, and Codex registration state, then
+removes the failed generated tree.
 
 Custom destinations are explicit:
 
