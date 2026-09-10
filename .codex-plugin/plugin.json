@@ -1,0 +1,21 @@
+{
+  "name": "codex-profile-harness",
+  "version": "0.1.0",
+  "description": "Isolated profile memory and repository routing for Codex projects.",
+  "author": {
+    "name": "Codex Profile Harness contributors"
+  },
+  "interface": {
+    "displayName": "Codex Profile Harness",
+    "shortDescription": "Keep profile memory isolated and repository work routed.",
+    "longDescription": "Initialize auditable Codex profiles and safely route operational knowledge to nested repositories.",
+    "developerName": "Codex Profile Harness contributors",
+    "category": "Productivity",
+    "capabilities": [
+      "Write"
+    ],
+    "defaultPrompt": [
+      "Initialize a Codex profile harness in this project."
+    ]
+  }
+}
