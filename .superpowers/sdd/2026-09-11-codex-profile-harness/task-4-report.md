@@ -120,3 +120,44 @@ Codex hook discovery and the trust prompt are host UI behavior and were not
 automated. The hook contract and exact local marketplace metadata were validated
 locally, and the relevant `codex plugin marketplace` and `codex plugin` command
 forms were checked against the installed CLI help.
+
+## Fix Round 2
+
+Implementation commit: `6f5ad96af8cc1858d393b419636c2a9b37160cb1`
+
+### Review changes
+
+- Doctor now validates the curation schema against the manual validator's
+  executable security contract. It checks the bounded top-level action array
+  and exact `oneOf`, shared content and source constraints, exact action fields,
+  object and additional-property boundaries, action type constants, memory kind,
+  repository names, content/source references, and bounded unique numeric ADR
+  supersession identifiers.
+- README now states that the Codex CLI is required for local plugin installation
+  and automatic curation, and that `doctor --check-codex` optionally checks its
+  availability. It separately identifies post-install commands that do not
+  invoke Codex.
+
+### TDD and verification
+
+The new focused regression test failed with 22 subtest failures against the
+previous doctor: malformed per-action definitions and weakened length, array,
+uniqueness, reference, enum, and pattern boundaries were accepted. The existing
+validator rejected only the already-covered incorrect top-level action set.
+After the contract validator was implemented:
+
+- `python3 -m unittest tests.test_dashboard_and_doctor -v` — 16 tests passed.
+- `python3 -m unittest discover -s tests -v` — 71 tests, 0 failures.
+- Plugin validator — source tree and generated marketplace plugin both passed.
+- Skill quick validator — passed.
+- Generated marketplace smoke — build, validation, profile initialization, and
+  healthy doctor execution passed.
+- `python3 -m compileall -q src tests scripts` — exit 0.
+- `git diff --check` and clean generated-artifact hygiene scans — passed.
+
+### Remaining concern
+
+The schema checks intentionally encode runtime security invariants rather than
+requiring byte-for-byte equality with the shipped JSON. Future action types or
+limits therefore require coordinated updates to the manual validator, schema,
+doctor contract map, and regression cases.
