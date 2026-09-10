@@ -64,6 +64,7 @@ class ImprovementTests(unittest.TestCase):
     def add_improvement_success(self, root: Path, curation_head: str, at: datetime) -> dict:
         return append_entry(root / ".harness/memory/journal/improvement.jsonl", {
             "event": "improvement",
+            "transaction_id": "1" * 32,
             "model": "gpt-6-astra",
             "reasoning_effort": "high",
             "source_journal_hashes": [curation_head],
@@ -151,7 +152,12 @@ class ImprovementTests(unittest.TestCase):
             self.assertEqual("performed", output["status"])
             proposals = list((root / ".harness/improvements/proposed").glob("*.md"))
             self.assertEqual(1, len(proposals))
-            self.assertEqual("# Safer review\n\nRequire a review before policy changes.\n", proposals[0].read_text())
+            journal = verify_journal(root / ".harness/memory/journal/improvement.jsonl")
+            self.assertEqual(
+                f"<!-- profile-harness-improvement-transaction: {journal[0]['transaction_id']} -->\n"
+                "# Safer review\n\nRequire a review before policy changes.\n",
+                proposals[0].read_text(),
+            )
             self.assertEqual(protected, {name: (root / name).read_bytes() for name in protected})
             call = json.loads(invocation.read_text())
             self.assertEqual(str(root.resolve()), call["cwd"])
@@ -166,13 +172,14 @@ class ImprovementTests(unittest.TestCase):
                 str((ROOT / "schemas/improvement-result.schema.json").resolve()),
                 "-o", str((root / ".harness/state/improvement-result.json").resolve()), "-",
             ], call["argv"])
-            journal = verify_journal(root / ".harness/memory/journal/improvement.jsonl")
             self.assertEqual(1, len(journal))
             self.assertEqual("gpt-6-astra", journal[0]["model"])
             self.assertEqual("high", journal[0]["reasoning_effort"])
             self.assertEqual([entries[0]["entry_hash"]], journal[0]["source_journal_hashes"])
             self.assertEqual(64, len(journal[0]["result_digest"]))
             self.assertEqual(1, len(journal[0]["proposal_digests"]))
+            self.assertRegex(journal[0]["transaction_id"], r"^[a-f0-9]{32}$")
+            self.assertTrue(proposals[0].name.startswith(journal[0]["transaction_id"] + "-"))
 
     def test_improvement_bounds_journal_metadata_to_one_hundred_recent_sources(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -317,28 +324,85 @@ class ImprovementTests(unittest.TestCase):
             self.assertFalse((root / ".harness/state/improvement-transaction.json").exists())
 
     def test_recovery_obeys_precommit_and_committed_wal_states(self) -> None:
-        for state, keep in (("applying", False), ("committed", True)):
-            with self.subTest(state=state), tempfile.TemporaryDirectory() as temporary_directory:
-                root = self.make_profile(Path(temporary_directory))
-                proposal = root / ".harness/improvements/proposed/p.md"
-                proposal.write_text("proposal", encoding="utf-8")
-                journal = root / ".harness/memory/journal/improvement.jsonl"
-                append_entry(journal, {"event": "improvement"})
-                descriptor = root / ".harness/state/improvement-transaction.json"
-                descriptor.write_text(json.dumps({
-                    "version": 1, "state": state,
-                    "targets": [{
-                        "path": str(proposal.relative_to(root)),
-                        "digest": __import__("hashlib").sha256(b"proposal").hexdigest(),
-                    }],
-                    "journal_existed": False,
-                    "journal_snapshot": None,
-                    "journal_snapshot_digest": None,
-                }), encoding="utf-8")
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = self.make_profile(Path(temporary_directory))
+            transaction_id = "a" * 32
+            proposal = root / ".harness/improvements/proposed" / f"{transaction_id}-01-proposal.md"
+            body = (
+                f"<!-- profile-harness-improvement-transaction: {transaction_id} -->\n"
+                "# Proposal\n\nBody\n"
+            )
+            proposal.write_text(body, encoding="utf-8")
+            descriptor = root / ".harness/state/improvement-transaction.json"
+            descriptor.write_text(json.dumps({
+                "version": 1, "state": "applying", "transaction_id": transaction_id,
+                "targets": [{
+                    "path": str(proposal.relative_to(root)),
+                    "digest": __import__("hashlib").sha256(body.encode()).hexdigest(),
+                }],
+                "journal_existed": False,
+                "journal_snapshot": None,
+                "journal_snapshot_digest": None,
+            }), encoding="utf-8")
+            recover_improvement_transaction(root)
+            self.assertFalse(proposal.exists())
+            self.assertFalse(descriptor.exists())
+
+    def test_malicious_wal_cannot_delete_a_committed_proposal_or_valid_journal(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            parent = Path(temporary_directory)
+            root = self.make_profile(parent)
+            entries = self.add_curations(root, 1, start=NOW)
+            fake = self.make_fake(parent, {"proposals": [{
+                "title": "Existing", "content": "Keep me",
+                "source_journal_hashes": [entries[0]["entry_hash"]],
+            }]})
+            self.configure_fake(root, fake)
+            run_improvement(root, now=NOW, force=True)
+            journal = root / ".harness/memory/journal/improvement.jsonl"
+            committed = verify_journal(journal)[0]
+            proposal_relative, proposal_digest = next(iter(committed["proposal_digests"].items()))
+            proposal = root / proposal_relative
+            before = {journal: journal.read_bytes(), proposal: proposal.read_bytes()}
+            descriptor = root / ".harness/state/improvement-transaction.json"
+            descriptor.write_text(json.dumps({
+                "version": 1, "state": "applying",
+                "transaction_id": committed["transaction_id"],
+                "targets": [{"path": proposal_relative, "digest": proposal_digest}],
+                "journal_existed": False,
+                "journal_snapshot": None,
+                "journal_snapshot_digest": None,
+            }), encoding="utf-8")
+
+            recover_improvement_transaction(root)
+
+            self.assertEqual(before, {path: path.read_bytes() for path in before})
+            self.assertFalse(descriptor.exists())
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            parent = Path(temporary_directory)
+            root = self.make_profile(parent)
+            entries = self.add_curations(root, 1, start=NOW)
+            fake = self.make_fake(parent, {"proposals": [{
+                "title": "Existing", "content": "Keep me",
+                "source_journal_hashes": [entries[0]["entry_hash"]],
+            }]})
+            self.configure_fake(root, fake)
+            run_improvement(root, now=NOW, force=True)
+            journal = root / ".harness/memory/journal/improvement.jsonl"
+            before = journal.read_bytes()
+            descriptor = root / ".harness/state/improvement-transaction.json"
+            descriptor.write_text(json.dumps({
+                "version": 1, "state": "applying", "transaction_id": "f" * 32,
+                "targets": [], "journal_existed": False,
+                "journal_snapshot": None, "journal_snapshot_digest": None,
+            }), encoding="utf-8")
+
+            with self.assertRaises(ImprovementError):
                 recover_improvement_transaction(root)
-                self.assertEqual(keep, proposal.exists())
-                self.assertEqual(keep, journal.exists())
-                self.assertFalse(descriptor.exists())
+
+            self.assertEqual(before, journal.read_bytes())
+            self.assertTrue(descriptor.exists())
 
     def test_recovery_rejects_policy_snapshot_and_tampered_members_before_any_mutation(self) -> None:
         mutations = (
@@ -357,6 +421,7 @@ class ImprovementTests(unittest.TestCase):
                 transaction = {
                     "version": 1,
                     "state": "applying",
+                    "transaction_id": "a" * 32,
                     "targets": [],
                     "journal_existed": True,
                     "journal_snapshot": ".harness/state/improvement-journal.before",
@@ -445,7 +510,7 @@ class ImprovementTests(unittest.TestCase):
                 self.assertFalse(called.exists())
 
     def test_real_process_crashes_recover_precommit_or_finish_committed_state(self) -> None:
-        for stage, keep in (("after_journal", False), ("after_commit", True)):
+        for stage, keep in (("after_first_write", False), ("after_journal", True), ("after_commit", True)):
             with self.subTest(stage=stage), tempfile.TemporaryDirectory() as temporary_directory:
                 parent = Path(temporary_directory)
                 root = self.make_profile(parent)
@@ -469,6 +534,57 @@ class ImprovementTests(unittest.TestCase):
                 self.assertEqual(keep, bool(list((root / ".harness/improvements/proposed").glob("*.md"))))
                 self.assertEqual(keep, (root / ".harness/memory/journal/improvement.jsonl").exists())
                 self.assertFalse((root / ".harness/state/improvement-transaction.json").exists())
+
+    def test_authentic_legacy_curation_is_normalized_in_memory_without_rewrite(self) -> None:
+        legacy_receipt = (
+            '{"captured_at":"2026-09-08T11:00:00Z","cwd":"legacy","event":"Stop",'
+            '"id":"legacy-one","payload":{"session_id":"legacy-session"}}\n'
+        )
+        legacy_entry = (
+            '{"actions":0,"applied_at":"2026-09-08T12:00:00Z","archived_receipts":'
+            '[{"digest":"3ea11c9c24c514955468ed4e523b97c1a2e84fa84b5e6c527f28d61d42f7223c",'
+            '"filename":"legacy-one.json","receipt_id":"legacy-one"}],'
+            '"batch_id":"20260908T110000000000Z-abcdef123456","changed_paths":[],'
+            '"entry_hash":"2cabb5d90e6b517aab8c1f546b9a1067c38838bc0c7e7f6c7f56d1d80fcc32ad",'
+            '"previous_hash":"0000000000000000000000000000000000000000000000000000000000000000",'
+            '"receipt_digests":{"legacy-one":"3ea11c9c24c514955468ed4e523b97c1a2e84fa84b5e6c527f28d61d42f7223c"},'
+            '"receipt_ids":["legacy-one"],"result_digest":"2222222222222222222222222222222222222222222222222222222222222222",'
+            '"sequence":1,"target_digests":{}}\n'
+        )
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = self.make_profile(Path(temporary_directory))
+            processed = root / ".harness/memory/archive/processed/legacy-one.json"
+            processed.parent.mkdir(parents=True, exist_ok=True)
+            processed.write_text(legacy_receipt, encoding="utf-8")
+            journal = root / ".harness/memory/journal/curation.jsonl"
+            journal.write_text(legacy_entry, encoding="utf-8")
+            before = journal.read_bytes()
+
+            due = improvement_due(root, now=NOW)
+            report = diagnose(root)
+
+            self.assertEqual(1, due.new_curations)
+            self.assertTrue(report.ok, report.format())
+            self.assertEqual(before, journal.read_bytes())
+
+        for missing in ("result_digest", "archived_receipts"):
+            with self.subTest(missing=missing), tempfile.TemporaryDirectory() as temporary_directory:
+                root = self.make_profile(Path(temporary_directory))
+                payload = {
+                    "batch_id": "20260908T110000000000Z-abcdef123456",
+                    "receipt_ids": ["legacy-one"],
+                    "receipt_digests": {"legacy-one": "a" * 64},
+                    "archived_receipts": [{
+                        "filename": "legacy-one.json", "receipt_id": "legacy-one", "digest": "a" * 64,
+                    }],
+                    "result_digest": "b" * 64, "target_digests": {}, "actions": 0,
+                    "changed_paths": [], "applied_at": "2026-09-08T12:00:00Z",
+                }
+                payload.pop(missing)
+                append_entry(root / ".harness/memory/journal/curation.jsonl", payload)
+                with self.assertRaisesRegex(ImprovementError, "curation journal"):
+                    improvement_due(root, now=NOW)
+                self.assertFalse(diagnose(root).ok)
 
     def test_invalid_new_config_schema_weakening_and_packaging_are_detected(self) -> None:
         invalid_fragments = (

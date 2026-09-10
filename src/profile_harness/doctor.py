@@ -42,6 +42,7 @@ from .improvement import (
     MAX_SOURCE_HASHES,
     MAX_TITLE_CHARS,
     recover_improvement_transaction,
+    successful_improvement_entries,
 )
 from .locking import LeaseBusyError, ProfileLease
 
@@ -967,22 +968,10 @@ def diagnose(
     improvement_journal = profile_root / ".harness/memory/journal/improvement.jsonl"
     try:
         require_safe_path(profile_root, improvement_journal, directory=False)
-        improvement_entries = verify_journal(improvement_journal)
+        improvement_entries = successful_improvement_entries(improvement_journal)
     except (OSError, UnicodeError, ValueError) as error:
         findings.append(Finding("ERROR", "journal", f"improvement journal: {error}"))
     else:
-        for entry in improvement_entries:
-            if (
-                entry.get("event") != "improvement"
-                or not isinstance(entry.get("model"), str)
-                or not isinstance(entry.get("reasoning_effort"), str)
-                or not isinstance(entry.get("source_journal_hashes"), list)
-                or any(not isinstance(item, str) or re.fullmatch(r"[a-f0-9]{64}", item) is None for item in entry.get("source_journal_hashes", []))
-                or not isinstance(entry.get("result_digest"), str)
-                or re.fullmatch(r"[a-f0-9]{64}", entry.get("result_digest", "")) is None
-                or not isinstance(entry.get("proposal_digests"), dict)
-            ):
-                findings.append(Finding("ERROR", "journal", "improvement journal entry contract is invalid"))
         findings.append(Finding("OK", "journal", f"improvement hash chain verified ({len(improvement_entries)} entries)"))
 
     lock = profile_root / ".harness/state/curation.lock"

@@ -70,11 +70,14 @@ class ApplyResult:
     journal_entry: dict[str, Any]
 
 
-CURATION_JOURNAL_REQUIRED_FIELDS = frozenset({
-    "type", "status", "batch_id", "receipt_ids", "receipt_digests",
+LEGACY_CURATION_JOURNAL_REQUIRED_FIELDS = frozenset({
+    "batch_id", "receipt_ids", "receipt_digests",
     "archived_receipts", "result_digest", "target_digests", "actions",
     "changed_paths", "applied_at", "sequence", "previous_hash", "entry_hash",
 })
+CURATION_JOURNAL_REQUIRED_FIELDS = LEGACY_CURATION_JOURNAL_REQUIRED_FIELDS | {
+    "type", "status",
+}
 
 
 def _is_digest(value: object) -> bool:
@@ -93,9 +96,18 @@ def _journal_timestamp(value: object) -> datetime:
 
 def validate_curation_journal_entry(entry: object) -> dict[str, Any]:
     """Require the complete semantics of one successfully committed curation."""
-    if not isinstance(entry, dict) or not CURATION_JOURNAL_REQUIRED_FIELDS <= set(entry):
+    if not isinstance(entry, dict):
         raise CurationError("curation journal event is missing required fields")
-    if entry.get("type") != "curation" or entry.get("status") != "success":
+    has_type = "type" in entry
+    has_status = "status" in entry
+    if has_type != has_status:
+        raise CurationError("curation journal event is missing required fields")
+    required = CURATION_JOURNAL_REQUIRED_FIELDS if has_type else LEGACY_CURATION_JOURNAL_REQUIRED_FIELDS
+    if not required <= set(entry):
+        raise CurationError("curation journal event is missing required fields")
+    if not has_type and set(entry) != LEGACY_CURATION_JOURNAL_REQUIRED_FIELDS:
+        raise CurationError("curation journal legacy event shape is invalid")
+    if has_type and (entry.get("type") != "curation" or entry.get("status") != "success"):
         raise CurationError("curation journal event must be a successful curation")
     if not isinstance(entry.get("batch_id"), str) or _BATCH_ID.fullmatch(entry["batch_id"]) is None:
         raise CurationError("curation journal batch provenance is invalid")
@@ -156,7 +168,9 @@ def validate_curation_journal_entry(entry: object) -> dict[str, Any]:
     if isinstance(actions, bool) or not isinstance(actions, int) or not 0 <= actions <= MAX_ACTIONS:
         raise CurationError("curation journal action count is invalid")
     _journal_timestamp(entry.get("applied_at"))
-    return entry
+    if has_type:
+        return entry
+    return {**entry, "type": "curation", "status": "success"}
 
 
 def successful_curation_entries(path: Path) -> list[dict[str, Any]]:
@@ -164,9 +178,7 @@ def successful_curation_entries(path: Path) -> list[dict[str, Any]]:
     from .journal import verify_journal
 
     entries = verify_journal(path)
-    for entry in entries:
-        validate_curation_journal_entry(entry)
-    return entries
+    return [validate_curation_journal_entry(entry) for entry in entries]
 
 
 def _strict_json(path: Path) -> Any:
