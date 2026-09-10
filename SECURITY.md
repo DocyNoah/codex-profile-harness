@@ -1,78 +1,70 @@
 # Security model
 
-## Trust boundaries
+## Boundaries
 
-- Treat every Codex project as one profile. Repository registrations must resolve
-  below that profile's `projects/` directory.
-- Hook capture is model-free. It selects bounded metadata, normalizes text,
-  redacts common credential patterns, and creates immutable file-per-event
-  receipts.
-- Redaction is defense in depth, not a guarantee. Assistant text may contain
-  confidential material that does not resemble a known credential. Protect the
-  entire `.harness/` tree and its backups accordingly.
-- Curation accepts only schema-bounded action types with source receipt IDs.
-  Actions map to fixed destinations; identity, user, context, and mandatory rule
-  files are never model-writable.
-- Curation calls `codex exec` with a read-only sandbox. Application is local,
-  deterministic, snapshot-backed, and journaled.
-- Every fixed profile and repository path is checked lexically for symlink
-  components before it is read or written. Existing ordinary directories are
-  allowed; a link anywhere inside the trusted profile boundary is rejected.
-- Batch manifests bind canonical receipt bytes with SHA-256. Journal entries bind
-  the consumed receipt digests, accepted result digest, resulting target digests,
-  and archived receipt names/digests.
-- Receipt timestamps use a strict uppercase-`Z` UTC RFC 3339 subset (optional one
-  to six fractional digits); numeric offsets and malformed calendar dates are
-  rejected consistently by runtime validation and the bundled schema. Doctor
-  verifies the complete bounded payload schema, not only its top-level keys.
+- One Codex project is one profile. Registered repositories must resolve below
+  its `projects/` directory; fixed profile/repository paths reject symlink
+  components.
+- Hook capture is model-free and bounded. It keeps only selected user/assistant
+  text, applies best-effort credential redaction, and writes immutable receipts.
+- Transcript reads must be regular files contained below `CODEX_HOME`. Unsafe,
+  unavailable, malformed, changed, or oversized transcript input uses a safe
+  fallback with `capture_quality=partial`. Hook payload and transcript formats
+  are not guaranteed stable APIs.
+- Curation uses `gpt-5.6-sol` at `medium`; improvement uses `gpt-6-astra` at
+  `high`. Model calls consume tokens only when due. Outputs are schema/size
+  bounded, and `codex exec` runs with a read-only sandbox.
+- Improvement is proposal-only. Applying a proposal requires user approval.
+  Identity, user policy, context, and mandatory instructions are outside model
+  write targets.
 
-## Hook approval
+Redaction is defense in depth, not a secret scanner. User or assistant text may
+contain confidential material that patterns miss. Do not put API keys in profile
+documents; protect `.harness/` and backups as confidential.
 
-Hooks execute local code with the user's permissions. Inspect `hooks/hooks.json`
-and the installed source before accepting Codex's trust prompt. The bundled hook
-only invokes `profile-harness hook capture`; it never invokes a model or performs
-curation. Do not bypass hook trust for interactive use.
+## Hook trust
 
-## Installation boundary
+Hooks execute local code with the user's permissions. Inspect the source and
+generated `hooks/hooks.json` before approval. The bundled hook invokes only the
+capture command and does not call a model. The installer never approves or
+bypasses hook trust. A malicious source checkout or local account can replace
+code before execution; use a reviewed release and normal filesystem protections.
 
-Build installable files with `scripts/build_local_marketplace.py`. The builder
-copies an explicit runtime allowlist and refuses to overwrite its output. It does
-not traverse the source tree, so `.git`, untracked files, credentials, tests,
-caches, and generated profile state cannot enter the marketplace artifact merely
-because they exist beside the source. Inspect the generated local marketplace
-before registering it with Codex.
+## Installation and managed Git paths
 
-## Data integrity and recovery
+The marketplace builder copies a fixed allowlist and refuses to follow packaged
+symlinks or overwrite output. It excludes Git data, tests, caches, scratch,
+profiles, credentials, and arbitrary untracked files. The installer stages that
+artifact and retains a recoverable previous installation.
 
-Run `profile-harness doctor` after installation, upgrades, restores, or suspected
-tampering. It checks registry containment and symlinks, runtime directories,
-active and archived receipts, evidence-to-journal bindings, journal hash
-continuity, interrupted transactions, and stale locks. A nonzero exit requires
-operator attention.
+Automatic profile Git stages only code-owned managed paths: profile documents,
+registry/config, curated semantic/procedural memory, journals, and improvement
+state. Runtime receipts, processing/archive/state/log directories,
+`DASHBOARD.md`, and nested repositories are ignored. Harness checkpoint commands
+disable Git hooks and hostile repository environment variables at their own
+boundary; normal Git usage is unaffected. There is no automatic push.
 
-Application snapshots are under `.harness/memory/archive/snapshots/`; processed
-receipts are under `.harness/memory/archive/processed/`. The append-only journal
-detects modification but does not prevent an attacker with filesystem access
-from replacing the profile and its backups. Keep independent backups and use
-filesystem permissions appropriate for the profile's sensitivity.
+Local history is auditability, not backup. Disk loss destroys it with the profile.
+Keep encrypted or otherwise protected independent backups, and remember that
+runtime evidence intentionally ignored by Git is included only if the whole
+profile is backed up.
 
-Before any target mutation, curation atomically publishes and fsyncs a
-write-ahead descriptor under `.harness/state/transactions/`. A crash before the
-commit marker restores all targets, journal state, and receipts. A crash after
-the commit marker preserves the committed targets/journal and idempotently
-finishes receipt archival and batch cleanup. Directory fsync is attempted where
-the host filesystem supports it.
+## Integrity and recovery
 
-Recovery holds the same exclusive `ProfileLease` for the complete operation.
-Doctor never performs a check-then-act recovery: when a curator owns the lease,
-doctor reports the active lock and leaves the transaction untouched. Every
-recovery unlink, cross-directory receipt rename, and batch-tree removal is
-followed by the affected parent-directory fsync calls before the transaction
-descriptor is deleted.
+Curation and improvement use durable transaction descriptors, snapshots,
+cryptographic digests, bounded hash-chained journals, and one profile lease.
+Recovery rolls back pre-commit work or completes post-commit publication without
+racing a live owner. Git checkpoint failure does not invalidate a completed
+capture/curation; the failure is recorded for `doctor` and a later checkpoint.
 
-The curator sets `PROFILE_HARNESS_CURATOR=1` only in its child process
-environment. Lifecycle capture checks that inherited marker before parsing hook
-payloads, preventing curation from capturing its own child lifecycle events.
+Run `profile-harness doctor` after install, upgrade, restore, crashes, or suspected
+tampering. Do not edit receipts, journal entries, or transaction descriptors to
+silence a finding. Recover with the harness where safe or restore an independently
+verified backup.
 
-Do not store API keys in profile files. `curate --run` reuses Codex's existing
-authentication and requires no separate provider credential.
+## Reporting vulnerabilities
+
+Do not include secrets or private profile data in a public issue. Report the
+minimum reproducible details through the repository's private security advisory
+channel when available:
+https://github.com/DocyNoah/codex-profile-harness/security/advisories/new

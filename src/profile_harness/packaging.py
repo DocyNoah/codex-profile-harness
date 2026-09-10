@@ -13,7 +13,9 @@ PLUGIN_NAME = "codex-profile-harness"
 MARKETPLACE_NAME = "codex-profile-harness-local"
 PACKAGED_FILES = (
     ".codex-plugin/plugin.json",
+    "CHANGELOG.md",
     "INSTALL.md",
+    "LICENSE",
     "README.md",
     "SECURITY.md",
     "bin/profile-harness",
@@ -23,6 +25,8 @@ PACKAGED_FILES = (
     "schemas/hook-receipt.schema.json",
     "schemas/improvement-result.schema.json",
     "scripts/build_local_marketplace.py",
+    "scripts/install.py",
+    "scripts/validate_release.py",
     "skills/profile-harness/SKILL.md",
     "src/profile_harness/__init__.py",
     "src/profile_harness/capture.py",

@@ -1,10 +1,18 @@
 {
   "name": "codex-profile-harness",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Isolated profile memory and repository routing for Codex projects.",
   "author": {
     "name": "Codex Profile Harness contributors"
   },
+  "homepage": "https://github.com/DocyNoah/codex-profile-harness",
+  "repository": "https://github.com/DocyNoah/codex-profile-harness",
+  "license": "MIT",
+  "keywords": [
+    "codex",
+    "profiles",
+    "memory"
+  ],
   "interface": {
     "displayName": "Codex Profile Harness",
     "shortDescription": "Keep profile memory isolated and repository work routed.",

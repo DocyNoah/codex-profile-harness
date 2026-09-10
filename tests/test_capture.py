@@ -142,9 +142,10 @@ class CaptureEventTests(unittest.TestCase):
     def test_redacts_credentials_before_persistence(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = self.make_profile(Path(temporary_directory))
+            github_token = "ghp_" + "abcdefghijklmnopqrstuvwxyz123456"
             message = (
                 "API_KEY=top-secret-value Authorization: Bearer abc.def.ghi "
-                "github=ghp_abcdefghijklmnopqrstuvwxyz123456"
+                f"github={github_token}"
             )
 
             result = capture_event(
@@ -159,7 +160,7 @@ class CaptureEventTests(unittest.TestCase):
             persisted = result.receipt_path.read_text(encoding="utf-8")
             self.assertNotIn("top-secret-value", persisted)
             self.assertNotIn("abc.def.ghi", persisted)
-            self.assertNotIn("ghp_abcdefghijklmnopqrstuvwxyz123456", persisted)
+            self.assertNotIn(github_token, persisted)
             self.assertIn("[REDACTED]", persisted)
 
     def test_top_level_cwd_is_redacted_and_bounded_before_persistence(self) -> None:

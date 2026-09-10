@@ -13,7 +13,18 @@ Keep profile-wide memory under `.harness/memory/`. Keep repository status,
 tasks, and decisions in that repository's `STATUS.md`, `TASKS.md`, and
 `DECISIONS.md`. Never treat generated `DASHBOARD.md` as a source of truth.
 
+The working agent updates repository `STATUS.md` and `TASKS.md` naturally while
+doing the user's work. Curation only reconciles missed, duplicate, or conflicting
+state from captured evidence; it is not a second project-management workflow.
+Preserve the authority boundaries in the profile and repository `AGENTS.md` files.
+
+Improvement is proposal-only. Never apply a file under
+`.harness/improvements/proposed/` without explicit user approval, and never let
+curation or improvement rewrite identity, user policy, or mandatory instructions.
+
 Run `profile-harness --help` and the relevant subcommand help before operating
 the harness. Capture hooks only record evidence. Use `curate --prepare` for
-reviewable input, `curate --apply` for an approved result, `dashboard` to
-refresh the index, and `doctor` to inspect integrity.
+reviewable input, `curate --apply` for an approved result, `maintain` for one
+scheduled due check, `dashboard` to refresh the index, and `doctor` to inspect
+integrity. Use `git status` and `git log` subcommands to inspect automatic local
+profile checkpoints; the harness never pushes them.

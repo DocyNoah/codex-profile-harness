@@ -1,75 +1,111 @@
 # Codex Profile Harness
 
-Codex Profile Harness treats one Codex project as one profile. Code repositories
-remain nested below the profile's `projects/` directory and are selected through
-`PROJECTS.toml`; they are not separate Codex projects.
-
-The hook path only captures immutable, redacted receipts. Curation is a separate
-manual or scheduled operation that validates fixed action types, binds canonical
-receipt/result/target digests, uses a durable write-ahead transaction, appends a
-hash-chained journal, and archives processed receipts.
-Profile identity and policy files are outside the curation write boundary.
-
-## Requirements
-
-- Python 3.11 or newer on macOS or Linux
-- Codex CLI for local marketplace/plugin installation and automatic curation
-  with `curate --run`; `doctor --check-codex` optionally verifies its presence
-
-The installed harness runtime uses only the Python standard library. Manual
-capture, prepare/apply, dashboard, and ordinary doctor commands do not invoke
-the Codex CLI after installation.
+Codex Profile Harness turns one Codex project into one durable **profile**:
+profile-wide identity and memory live at the project root, while any number of
+real Git repositories live below `projects/`. It captures bounded conversation
+evidence, curates useful memory when due, proposes harness improvements, and
+keeps managed profile documents in automatic local Git history.
 
 ## Quick start
 
-Build and install the allowlisted local marketplace as described in
-[INSTALL.md](INSTALL.md), then:
+Requirements: macOS or Linux, Python 3.11+, Git, and an installed/authenticated
+Codex CLI. Clone [this repository](https://github.com/DocyNoah/codex-profile-harness),
+inspect `hooks/hooks.json`, then run:
 
 ```sh
-PROFILE_ROOT="$HOME/codex-profiles/work"
-profile-harness init "$PROFILE_ROOT" --name "Work"
-mkdir -p "$PROFILE_ROOT/projects/api"
-profile-harness register-repo "$PROFILE_ROOT" api "$PROFILE_ROOT/projects/api"
-cd "$PROFILE_ROOT"
+python3 scripts/install.py
+export PATH="$HOME/.local/bin:$PATH"
+profile-harness init "$HOME/codex-profiles/work" --name "Work"
+mkdir -p "$HOME/codex-profiles/work/projects/api"
+profile-harness register-repo "$HOME/codex-profiles/work" api "$HOME/codex-profiles/work/projects/api"
+cd "$HOME/codex-profiles/work"
+profile-harness doctor --check-codex
+profile-harness dashboard
+```
+
+The installer builds a fixed allowlist into a local marketplace, installs selector
+`codex-profile-harness@codex-profile-harness-local`, and never approves hooks.
+Start a new Codex task and approve the hook only after inspecting it. See
+[INSTALL.md](INSTALL.md) for dry-run, manual installation, and recovery.
+
+## How it works
+
+```text
+profile/                         one Codex project and profile
+├── IDENTITY.md USER.md          stable profile identity and user context
+├── CONTEXT.md MEMORY.md         profile context and curated summary
+├── PROJECTS.toml                registered nested repositories
+├── DASHBOARD.md                 generated status view (ignored)
+├── .harness/                    config, captured evidence, curated memory,
+│                                journals, proposals, and runtime state
+└── projects/
+    ├── api/                     ordinary repository
+    │   ├── STATUS.md            current state, updated by the working agent
+    │   ├── TASKS.md             unfinished work, updated by the working agent
+    │   └── DECISIONS.md         compact index; details may be archived
+    └── web/
+```
+
+- **Captured** data is model-free, immutable, redacted evidence from lifecycle
+  hooks. When a supported transcript delta is unavailable or unsafe, capture
+  falls back to the bounded last assistant message and marks quality `partial`.
+- **Curated** data is a model-produced, schema-bounded reconciliation of missed,
+  duplicate, or conflicting state. Normal work should update repository
+  `STATUS.md` and `TASKS.md` directly and naturally.
+- **Improved** data is a model-produced proposal under
+  `.harness/improvements/proposed/`. It is proposal-only and requires user
+  approval before anything is applied.
+
+The transcript file format and Codex hook payload are host implementation details,
+not guaranteed public APIs. Unsafe or changed formats degrade to safe fallback.
+
+## Models, schedule, and token use
+
+Run [the cron example](examples/cron.example) every **15 minutes**. Each
+`profile-harness maintain` first performs model-free due checks:
+
+- Curation uses `gpt-5.6-sol` at `medium` only when at least **30** valid receipts
+  exist or the oldest valid receipt is at least **4 hours** old; at most 30 are
+  processed per run.
+- Improvement uses `gpt-6-astra` at `high`. After a **24 hours** minimum cooldown,
+  it runs when there are at least 10 new curations, or after **72 hours** when
+  there are at least 3. It only writes proposals.
+
+Empty and not-due runs use no model tokens. Due curation and improvement consume
+Codex model tokens in proportion to bounded evidence and curated state. Defaults
+are explicit in `.harness/config.toml` and may be changed there.
+
+## Local Git, status, and backup
+
+Initialization creates a Git repository for profile-owned documents. The harness
+stages only code-owned managed paths, uses deterministic commit messages, ignores
+runtime evidence and nested `projects/`, and records failures for `doctor`. There
+is **no automatic push** and repository Git histories remain independent.
+
+```sh
+profile-harness maintain
+profile-harness dashboard
 profile-harness doctor
-profile-harness dashboard
+profile-harness git status
+profile-harness git log
 ```
 
-Run curation manually with either a review boundary:
+Local history is not disk-loss protection. Back up the whole profile—including
+`.git`, `.harness`, and nested repositories—to protected independent storage.
+See [INSTALL.md](INSTALL.md#backup-and-restore).
 
-```sh
-cd "$PROFILE_ROOT"
-BATCH_JSON="$(profile-harness curate --prepare)"
-BATCH_ID="$(printf '%s\n' "$BATCH_JSON" | python3 -c 'import json, sys; print(json.load(sys.stdin)["batch_id"])')"
-profile-harness curate --apply "$PROFILE_ROOT/curation-result.json" --batch "$BATCH_ID"
-profile-harness dashboard
-```
+## Privacy, limits, and removal
 
-or let an installed and authenticated Codex CLI produce and apply the bounded
-result:
+Captured text can contain confidential material even after redaction. Evidence and
+backups stay local but must be protected. Transcript reads are contained below
+`CODEX_HOME`, fixed paths reject symlinks, model output has narrow write targets,
+and Git checkpoints never push. See [SECURITY.md](SECURITY.md).
 
-```sh
-cd "$PROFILE_ROOT"
-profile-harness curate --run
-profile-harness dashboard
-```
+This is a local harness, not a background service, cloud sync system, secret
+scanner, or guarantee against a hostile local account. Codex hooks and transcript
+formats can change. Scheduling requires cron or an equivalent scheduler.
 
-An empty inbox returns `{"status":"no_op"}` without creating a batch, invoking
-Codex, or appending to the journal. Interrupted curation is recovered under the
-profile lease on the next curate command (or by `doctor` while no curator owns
-the lease). Doctor acquires and holds that same lease throughout recovery; an
-active curator is reported and never raced.
-
-Use `profile-harness --help` and subcommand help for the authoritative CLI.
-`DASHBOARD.md` is a generated index; edit repository `STATUS.md`, `TASKS.md`, and
-`DECISIONS.md` instead.
-
-## Documentation
-
-- [INSTALL.md](INSTALL.md): install, hooks, cron, backup, upgrade, uninstall, troubleshooting
-- [SECURITY.md](SECURITY.md): trust and data-boundary model
-- [examples/cron.example](examples/cron.example): hourly curation example
-
-This repository is a local plugin artifact. Its builder creates a fixed-name
-local marketplace for installation, but the project does not publish or depend
-on a remote marketplace.
+For upgrade and uninstall commands, see [INSTALL.md](INSTALL.md). Uninstalling the
+plugin intentionally preserves profiles and their local history. Released under
+the [MIT License](LICENSE); changes are listed in [CHANGELOG.md](CHANGELOG.md),
+and contributions follow [CONTRIBUTING.md](CONTRIBUTING.md).

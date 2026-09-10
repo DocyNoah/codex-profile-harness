@@ -1,44 +1,64 @@
 # Installation and operations
 
-## Build and install the local plugin
+## Install
 
-Run these commands from an extracted or cloned copy of this repository:
+From a cloned or extracted release, inspect `hooks/hooks.json`, preview the
+operation, then install:
 
 ```sh
-MARKETPLACE_ROOT="${XDG_DATA_HOME:-$HOME/.local/share}/codex-profile-harness-marketplace"
-BIN_HOME="$HOME/.local/bin"
-python3 scripts/build_local_marketplace.py "$MARKETPLACE_ROOT"
-codex plugin marketplace add "$MARKETPLACE_ROOT"
-codex plugin add codex-profile-harness@codex-profile-harness-local
-mkdir -p "$BIN_HOME"
-ln -sfn "$MARKETPLACE_ROOT/plugins/codex-profile-harness/bin/profile-harness" "$BIN_HOME/profile-harness"
-export PATH="$BIN_HOME:$PATH"
+python3 scripts/install.py --dry-run
+python3 scripts/install.py
+export PATH="$HOME/.local/bin:$PATH"
 profile-harness --help
 ```
 
-Persist `$HOME/.local/bin` in the shell `PATH` using the shell's normal startup
-file. The builder copies a fixed runtime allowlist into a local marketplace; it
-does not copy `.git`, arbitrary untracked files, credentials, tests, caches, or
-profile state. It creates marketplace name `codex-profile-harness-local` and
-plugin selector `codex-profile-harness@codex-profile-harness-local`. This is a
-local installation, not marketplace publication.
+Persist `$HOME/.local/bin` in the shell `PATH`. The noninteractive installer
+builds a staging marketplace from a fixed file allowlist, moves an existing
+marketplace to a timestamped `.previous.*` directory, registers marketplace
+`codex-profile-harness-local`, installs selector
+`codex-profile-harness@codex-profile-harness-local`, and atomically updates the
+executable symlink. It never bypasses hook trust, copies arbitrary source files,
+deletes a profile, or deletes the previous installation. On failure it restores
+the previous marketplace and retains the failed generated tree when possible.
 
-## Hook trust
+Custom destinations are explicit:
 
-The installed plugin discovers `hooks/hooks.json` and supplies `PLUGIN_ROOT`
-to its commands. Before approving the Codex hook trust prompt, inspect that file
-and verify it invokes only:
+```sh
+python3 scripts/install.py \
+  --marketplace-root "$HOME/.local/share/codex-profile-harness-marketplace" \
+  --bin-home "$HOME/.local/bin"
+```
+
+For a manual install, run the same safe primitives:
+
+```sh
+MARKETPLACE_ROOT="$HOME/.local/share/codex-profile-harness-marketplace"
+python3 scripts/build_local_marketplace.py "$MARKETPLACE_ROOT"
+codex plugin marketplace add "$MARKETPLACE_ROOT"
+codex plugin add codex-profile-harness@codex-profile-harness-local
+mkdir -p "$HOME/.local/bin"
+ln -s "$MARKETPLACE_ROOT/plugins/codex-profile-harness/bin/profile-harness" "$HOME/.local/bin/profile-harness"
+```
+
+The builder refuses an existing output and packages only reviewed runtime,
+templates, schemas, skill, and public documentation.
+
+## Hook trust and transcript fallback
+
+The installed plugin supplies `PLUGIN_ROOT`; its lifecycle hook runs only:
 
 ```sh
 python3 "$PLUGIN_ROOT/bin/profile-harness" hook capture
 ```
 
-Approve only the generated plugin below `$MARKETPLACE_ROOT`. Do not use
-`--dangerously-bypass-hook-trust`. Start a new Codex task after installation so
-the host discovers the plugin and prompts for trust. Events can also be supplied
-explicitly to `profile-harness hook capture` on standard input.
+Start a new Codex task after installation. Approve only the inspected hook from
+the expected generated marketplace. Never use a hook-trust bypass. Capture reads
+only a bounded regular transcript below `CODEX_HOME`. Missing, malformed,
+oversized, changed, or unsafe transcript input falls back to bounded hook data,
+sets `capture_quality` to `partial`, and does not expose the rejected path. Codex
+hook payload and transcript formats are not guaranteed APIs.
 
-## Initialize a profile and register repositories
+## First profile and repositories
 
 ```sh
 PROFILE_ROOT="$HOME/codex-profiles/work"
@@ -48,71 +68,59 @@ profile-harness register-repo "$PROFILE_ROOT" api "$PROFILE_ROOT/projects/api"
 profile-harness register-repo "$PROFILE_ROOT" web "$PROFILE_ROOT/projects/web"
 cd "$PROFILE_ROOT"
 profile-harness doctor --check-codex
+profile-harness git status
 ```
 
-Initialization preserves existing user files. Registration accepts only real
-directories below the profile's `projects/` directory.
+Initialization preserves existing user files and creates automatic local Git
+history. Registration accepts only real directories below `projects/`.
 
-The app-installed plugin provides the bundled skill. The profile-local
-`.agents/skills` directory remains available for user-owned skills.
+## Scheduling and models
 
-## Manual curation
-
-Prepare evidence and note the printed batch ID:
-
-```sh
-cd "$PROFILE_ROOT"
-BATCH_JSON="$(profile-harness curate --prepare)"
-BATCH_ID="$(printf '%s\n' "$BATCH_JSON" | python3 -c 'import json, sys; print(json.load(sys.stdin)["batch_id"])')"
-printf '%s\n' "$BATCH_JSON"
-```
-
-If `status` is `no_op`, stop here: the inbox was empty and no batch, model call,
-or journal entry was created.
-
-Review the `prompt.md` inside `.harness/memory/processing/$BATCH_ID`, create
-`$PROFILE_ROOT/curation-result.json` conforming to the bundled curation schema,
-then apply that exact batch:
-
-```sh
-profile-harness curate --apply "$PROFILE_ROOT/curation-result.json" --batch "$BATCH_ID"
-profile-harness dashboard
-profile-harness doctor
-```
-
-Failed application restores snapshots and returns valid receipts to the inbox.
-Process crashes are recovered from the durable transaction descriptor by the
-next curate command; `doctor` also recovers an interrupted transaction when no
-curator holds the lease. Doctor holds the profile lease until recovery and all
-directory durability barriers finish; if curation is active it reports the lock
-and does not attempt repair.
-
-With an installed, authenticated `codex` executable:
-
-```sh
-cd "$PROFILE_ROOT"
-profile-harness curate --run
-profile-harness dashboard
-```
-
-## Scheduled curation
-
-Copy [examples/cron.example](examples/cron.example) into `crontab -e`, adjust the
-profile directory if it is not `$HOME/codex-profiles/work`, and create the log
-directory once:
+Install [examples/cron.example](examples/cron.example) with `crontab -e` after
+adjusting its profile path, and create the log directory:
 
 ```sh
 mkdir -p "$HOME/.local/state/profile-harness"
 crontab -e
 ```
 
-Cron uses the saved Codex authentication of the account that owns the crontab.
-It does not need a separate provider key. Empty hourly runs are true no-ops and
-do not invoke Codex or create batches/journal entries.
+Every 15 minutes, `maintain` performs model-free due checks. Curation runs with
+`gpt-5.6-sol` / `medium` at 30 receipts or 4 hours oldest-receipt age. Improvement
+runs with `gpt-6-astra` / `high` after a 24 hours cooldown and either 10 new
+curations, or 72 hours plus 3 new curations. Not-due runs consume no model token;
+due work consumes tokens. Improvement is proposal-only and never auto-applies.
+
+To run or inspect manually:
+
+```sh
+cd "$PROFILE_ROOT"
+profile-harness maintain
+profile-harness dashboard
+profile-harness doctor
+profile-harness git status
+profile-harness git log
+```
+
+The working agent should update repository `STATUS.md` and `TASKS.md` during the
+work itself. Curation reconciles evidence; it is not a separate routine rewrite.
+
+## Managed Git and recovery
+
+Only managed profile documents are staged: profile instructions/context,
+`PROJECTS.toml`, config, curated semantic/procedural memory, journals, and
+improvement proposals/status. Runtime evidence and state, `DASHBOARD.md`, and
+nested repositories are ignored. Deterministic commits are local: there is no
+automatic push. Git hooks are disabled only for harness-owned checkpoint commands;
+normal user Git commands retain their configured hooks.
+
+`profile-harness doctor` reports capture, journal, transaction, and checkpoint
+failures. Interrupted curation/improvement uses durable descriptors and snapshots.
+Restore a verified backup if integrity validation cannot safely recover state.
 
 ## Backup and restore
 
-Pause scheduled curation before backup. From the profile's parent directory:
+Pause scheduling, then back up the whole profile. This includes private evidence,
+profile `.git` history, and nested repositories:
 
 ```sh
 PROFILE_ROOT="$HOME/codex-profiles/work"
@@ -121,7 +129,8 @@ tar -czf "$BACKUP_FILE" -C "$(dirname "$PROFILE_ROOT")" "$(basename "$PROFILE_RO
 tar -tzf "$BACKUP_FILE"
 ```
 
-Restore into an empty parent directory, then diagnose it:
+Store the archive as confidential data on independent storage. Local Git history
+alone can be lost with the disk. Restore into an empty parent and validate:
 
 ```sh
 RESTORE_PARENT="$HOME/restored-codex-profiles"
@@ -131,66 +140,34 @@ cd "$RESTORE_PARENT/work"
 profile-harness doctor
 ```
 
-The profile backup includes receipts, journals, snapshots, memory, and nested
-repositories. Keep it protected as confidential data.
-
 ## Upgrade
 
-Run from the newer source tree after pausing hooks and scheduled curation. The
-builder refuses to overwrite an existing output, so it builds a new tree before
-the installed tree is moved aside:
-
-```sh
-MARKETPLACE_ROOT="${XDG_DATA_HOME:-$HOME/.local/share}/codex-profile-harness-marketplace"
-NEW_MARKETPLACE="${MARKETPLACE_ROOT}.new.$(date -u +%Y%m%dT%H%M%SZ)"
-OLD_MARKETPLACE="${MARKETPLACE_ROOT}.previous.$(date -u +%Y%m%dT%H%M%SZ)"
-PROFILE_ROOT="$HOME/codex-profiles/work"
-python3 scripts/build_local_marketplace.py "$NEW_MARKETPLACE"
-codex plugin remove codex-profile-harness@codex-profile-harness-local
-codex plugin marketplace remove codex-profile-harness-local
-mv "$MARKETPLACE_ROOT" "$OLD_MARKETPLACE"
-mv "$NEW_MARKETPLACE" "$MARKETPLACE_ROOT"
-codex plugin marketplace add "$MARKETPLACE_ROOT"
-codex plugin add codex-profile-harness@codex-profile-harness-local
-ln -sfn "$MARKETPLACE_ROOT/plugins/codex-profile-harness/bin/profile-harness" "$HOME/.local/bin/profile-harness"
-profile-harness --help
-cd "$PROFILE_ROOT"
-profile-harness doctor --check-codex
-```
-
-Profiles live outside the plugin installation and are not replaced. Open a new
-Codex task after the reinstall. Keep `$OLD_MARKETPLACE` until the upgraded
-installation has been verified.
+Pause scheduling and run `python3 scripts/install.py` from the newer release.
+The old marketplace is retained as `.previous.TIMESTAMP`. Open a new Codex task,
+reinspect the installed hook, run `profile-harness doctor --check-codex`, and keep
+the backup until verification succeeds. Profiles are outside the install tree and
+are untouched.
 
 ## Uninstall
 
-Pause cron and remove its line, then remove the executable and installed source:
+Pause/remove the cron entry, then unregister the plugin and marketplace:
 
 ```sh
-MARKETPLACE_ROOT="${XDG_DATA_HOME:-$HOME/.local/share}/codex-profile-harness-marketplace"
 codex plugin remove codex-profile-harness@codex-profile-harness-local
 codex plugin marketplace remove codex-profile-harness-local
 rm "$HOME/.local/bin/profile-harness"
-rm -rf "$MARKETPLACE_ROOT"
 ```
 
-Profile directories and any `.previous` upgrade copies are intentionally
-retained. Delete them only after verifying a backup.
+The marketplace and `.previous.*` copies may be removed after inspection. Profile
+directories, nested repositories, evidence, and local history are intentionally
+preserved; delete them only with a verified backup and an explicit decision.
 
 ## Troubleshooting
 
-- `no Codex profile found`: run inside a profile or nested registered repository.
-- `repository path must be below ... projects`: move the repository below the
-  profile's `projects/` directory before registering it.
-- `curation lease is live`: allow the active run to finish. `profile-harness
-  doctor` reports stale lock metadata; the next curation safely quarantines it.
-- invalid receipt or journal: do not edit evidence or journal files. Restore a
-  verified backup or inspect the reported dead-letter/snapshot path.
-- missing `codex`: manual prepare/apply and dashboards still work. Install
-  Codex and authenticate before `curate --run`.
-- hooks do not fire: confirm the plugin is installed in the current Codex host,
-  run `codex plugin list --marketplace codex-profile-harness-local`, start a new
-  task, and approve the inspected hook source when prompted.
-- broken or missing config: run `profile-harness doctor --profile
-  "$PROFILE_ROOT"`; doctor can diagnose an explicitly selected profile without
-  a valid config.
+- `no Codex profile found`: run inside the profile or a registered repository.
+- `curation lease is live`: let the active run finish; do not remove its lock.
+- Missing Codex: capture/status/doctor still work, but due model runs require an
+  installed and authenticated CLI.
+- Hook does not fire: confirm the plugin selector, start a new task, and approve
+  the inspected hook prompt.
+- Broken config: run `profile-harness doctor --profile "$PROFILE_ROOT"`.
