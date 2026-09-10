@@ -4,6 +4,7 @@ import json
 import fcntl
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -220,6 +221,163 @@ class ProfileGitTests(unittest.TestCase):
                     profile_git_module._git(profile, "status", read_only=True)
             observed = json.loads(env_dump.read_text(encoding="utf-8"))
             self.assertEqual("0", observed.get("GIT_OPTIONAL_LOCKS"))
+
+    def test_git_deadline_covers_stdin_and_descendant_held_output_pipes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            parent = Path(temporary_directory)
+            profile = parent / "profile"
+            init_profile(profile, "Work")
+            fake_root = parent / "fake-bin"
+            fake_root.mkdir()
+            fake = fake_root / "git"
+            fake.write_text(
+                "#!/bin/sh\n"
+                "(/bin/sleep 1) &\n"
+                "/bin/sleep 1\n",
+                encoding="utf-8",
+            )
+            fake.chmod(0o755)
+            invocation = (
+                "import sys,time;from pathlib import Path;"
+                f"sys.path.insert(0,{str(ROOT / 'src')!r});"
+                "import profile_harness.profile_git as g;"
+                "g._TIMEOUT=0.1;start=time.monotonic();"
+                "\ntry:g._git(Path(sys.argv[1]),'check-ignore',input_text='x'*1000000)"
+                "\nexcept g.ProfileGitError as e:print(time.monotonic()-start, str(e))"
+            )
+            environment = os.environ.copy()
+            environment["PATH"] = str(fake_root)
+
+            started = time.monotonic()
+            result = subprocess.run(
+                [sys.executable, "-c", invocation, str(profile)],
+                text=True,
+                capture_output=True,
+                check=False,
+                timeout=0.8,
+                env=environment,
+            )
+
+            self.assertEqual(0, result.returncode, result.stderr)
+            elapsed_text, message = result.stdout.strip().split(" ", 1)
+            self.assertLess(float(elapsed_text), 0.5)
+            self.assertIn("time", message.lower())
+            self.assertLess(time.monotonic() - started, 0.8)
+
+    def test_guard_timeout_bounds_checkpoint_and_capture_while_other_process_holds_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            parent = Path(temporary_directory)
+            profile = parent / "profile"
+            init_profile(profile, "Work")
+            ready = parent / "ready"
+            holder_script = (
+                "import fcntl,sys,time;from pathlib import Path;"
+                "p=Path(sys.argv[1]);r=Path(sys.argv[2]);"
+                "h=p.open('a+b');fcntl.flock(h.fileno(),fcntl.LOCK_EX);"
+                "r.write_text('ready');time.sleep(1)"
+            )
+            holder = subprocess.Popen([
+                sys.executable,
+                "-c",
+                holder_script,
+                str(profile / ".harness/state/profile-git.guard"),
+                str(ready),
+            ])
+            try:
+                deadline = time.monotonic() + 2
+                while not ready.exists() and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                self.assertTrue(ready.exists())
+                (profile / "MEMORY.md").write_text("guarded\n", encoding="utf-8")
+                with mock.patch.object(profile_git_module, "_GUARD_TIMEOUT", 0.1):
+                    started = time.monotonic()
+                    checkpoint = checkpoint_profile(profile, CHECKPOINT_SUBJECT)
+                    captured = capture_event({
+                        "hook_event_name": "Stop",
+                        "session_id": "locked-git",
+                        "cwd": str(profile),
+                    })
+                    elapsed = time.monotonic() - started
+                self.assertFalse(checkpoint.committed)
+                self.assertIsNotNone(checkpoint.error)
+                self.assertTrue(captured.success)
+                self.assertTrue(captured.receipt_path and captured.receipt_path.is_file())
+                self.assertLess(elapsed, 0.6)
+            finally:
+                holder.terminate()
+                holder.wait(timeout=2)
+
+    def test_multiprocess_checkpoints_serialize_to_one_commit(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            profile = Path(temporary_directory) / "profile"
+            init_profile(profile, "Work")
+            (profile / "MEMORY.md").write_text("one shared change\n", encoding="utf-8")
+            processes = [
+                subprocess.Popen(
+                    [sys.executable, str(ROOT / "bin/profile-harness"), "git", "checkpoint"],
+                    cwd=profile, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                )
+                for _ in range(4)
+            ]
+            results = [process.communicate(timeout=5) + (process.returncode,) for process in processes]
+
+            self.assertFalse([(stdout, stderr, code) for stdout, stderr, code in results if code != 0])
+            payloads = [json.loads(stdout) for stdout, _stderr, _code in results]
+            self.assertEqual(1, sum(bool(payload["committed"]) for payload in payloads))
+            self.assertEqual(2, int(git(profile, "rev-list", "--count", "HEAD").stdout))
+
+    def test_initialization_keeps_git_init_and_first_commit_in_one_guard_section(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            profile = Path(temporary_directory) / "profile"
+            init_profile(profile, "Work")
+            shutil.rmtree(profile / ".git")
+            (profile / "MEMORY.md").write_text("initial race\n", encoding="utf-8")
+            original_exit = profile_git_module._GitGuard.__exit__
+            competitor_results = []
+
+            def coordinated_exit(guard, exc_type, exc_value, traceback) -> None:
+                original_exit(guard, exc_type, exc_value, traceback)
+                if competitor_results or not (profile / ".git").is_dir():
+                    return
+                competed = subprocess.run(
+                    [sys.executable, str(ROOT / "bin/profile-harness"), "git", "checkpoint"],
+                    cwd=profile, text=True, capture_output=True, check=False, timeout=5,
+                )
+                competitor_results.append(competed)
+
+            with mock.patch.object(profile_git_module._GitGuard, "__exit__", coordinated_exit):
+                initialized = profile_git_module.initialize_profile_git(profile)
+
+            self.assertTrue(initialized.committed)
+            self.assertEqual(1, len(competitor_results))
+            self.assertEqual(0, competitor_results[0].returncode, competitor_results[0].stderr)
+            self.assertEqual(1, int(git(profile, "rev-list", "--count", "HEAD").stdout))
+            self.assertEqual(INITIALIZE_SUBJECT, subjects(profile)[0])
+
+    def test_capture_checkpoint_spy_observes_published_receipt(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            profile = Path(temporary_directory) / "profile"
+            init_profile(profile, "Work")
+            observed = []
+
+            def checkpoint(root: Path, subject: str) -> CheckpointResult:
+                receipts = list((root / ".harness/memory/inbox").glob("*.json"))
+                observed.append((
+                    subject,
+                    len(receipts),
+                    json.loads(receipts[0].read_text(encoding="utf-8"))["payload"]["session_id"],
+                ))
+                return CheckpointResult(False)
+
+            with mock.patch.object(profile_git_module, "checkpoint_profile", side_effect=checkpoint):
+                result = capture_event({
+                    "hook_event_name": "SessionEnd",
+                    "session_id": "published-first",
+                    "cwd": str(profile),
+                })
+
+            self.assertTrue(result.success)
+            self.assertEqual([(CHECKPOINT_SUBJECT, 1, "published-first")], observed)
 
     def test_forbidden_file_matching_does_not_flag_backup_or_example_names(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

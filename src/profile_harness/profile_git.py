@@ -8,8 +8,10 @@ import fcntl
 import json
 import os
 from pathlib import Path
+import signal
 import subprocess
 import threading
+import time
 from typing import Any, BinaryIO
 
 from .fs import atomic_write_text, ensure_safe_directory, require_safe_path
@@ -82,6 +84,7 @@ REQUIRED_IGNORE_RULES = (
 _FAILURE_PATH = ".harness/state/profile-git-failure.json"
 _MAX_OUTPUT = 16_384
 _TIMEOUT = 10
+_GUARD_TIMEOUT = 0.5
 _MAX_MANAGED_FILES = 2_000
 _MAX_PATH_CHARS = 4_096
 _DISABLED_HOOKS = ".harness/state/profile-git-disabled-hooks"
@@ -127,6 +130,8 @@ def _git(
     read_only: bool = False,
     filter_names: tuple[str, ...] = (),
 ) -> subprocess.CompletedProcess[str]:
+    started = time.monotonic()
+    deadline = started + _TIMEOUT
     environment = {
         key: value
         for key, value in os.environ.items()
@@ -171,6 +176,7 @@ def _git(
             stderr=subprocess.PIPE,
             cwd=root,
             env=environment,
+            start_new_session=True,
         )
     except OSError as error:
         raise ProfileGitError(f"Git command failed: {error}") from error
@@ -178,6 +184,12 @@ def _git(
     output_size = 0
     output_lock = threading.Lock()
     overflow = threading.Event()
+
+    def terminate_group() -> None:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
 
     def read_bounded(stream, destination: str) -> None:
         nonlocal output_size
@@ -193,8 +205,16 @@ def _git(
                     output_size += len(kept)
                 if len(chunk) > remaining:
                     overflow.set()
-                    process.kill()
+                    terminate_group()
                     break
+
+    def write_input() -> None:
+        assert process.stdin is not None
+        try:
+            process.stdin.write((input_text or "").encode("utf-8"))
+            process.stdin.close()
+        except (BrokenPipeError, OSError, ValueError):
+            pass
 
     readers = [
         threading.Thread(target=read_bounded, args=(process.stdout, "stdout")),
@@ -202,25 +222,34 @@ def _git(
     ]
     for reader in readers:
         reader.start()
+    writer = threading.Thread(target=write_input)
+    writer.start()
+    timed_out = False
     try:
-        assert process.stdin is not None
         try:
-            process.stdin.write((input_text or "").encode("utf-8"))
-            process.stdin.close()
-        except BrokenPipeError:
-            pass
-        try:
-            returncode = process.wait(timeout=_TIMEOUT)
-        except subprocess.TimeoutExpired as error:
-            process.kill()
+            returncode = process.wait(timeout=max(0.0, deadline - time.monotonic()))
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            terminate_group()
             process.wait()
-            raise ProfileGitError("Git command exceeded the bounded time limit") from error
     finally:
-        for reader in readers:
-            reader.join()
+        for worker in (*readers, writer):
+            worker.join(timeout=max(0.0, deadline - time.monotonic()))
+        if any(worker.is_alive() for worker in (*readers, writer)):
+            timed_out = True
+            terminate_group()
+            if process.stdin is not None:
+                process.stdin.close()
+            assert process.stdout is not None and process.stderr is not None
+            process.stdout.close()
+            process.stderr.close()
+            for worker in (*readers, writer):
+                worker.join(timeout=0.1)
         assert process.stdout is not None and process.stderr is not None
         process.stdout.close()
         process.stderr.close()
+    if timed_out:
+        raise ProfileGitError("Git command exceeded the bounded time limit")
     if overflow.is_set():
         raise ProfileGitError("Git output exceeded the bounded size limit")
     stdout = b"".join(chunks["stdout"]).decode("utf-8", "surrogateescape")
@@ -377,7 +406,20 @@ class _GitGuard:
         guard = state / "profile-git.guard"
         require_safe_path(self.root, guard, directory=False)
         self.handle = guard.open("a+b")
-        fcntl.flock(self.handle.fileno(), fcntl.LOCK_EX)
+        deadline = time.monotonic() + _GUARD_TIMEOUT
+        while True:
+            try:
+                fcntl.flock(self.handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError as error:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    self.handle.close()
+                    self.handle = None
+                    raise ProfileGitError(
+                        "profile Git checkpoint guard remained busy"
+                    ) from error
+                time.sleep(min(0.01, remaining))
         return self
 
     def __exit__(self, exc_type, exc_value, traceback) -> None:
@@ -437,20 +479,42 @@ def initialize_profile_git(root: Path) -> CheckpointResult:
     git_path = profile_root / ".git"
     try:
         with _GitGuard(profile_root):
-            _safe_hooks_directory(profile_root)
-            if git_path.is_symlink() or (git_path.exists() and not git_path.is_dir()):
-                error = "profile .git path is unsafe"
-                _record_failure(profile_root, INITIALIZE_SUBJECT, error)
-                return CheckpointResult(False, error=error)
-            if not git_path.exists():
-                try:
+            try:
+                _safe_hooks_directory(profile_root)
+                if git_path.is_symlink() or (git_path.exists() and not git_path.is_dir()):
+                    raise ProfileGitError("profile .git path is unsafe")
+                if not git_path.exists():
                     _git(profile_root, "init", "--quiet")
-                except ProfileGitError as error:
-                    _record_failure(profile_root, INITIALIZE_SUBJECT, str(error))
-                    return CheckpointResult(False, error=str(error))
+                return _checkpoint_locked(profile_root, INITIALIZE_SUBJECT)
+            except (OSError, ValueError, ProfileGitError) as error:
+                _record_failure(profile_root, INITIALIZE_SUBJECT, str(error))
+                return CheckpointResult(False, error=str(error))
     except (OSError, ValueError, ProfileGitError) as error:
         return CheckpointResult(False, error=str(error))
-    return checkpoint_profile(profile_root, INITIALIZE_SUBJECT)
+
+
+def _checkpoint_locked(profile_root: Path, subject: str) -> CheckpointResult:
+    """Checkpoint with the validated profile Git guard already held."""
+    _safe_hooks_directory(profile_root)
+    _safe_git_directory(profile_root)
+    candidates = _managed_candidates(profile_root)
+    dirty = _dirty_paths(profile_root, candidates)
+    if not dirty:
+        _failure_path(profile_root).unlink(missing_ok=True)
+        return CheckpointResult(False)
+    filters = _configured_filter_names(profile_root)
+    _git(profile_root, "add", "--", *candidates, filter_names=filters)
+    _git(
+        profile_root,
+        "-c", "user.name=Codex Profile Harness",
+        "-c", "user.email=profile-harness@localhost",
+        "commit", "--only", "--no-verify", "--quiet", "-m", subject,
+        "--", *candidates,
+        filter_names=filters,
+    )
+    sha = _git(profile_root, "rev-parse", "HEAD", read_only=True).stdout.strip()
+    _failure_path(profile_root).unlink(missing_ok=True)
+    return CheckpointResult(True, sha, dirty)
 
 
 def checkpoint_profile(root: Path, subject: str = CHECKPOINT_SUBJECT) -> CheckpointResult:
@@ -461,26 +525,7 @@ def checkpoint_profile(root: Path, subject: str = CHECKPOINT_SUBJECT) -> Checkpo
     try:
         with _GitGuard(profile_root):
             try:
-                _safe_hooks_directory(profile_root)
-                _safe_git_directory(profile_root)
-                candidates = _managed_candidates(profile_root)
-                dirty = _dirty_paths(profile_root, candidates)
-                if not dirty:
-                    _failure_path(profile_root).unlink(missing_ok=True)
-                    return CheckpointResult(False)
-                filters = _configured_filter_names(profile_root)
-                _git(root, "add", "--", *candidates, filter_names=filters)
-                _git(
-                    root,
-                    "-c", "user.name=Codex Profile Harness",
-                    "-c", "user.email=profile-harness@localhost",
-                    "commit", "--only", "--no-verify", "--quiet", "-m", subject,
-                    "--", *candidates,
-                    filter_names=filters,
-                )
-                sha = _git(root, "rev-parse", "HEAD", read_only=True).stdout.strip()
-                _failure_path(profile_root).unlink(missing_ok=True)
-                return CheckpointResult(True, sha, dirty)
+                return _checkpoint_locked(profile_root, subject)
             except (OSError, ValueError, ProfileGitError) as error:
                 _record_failure(profile_root, subject, str(error))
                 return CheckpointResult(False, error=str(error))
