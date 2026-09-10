@@ -102,3 +102,55 @@
 
 - No subagent review was run because this fix round explicitly prohibited
   subagents.
+
+## Fix round 2
+
+### Commit
+
+- `c02d027` — `fix: bind improvement recovery provenance`
+
+### RED evidence
+
+- A completed improvement journal had no transaction identity, so a malicious
+  `journal_existed = false` descriptor could name an existing proposal with its
+  current digest and recovery would delete both the proposal and journal.
+- A real process crash immediately after the journal append was treated as
+  pre-commit and rolled back a proposal that already had a verified durable
+  journal binding.
+- A complete hash-valid 0.1.0 curation entry without the later `type` and
+  `status` fields was rejected by improvement scheduling and doctor.
+- Focused RED command:
+  `python3 -m unittest tests.test_improvement.ImprovementTests.test_force_invokes_exact_improvement_model_and_creates_only_proposals tests.test_improvement.ImprovementTests.test_recovery_obeys_precommit_and_committed_wal_states tests.test_improvement.ImprovementTests.test_malicious_wal_cannot_delete_a_committed_proposal_or_valid_journal tests.test_improvement.ImprovementTests.test_real_process_crashes_recover_precommit_or_finish_committed_state tests.test_improvement.ImprovementTests.test_authentic_legacy_curation_is_normalized_in_memory_without_rewrite`
+  — 1 failure and 4 errors before the production fix.
+
+### Behavior delivered
+
+- Every improvement transaction now has a 128-bit transaction ID bound into
+  the WAL, proposal filename, proposal ownership marker, and committed journal
+  entry. Recovery validates exact paths, hashes, ownership markers, and journal
+  semantics before any mutation.
+- A verified journal append for the same transaction is authoritative commit
+  evidence: recovery rolls forward by retaining the bound proposal and journal
+  and only cleaning transaction state. Proposals referenced by any other
+  verified commit are never removed.
+- A pre-journal rollback requires exact transaction-owned proposal evidence and
+  proof that the journal is absent or exactly matches the validated snapshot.
+  A present journal combined with attacker-controlled `journal_existed = false`
+  fails closed without mutation.
+- The complete historical 0.1.0 curation event shape is accepted through an
+  explicit legacy branch and normalized only in memory. Missing-field and
+  partial-modern lookalikes remain invalid, and the on-disk journal is not
+  rewritten.
+
+### Verification
+
+- `python3 -m unittest tests.test_improvement tests.test_maintenance -v` — 22
+  focused tests passed in 5.963s.
+- `python3 -m unittest discover -s tests -v` — 124 tests passed in 10.047s.
+- `python3 -m compileall -q src tests` — exit 0.
+- `git diff --check` — exit 0, no output.
+
+### Concerns
+
+- No subagent review was run because this fix round explicitly prohibited
+  subagents.
