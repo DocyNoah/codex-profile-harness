@@ -88,3 +88,90 @@ Result: exit 0; compile succeeded and `git diff --check` produced no output.
 ## Concerns
 
 None.
+
+## Resumability and v1 compatibility correction
+
+### Root causes
+
+1. Committed cleanup removed the processing batch before unlinking its WAL.
+   If descriptor unlink failed, the remaining descriptor could not validate on
+   retry because validation still required the deleted batch manifest.
+2. Precommit rollback returned receipts one by one, but validation accepted
+   only receipts still in processing. A crash after one durable move left a
+   safe intermediate state that the next recovery rejected.
+3. Repeated writes to one target replaced `intended_digest` before replacing
+   the target. A crash in that gap left the target at the prior intended digest,
+   which was no longer represented by the WAL.
+4. The strengthened descriptor schema still used version 1 and had no explicit
+   compatibility branch for actual 0.1.0 descriptors without snapshot digests.
+
+### RED evidence
+
+The new tests were written before the production correction. The first focused
+run showed that committed cleanup could not be retried after batch removal,
+both repeated-write crash stages exited normally instead of at the injected
+boundary, and both safe v1 precommit and committed descriptors were rejected by
+the v2-only member shape. The new wrong-inbox-evidence case was already fail
+closed and remained so while partial-return support was added.
+
+### Implementation
+
+- Current curation WAL descriptors are version 2. Their archive evidence is
+  sufficient to validate committed cleanup after the batch directory is gone;
+  the verified transaction-bound journal entry remains mandatory.
+- Applying archive validation accepts exactly one receipt location: its
+  transaction-owned processing source or its exact inbox destination. Each
+  location must contain the manifest-bound receipt digest. Wrong, duplicate,
+  processed, or missing states fail closed, so receipt returns can resume after
+  any already-durable move.
+- Each target transition records `previous_digest` before publishing its next
+  `intended_digest`. Recovery accepts the original snapshot, immediately prior
+  digest, or intended digest as appropriate, while the existing scope,
+  symlink, snapshot, ownership-marker, and journal checks remain in force.
+  Injected crashes immediately after the repeated-write descriptor and after
+  the repeated target replacement both roll back normally.
+- A strict legacy version-1 branch recognizes only the complete 0.1.0 member
+  shape. Committed state still requires a semantically valid journal append,
+  including the authentic legacy curation entry shape without `type`/`status`.
+  Applying state is recovered only when an existing target already equals its
+  exact snapshot or a newly created target is still absent. Unmarked existing
+  files claimed as new and other ambiguous provenance fail closed. Legacy
+  modes are normalized in memory from the verified current files rather than
+  trusted from the descriptor.
+- Registered fixed repository files must already exist before curation writes;
+  newly created Markdown targets retain their batch marker across repeated
+  writes.
+
+### Verification
+
+Focused curation and recovery suite:
+
+```text
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_curation tests.test_final_hardening -v
+```
+
+Result: 49 tests passed in 13.613s, 0 failures.
+
+Complete suite:
+
+```text
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests
+```
+
+Result: 185 tests passed in 50.584s, 0 failures.
+
+Compile and whitespace verification:
+
+```text
+python3 -m compileall -q src tests && git diff --check
+```
+
+Result: exit 0; compile succeeded and `git diff --check` produced no output.
+
+### Implementation commit
+
+`13601a6`
+
+### Concerns
+
+None.
