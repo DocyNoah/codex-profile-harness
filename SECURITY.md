@@ -44,15 +44,15 @@ state. Runtime receipts, processing/archive/state/log directories,
 `DASHBOARD.md`, and nested repositories are ignored. Harness checkpoint commands
 disable Git hooks and hostile repository environment variables at their own
 boundary; normal Git usage is unaffected. There is no automatic push.
-Scheduled maintenance first acquires the profile lease with the built-in safe
-stale timeout, completes abandoned WAL recovery, and then performs Git preflight
-before config/time validation or model work. A validated pending failure is
-retried with its recorded allowlisted subject; malformed, unknown, or failed
-retry metadata is never executed as another subject or cleared. Preflight errors
-stop all later due checks, mutations, and model work. A curation or improvement
-checkpoint failure is not relabeled by a generic commit in the same run.
-Lifecycle hooks never run Git, so a slow or wedged executable cannot consume
-their completion window.
+Scheduled maintenance first acquires the profile lease and validates pending
+checkpoint metadata read-only, before WAL recovery or Git mutation. Malformed or
+unknown metadata aborts with the diagnostic and WAL untouched. Valid metadata is
+kept in memory while curation/improvement recovery runs with automatic recovery
+checkpoints suppressed. The single checkpoint subject priority is pending,
+recovery when a WAL was recovered, then generic. Checkpoint errors stop config,
+due, mutation, and model work while preserving the diagnostic. Lifecycle hooks
+never run Git, so a slow or wedged executable cannot consume their completion
+window.
 
 Local history is auditability, not backup. Disk loss destroys it with the profile.
 Keep encrypted or otherwise protected independent backups, and remember that

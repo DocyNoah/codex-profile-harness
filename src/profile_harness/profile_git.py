@@ -570,27 +570,11 @@ def checkpoint_profile(root: Path, subject: str = CHECKPOINT_SUBJECT) -> Checkpo
         return CheckpointResult(False, error=str(error))
 
 
-def checkpoint_pending_or_generic(root: Path) -> CheckpointResult:
-    """Retry a validated pending subject before the scheduled generic checkpoint."""
+def validate_pending_checkpoint(root: Path) -> str | None:
+    """Read and fully validate pending checkpoint metadata without running Git."""
     profile_root = Path(root).expanduser().resolve()
-    try:
-        with _GitGuard(profile_root):
-            try:
-                pending_subject = _pending_checkpoint_subject(profile_root)
-            except (OSError, ValueError, ProfileGitError) as error:
-                return CheckpointResult(False, error=str(error))
-            subject = pending_subject or CHECKPOINT_SUBJECT
-            try:
-                retried = _checkpoint_locked(profile_root, subject)
-                if subject == CHECKPOINT_SUBJECT:
-                    return retried
-                generic = _checkpoint_locked(profile_root, CHECKPOINT_SUBJECT)
-                return retried if retried.committed else generic
-            except (OSError, ValueError, ProfileGitError) as error:
-                _record_failure(profile_root, subject, str(error))
-                return CheckpointResult(False, error=str(error))
-    except (OSError, ValueError, ProfileGitError) as error:
-        return CheckpointResult(False, error=str(error))
+    with _GitGuard(profile_root):
+        return _pending_checkpoint_subject(profile_root)
 
 
 def inspect_profile_git(root: Path) -> ProfileGitStatus:

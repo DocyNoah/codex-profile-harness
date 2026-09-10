@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import hashlib
 import json
 from pathlib import Path
 import stat
@@ -53,6 +54,58 @@ class MaintenanceTests(unittest.TestCase):
         (root / ".harness/memory/inbox" / f"{receipt_id}.json").write_text(
             json.dumps(value), encoding="utf-8"
         )
+
+    def crash_curation(self, root: Path, stage: str) -> Path:
+        self.add_receipt(root, 0, NOW)
+        batch = prepare_curation(root)
+        title = f"Combined {stage}"
+        script = (
+            "import sys;from pathlib import Path;"
+            f"sys.path.insert(0,{str(ROOT / 'src')!r});"
+            "from profile_harness.curation import apply_actions;"
+            f"apply_actions(Path({str(root)!r}),{batch.batch_id!r},"
+            f"{{'actions':[{{'type':'profile_proposal','title':{title!r},"
+            "'content':'body','source_receipt_ids':['receipt-00']}]},"
+            f"crash_after_stage={stage!r})"
+        )
+        crashed = subprocess.run([sys.executable, "-c", script], check=False)
+        self.assertEqual(91, crashed.returncode)
+        return root / ".harness/state/transactions" / f"{batch.batch_id}.json"
+
+    def create_improvement_wal(self, root: Path) -> tuple[Path, Path]:
+        transaction_id = "a" * 32
+        proposal = (
+            root / ".harness/improvements/proposed"
+            / f"{transaction_id}-01-combined.md"
+        )
+        body = (
+            f"<!-- profile-harness-improvement-transaction: {transaction_id} -->\n"
+            "# Combined\n\nBody\n"
+        )
+        proposal.write_text(body)
+        descriptor = root / ".harness/state/improvement-transaction.json"
+        descriptor.write_text(json.dumps({
+            "version": 1,
+            "state": "applying",
+            "transaction_id": transaction_id,
+            "targets": [{
+                "path": str(proposal.relative_to(root)),
+                "digest": hashlib.sha256(body.encode()).hexdigest(),
+            }],
+            "journal_existed": False,
+            "journal_snapshot": None,
+            "journal_snapshot_digest": None,
+        }, sort_keys=True, indent=2) + "\n")
+        return descriptor, proposal
+
+    def write_pending_diagnostic(self, root: Path, subject: str) -> Path:
+        path = root / ".harness/state/profile-git-failure.json"
+        path.write_text(json.dumps({
+            "subject": subject,
+            "error": "prior exact-subject failure",
+            "failed_at": "2026-09-11T12:00:00Z",
+        }, sort_keys=True, indent=2) + "\n")
+        return path
 
     def fail_commit_subject(self, subject: str):
         original_git = profile_git_module._git
@@ -356,25 +409,31 @@ class MaintenanceTests(unittest.TestCase):
                 ).stdout.strip(),
             )
 
-    def test_maintenance_order_is_lease_recovery_preflight_then_config_and_due_work(self) -> None:
+    def test_maintenance_orders_pending_validation_recovery_checkpoint_before_config(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = self.make_profile(Path(temporary_directory))
             config = load_profile_config(root)
             events = []
 
-            def recover(profile_root: Path):
+            def recover(profile_root: Path, **kwargs):
                 with self.assertRaises(LeaseBusyError):
                     with ProfileLease(profile_root, stale_timeout=60):
                         pass
+                self.assertFalse(kwargs["checkpoint"])
                 events.append("curation-recovery")
                 return ()
 
-            def recover_improvement(profile_root: Path):
+            def recover_improvement(profile_root: Path, **kwargs):
+                self.assertFalse(kwargs["checkpoint"])
                 events.append("improvement-recovery")
                 return False
 
-            def checkpoint(profile_root: Path):
-                events.append("preflight")
+            def validate_pending(profile_root: Path):
+                events.append("validate-pending")
+                return None
+
+            def checkpoint(profile_root: Path, subject: str):
+                events.append("checkpoint")
                 return CheckpointResult(False)
 
             due = maintenance_module.MaintenanceDue(False, None, 0, None, None)
@@ -385,7 +444,9 @@ class MaintenanceTests(unittest.TestCase):
                 "recover_improvement_transaction",
                 side_effect=recover_improvement,
             ), mock.patch.object(
-                profile_git_module, "checkpoint_pending_or_generic", side_effect=checkpoint
+                profile_git_module, "validate_pending_checkpoint", side_effect=validate_pending
+            ), mock.patch.object(
+                profile_git_module, "checkpoint_profile", side_effect=checkpoint
             ), mock.patch.object(
                 maintenance_module,
                 "load_profile_config",
@@ -407,9 +468,10 @@ class MaintenanceTests(unittest.TestCase):
 
             self.assertEqual(
                 [
+                    "validate-pending",
                     "curation-recovery",
                     "improvement-recovery",
-                    "preflight",
+                    "checkpoint",
                     "config",
                     "clock",
                     "due",
@@ -420,7 +482,7 @@ class MaintenanceTests(unittest.TestCase):
 
     def test_abandoned_wal_recovers_before_preflight_even_with_invalid_config(self) -> None:
         for stage, expected_subject, proposal_committed in (
-            ("after_first_write", "harness: checkpoint profile documents", False),
+            ("after_first_write", RECOVERY_SUBJECT, False),
             ("after_commit", RECOVERY_SUBJECT, True),
         ):
             with self.subTest(stage=stage), tempfile.TemporaryDirectory() as temporary_directory:
@@ -464,6 +526,67 @@ class MaintenanceTests(unittest.TestCase):
                 ).returncode == 0
                 self.assertEqual(proposal_committed, tracked)
                 self.assertFalse(list((root / ".harness/state/transactions").glob("*.json")))
+
+    def test_valid_pending_subject_wins_over_curation_or_improvement_recovery(self) -> None:
+        for wal_kind, subject in (
+            ("curation", CURATION_SUBJECT),
+            ("improvement", IMPROVEMENT_SUBJECT),
+        ):
+            with self.subTest(wal_kind=wal_kind), tempfile.TemporaryDirectory() as temporary_directory:
+                root = self.make_profile(Path(temporary_directory))
+                if wal_kind == "curation":
+                    descriptor = self.crash_curation(root, "after_commit")
+                else:
+                    descriptor, _proposal = self.create_improvement_wal(root)
+                    (root / "MEMORY.md").write_text("pending with improvement recovery\n")
+                self.write_pending_diagnostic(root, subject)
+
+                output = run_maintenance(root, now=NOW)
+
+                self.assertEqual("no_op", output["curation"]["status"])
+                self.assertFalse(descriptor.exists())
+                self.assertEqual(
+                    subject,
+                    subprocess.run(
+                        ["git", "-C", str(root), "log", "-1", "--format=%s"],
+                        text=True, capture_output=True, check=True,
+                    ).stdout.strip(),
+                )
+                self.assertFalse(
+                    (root / ".harness/state/profile-git-failure.json").exists()
+                )
+
+    def test_malformed_pending_diagnostic_blocks_curation_or_improvement_recovery(self) -> None:
+        for wal_kind in ("curation", "improvement"):
+            with self.subTest(wal_kind=wal_kind), tempfile.TemporaryDirectory() as temporary_directory:
+                root = self.make_profile(Path(temporary_directory))
+                if wal_kind == "curation":
+                    descriptor = self.crash_curation(root, "after_first_write")
+                    managed = root / ".harness/improvements/proposed/combined-after-first-write.md"
+                else:
+                    descriptor, managed = self.create_improvement_wal(root)
+                failure_path = root / ".harness/state/profile-git-failure.json"
+                failure_path.write_bytes(b"malformed pending diagnostic\n")
+                before = {
+                    descriptor: descriptor.read_bytes(),
+                    managed: managed.read_bytes(),
+                    failure_path: failure_path.read_bytes(),
+                }
+
+                with self.assertRaisesRegex(ProfileGitError, "preflight"):
+                    run_maintenance(root, now=NOW)
+
+                self.assertEqual(
+                    before,
+                    {path: path.read_bytes() for path in before},
+                )
+                self.assertEqual(
+                    "harness: initialize profile",
+                    subprocess.run(
+                        ["git", "-C", str(root), "log", "-1", "--format=%s"],
+                        text=True, capture_output=True, check=True,
+                    ).stdout.strip(),
+                )
 
     def test_preflight_does_not_checkpoint_while_another_profile_lease_is_active(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -564,7 +687,7 @@ class MaintenanceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = self.make_profile(Path(temporary_directory))
 
-            def recover(profile_root: Path):
+            def recover(profile_root: Path, **_kwargs):
                 recovered = profile_root / ".harness/memory/semantic/recovered.md"
                 recovered.write_text("recovered state\n")
                 checkpoint_profile(profile_root, RECOVERY_SUBJECT)

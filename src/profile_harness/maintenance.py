@@ -106,10 +106,10 @@ def _run_maintenance_locked(
     }
 
 
-def _checkpoint_preflight(profile_root: Path) -> None:
-    from .profile_git import ProfileGitError, checkpoint_pending_or_generic
+def _checkpoint_preflight(profile_root: Path, subject: str) -> None:
+    from .profile_git import ProfileGitError, checkpoint_profile
 
-    result = checkpoint_pending_or_generic(profile_root)
+    result = checkpoint_profile(profile_root, subject)
     if result.error is not None:
         raise ProfileGitError(f"profile Git preflight failed: {result.error}")
 
@@ -118,9 +118,27 @@ def run_maintenance(root: Path, *, now: datetime | None = None) -> dict[str, Any
     """Recover, checkpoint pending documents, then run due work under one lease."""
     profile_root = Path(root).resolve()
     with ProfileLease(profile_root, stale_timeout=DEFAULT_STALE_TIMEOUT_SECONDS):
-        recover_transactions(profile_root)
-        recover_improvement_transaction(profile_root)
-        _checkpoint_preflight(profile_root)
+        from .profile_git import (
+            CHECKPOINT_SUBJECT,
+            RECOVERY_SUBJECT,
+            ProfileGitError,
+            validate_pending_checkpoint,
+        )
+
+        try:
+            pending_subject = validate_pending_checkpoint(profile_root)
+        except (OSError, ValueError, ProfileGitError) as error:
+            raise ProfileGitError(f"profile Git preflight failed: {error}") from error
+        curation_recovered = recover_transactions(profile_root, checkpoint=False)
+        improvement_recovered = recover_improvement_transaction(
+            profile_root, checkpoint=False
+        )
+        subject = (
+            pending_subject
+            or (RECOVERY_SUBJECT if curation_recovered or improvement_recovered else None)
+            or CHECKPOINT_SUBJECT
+        )
+        _checkpoint_preflight(profile_root, subject)
         config = load_profile_config(profile_root)
         current = _utc_now(now)
         return _run_maintenance_locked(profile_root, config, current)

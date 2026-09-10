@@ -66,15 +66,17 @@ resets, rebases, amends, pushes, or stages nested repositories.
 
 Stop and SessionEnd durably publish receipt and cursor evidence but never invoke
 Git inside the hook completion envelope. `maintain`, scheduled every 15 minutes,
-acquires the profile lease using the built-in safe stale timeout, completes
-curation and improvement WAL recovery, and then performs Git preflight before
-config/time validation and due work. This permits recovery and checkpointing even
-when configuration is malformed. A strictly validated pending failure is retried
-with its original allowlisted subject; only success or absence permits a generic
-pending-document checkpoint. Any preflight error stops later maintenance and
-model work while preserving the diagnostic. Commands still checkpoint after
-their own durable commit, but a specific failure later in the run is left for
-the next preflight rather than committed under a same-run generic subject.
+acquires the profile lease using the built-in safe stale timeout and validates
+pending checkpoint metadata read-only before recovery or Git mutation. Invalid
+metadata aborts without changing its diagnostic or an abandoned WAL. With a
+valid subject retained in memory, curation and improvement recovery run with
+their default-compatible checkpoints disabled. One Git preflight then commits
+safe recovered dirtiness using the pending subject when present, otherwise the
+recovery subject when either WAL recovered, otherwise the generic subject. This
+occurs before config/time validation and permits safe recovery when config is
+malformed. Any checkpoint error stops later maintenance and model work while
+preserving its subject. A specific failure later in the run remains for the next
+preflight rather than being relabeled by a same-run generic commit.
 Dashboard and doctor display whether automatic Git is active, last commit,
 managed dirty paths, branch, and whether a remote exists; a missing remote is a
 warning because local Git does not protect against disk loss.

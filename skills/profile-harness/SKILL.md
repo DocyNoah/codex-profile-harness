@@ -28,10 +28,9 @@ wait for Git. Use `curate --prepare` for
 reviewable input, `curate --apply` for an approved result, `maintain` for one
 scheduled due check, `dashboard` to refresh the index, and `doctor` to inspect
 integrity. Use `git status` and `git log` subcommands to inspect automatic local
-profile checkpoints. Each scheduled `maintain` acquires the profile lease,
-recovers abandoned WAL state, and then retries a validated pending checkpoint
-with its original subject before reading config or checking due work. Stop if
-preflight reports an error; do not run later maintenance or a model. With no
-pending retry, preflight uses the generic subject for pending managed documents.
-A later specific failure waits for the next scheduled preflight; the harness
-never pushes.
+profile checkpoints. Each scheduled `maintain` acquires the profile lease, first
+validates pending checkpoint metadata read-only, then recovers abandoned WAL
+with recovery checkpoints suppressed. Commit once using the validated pending
+subject first, otherwise the recovery subject if a WAL was recovered, otherwise
+the generic subject. Stop on validation or checkpoint error before config, due
+work, mutation, or model execution. The harness never pushes.

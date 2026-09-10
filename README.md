@@ -109,13 +109,13 @@ stages only code-owned managed paths, uses deterministic commit messages, ignore
 runtime evidence and nested `projects/`, and records failures for `doctor`. There
 is **no automatic push** and repository Git histories remain independent.
 Each scheduled `maintain` run acquires the profile lease with the built-in safe
-stale timeout, completes abandoned curation/improvement WAL recovery, and then
-retries any validated pending checkpoint with its original deterministic
-subject. Only a successful preflight proceeds to config/time validation, due
-checks, or model work. With no pending retry, preflight checkpoints pending
-managed documents under the generic subject. A curation or improvement
-checkpoint that fails later remains pending for the next scheduled preflight;
-it is never relabeled by a same-run generic commit.
+stale timeout and first validates pending checkpoint metadata without running
+Git or recovery. It then recovers abandoned curation/improvement WAL with their
+automatic checkpoints suppressed and commits the resulting safe managed state
+once. Subject priority is: the previously validated pending subject, the
+recovery subject when any WAL was recovered, then the generic subject. Only a
+successful checkpoint proceeds to config/time validation, due checks, or model
+work. A later curation or improvement failure waits for the next run.
 
 ```sh
 profile-harness maintain
