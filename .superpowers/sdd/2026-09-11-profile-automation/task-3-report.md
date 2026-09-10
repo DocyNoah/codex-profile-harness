@@ -321,3 +321,49 @@ implemented.
 - `maintain` deliberately uses the built-in 300-second stale lease threshold
   before config validation; a profile override cannot govern this recovery-first
   entry step because the override may itself be unreadable.
+
+## Final fix C round 4: Validated pending subject across recovery
+
+### Commit
+
+- `867946f` — `fix: preserve checkpoint subjects across recovery`
+
+### RED evidence
+
+- The focused ordering and combined-WAL tests initially ran three tests with one
+  failure and three errors in 0.772s. The read-only validation entry point did
+  not exist, recovery overwrote a valid pending curation subject with the
+  recovery subject, and malformed metadata allowed both curation and improvement
+  recovery to mutate their descriptors and managed files.
+
+### Behavior
+
+- Immediately after acquiring the profile lease, maintenance fully validates
+  pending checkpoint metadata without running Git or WAL recovery. Malformed or
+  unknown metadata aborts before any managed state, WAL, diagnostic, or Git
+  mutation.
+- A valid pending subject is retained in memory. Curation and improvement
+  recovery then run with their default-compatible automatic checkpoint option
+  disabled, so recovery cannot clear or overwrite the existing diagnostic.
+- One preflight checkpoint follows recovery. Its deterministic subject priority
+  is the retained pending subject, then the recovery subject when either WAL was
+  recovered, then the generic maintenance subject. Failure aborts immediately
+  and preserves its exact subject for retry.
+- Existing direct recovery callers retain their default checkpoint behavior.
+  Documentation and skill guidance now describe this exact ordering and subject
+  priority.
+
+### Verification
+
+- Focused maintenance/Git/curation/improvement/recovery/integration suite: 170
+  tests passed with `ResourceWarning` promoted to errors.
+- Full suite: 205 tests passed in 50.099s with `ResourceWarning` promoted to
+  errors.
+- `python3 -m compileall -q src tests` — exit 0.
+- `git diff --check` — exit 0.
+
+### Concerns
+
+- Any actual WAL recovery, including rollback of a partial precommit
+  transaction, intentionally selects the recovery subject when there is no
+  earlier valid pending subject; a clean tree still results in no commit.
