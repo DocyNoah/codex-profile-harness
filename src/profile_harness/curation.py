@@ -45,6 +45,10 @@ _ADR = re.compile(r"ADR-(\d{4,})-[a-z0-9-]+\.md")
 _INDEX_LINK = re.compile(r"\[[^]]+\]\(docs/decisions/(ADR-(\d{4,})-[a-z0-9-]+\.md)\)")
 _BATCH_ID = re.compile(r"[0-9]{8}T[0-9]{12}Z-[a-f0-9]{12}")
 _RECEIPT_ID = re.compile(r"[A-Za-z0-9._-]+")
+_RFC3339_UTC = re.compile(
+    r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}"
+    r"(?:\.[0-9]{1,6})?Z"
+)
 
 
 class CurationError(ValueError):
@@ -117,7 +121,30 @@ def _ensure_dir(root: Path, relative: str) -> Path:
         raise CurationError(str(error)) from error
 
 
-def _valid_receipt(path: Path) -> dict[str, Any]:
+def _durable_replace(source: Path, destination: Path) -> None:
+    os.replace(source, destination)
+    fsync_directory(source.parent)
+    if destination.parent != source.parent:
+        fsync_directory(destination.parent)
+
+
+def _durable_unlink(path: Path) -> None:
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return
+    fsync_directory(path.parent)
+
+
+def _durable_rmtree(path: Path) -> None:
+    if not path.exists():
+        return
+    parent = path.parent
+    shutil.rmtree(path)
+    fsync_directory(parent)
+
+
+def _valid_receipt(path: Path, *, expected_id: str | None = None) -> dict[str, Any]:
     try:
         receipt = _strict_json(path)
     except (OSError, ValueError, json.JSONDecodeError) as error:
@@ -131,14 +158,28 @@ def _valid_receipt(path: Path) -> dict[str, Any]:
         not isinstance(receipt_id, str)
         or _RECEIPT_ID.fullmatch(receipt_id) is None
         or len(receipt_id) > MAX_IDENTIFIER_CHARS
-        or path.stem != receipt_id
+        or (expected_id is None and path.stem != receipt_id)
+        or (expected_id is not None and expected_id != receipt_id)
     ):
         raise CurationError("receipt ID must match its filename")
     if receipt.get("event") not in {"Stop", "SessionEnd"}:
         raise CurationError("receipt event is unsupported")
-    if not isinstance(receipt.get("captured_at"), str) or len(receipt["captured_at"]) > 64:
-        raise CurationError("receipt captured_at is required")
-    if not isinstance(receipt.get("cwd"), str) or len(receipt["cwd"]) > MAX_RECEIPT_BYTES:
+    captured_at = receipt.get("captured_at")
+    if (
+        not isinstance(captured_at, str)
+        or len(captured_at) > 64
+        or _RFC3339_UTC.fullmatch(captured_at) is None
+    ):
+        raise CurationError("receipt captured_at must be strict RFC3339 UTC")
+    try:
+        datetime.fromisoformat(captured_at[:-1] + "+00:00")
+    except ValueError as error:
+        raise CurationError("receipt captured_at must be strict RFC3339 UTC") from error
+    if (
+        not isinstance(receipt.get("cwd"), str)
+        or not receipt["cwd"].strip()
+        or len(receipt["cwd"]) > MAX_RECEIPT_BYTES
+    ):
         raise CurationError("receipt cwd is required")
     payload = receipt.get("payload")
     allowed_payload = {"cwd", "last_assistant_message", "permission_mode", "reason", "session_id", "stop_hook_active", "transcript_path", "turn_id", "extra_keys"}
@@ -160,8 +201,7 @@ def _dead_letter(root: Path, path: Path, reason: str) -> None:
     suffix = "" if not (destination_root / path.name).exists() else f".{uuid.uuid4().hex}"
     destination = destination_root / f"{path.stem}{suffix}.json"
     require_safe_path(root, destination, directory=False)
-    os.replace(path, destination)
-    fsync_directory(destination_root)
+    _durable_replace(path, destination)
     atomic_write_text(destination.with_suffix(".reason"), reason.strip() + "\n")
 
 
@@ -193,9 +233,7 @@ def claim_receipts(root: Path, limit: int | None = None) -> CurationBatch:
                 continue
             destination = batch_path / path.name
             try:
-                os.replace(path, destination)
-                fsync_directory(inbox)
-                fsync_directory(batch_path)
+                _durable_replace(path, destination)
             except FileNotFoundError:
                 continue
             receipt_ids.append(receipt["id"])
@@ -221,9 +259,8 @@ def _return_receipts(root: Path, batch_path: Path) -> None:
         if destination.exists():
             _dead_letter(root, receipt, "duplicate receipt while returning failed batch")
         else:
-            os.replace(receipt, destination)
-            fsync_directory(inbox)
-    shutil.rmtree(batch_path, ignore_errors=True)
+            _durable_replace(receipt, destination)
+    _durable_rmtree(batch_path)
 
 
 def prepare_curation(root: Path, limit: int | None = None) -> CurationBatch:
@@ -504,7 +541,7 @@ def _restore_transaction(root: Path, transaction_path: Path, transaction: dict[s
         destination = _transaction_member(root, archive["destination"], directory=False)
         if destination.exists() and not source.exists():
             source.parent.mkdir(parents=True, exist_ok=True)
-            os.replace(destination, source)
+            _durable_replace(destination, source)
     for target_data in reversed(transaction.get("targets", [])):
         target = _transaction_member(root, target_data["path"], directory=False)
         if target_data["existed"]:
@@ -514,7 +551,7 @@ def _restore_transaction(root: Path, transaction_path: Path, transaction: dict[s
                 if isinstance(target_data.get("mode"), int):
                     target.chmod(target_data["mode"])
         else:
-            target.unlink(missing_ok=True)
+            _durable_unlink(target)
     journal_data = transaction.get("journal", {})
     journal = root / ".harness/memory/journal/curation.jsonl"
     if journal_data.get("existed"):
@@ -524,10 +561,9 @@ def _restore_transaction(root: Path, transaction_path: Path, transaction: dict[s
             if isinstance(journal_data.get("mode"), int):
                 journal.chmod(journal_data["mode"])
     else:
-        journal.unlink(missing_ok=True)
+        _durable_unlink(journal)
     _return_receipts(root, batch_path)
-    transaction_path.unlink(missing_ok=True)
-    fsync_directory(transaction_path.parent)
+    _durable_unlink(transaction_path)
 
 
 def _complete_transaction(root: Path, transaction_path: Path, transaction: dict[str, Any]) -> None:
@@ -536,12 +572,11 @@ def _complete_transaction(root: Path, transaction_path: Path, transaction: dict[
         destination = _transaction_member(root, archive["destination"], directory=False)
         if source.exists() and not destination.exists():
             destination.parent.mkdir(parents=True, exist_ok=True)
-            os.replace(source, destination)
+            _durable_replace(source, destination)
     batch_path = _transaction_member(root, transaction["batch_path"], directory=True)
     if batch_path.exists():
-        shutil.rmtree(batch_path)
-    transaction_path.unlink(missing_ok=True)
-    fsync_directory(transaction_path.parent)
+        _durable_rmtree(batch_path)
+    _durable_unlink(transaction_path)
 
 
 def recover_transactions(root: Path) -> tuple[str, ...]:
@@ -754,12 +789,9 @@ def apply_actions(
         for item in transaction["archives"]:
             source = profile.root / item["source"]
             destination = profile.root / item["destination"]
-            os.replace(source, destination)
-            fsync_directory(destination.parent)
-        shutil.rmtree(batch_path)
-        fsync_directory(batch_path.parent)
-        transaction_path.unlink(missing_ok=True)
-        fsync_directory(transaction_path.parent)
+            _durable_replace(source, destination)
+        _durable_rmtree(batch_path)
+        _durable_unlink(transaction_path)
         return ApplyResult(batch_id, tuple(dict.fromkeys(changed)), journal_entry)
     except BaseException:
         if transaction is not None and transaction_path.exists():

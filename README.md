@@ -57,7 +57,8 @@ profile-harness dashboard
 An empty inbox returns `{"status":"no_op"}` without creating a batch, invoking
 Codex, or appending to the journal. Interrupted curation is recovered under the
 profile lease on the next curate command (or by `doctor` while no curator owns
-the lease).
+the lease). Doctor acquires and holds that same lease throughout recovery; an
+active curator is reported and never raced.
 
 Use `profile-harness --help` and subcommand help for the authoritative CLI.
 `DASHBOARD.md` is a generated index; edit repository `STATUS.md`, `TASKS.md`, and

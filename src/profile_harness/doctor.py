@@ -26,6 +26,7 @@ from .curation import (
     MAX_ARRAY_ITEMS,
     MAX_CONTENT_CHARS,
     MAX_IDENTIFIER_CHARS,
+    MAX_RECEIPT_BYTES,
     CurationError,
     _valid_receipt,
     _strict_json,
@@ -34,6 +35,7 @@ from .curation import (
 )
 from .journal import verify_journal
 from .fs import require_safe_path
+from .locking import LeaseBusyError, ProfileLease
 
 
 REQUIRED_PLUGIN_FILES = (
@@ -75,6 +77,10 @@ PROFILE_LAYOUT_DIRECTORIES = tuple(
 )
 PLUGIN_NAME = "codex-profile-harness"
 HOOK_COMMAND = 'python3 "$PLUGIN_ROOT/bin/profile-harness" hook capture'
+_RFC3339_UTC_PATTERN = (
+    r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}"
+    r"(?:\.[0-9]{1,6})?Z$"
+)
 SEMVER = re.compile(
     r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)"
     r"(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?"
@@ -235,24 +241,70 @@ def _validate_receipt_schema(value: object) -> None:
         "payload",
     }:
         raise ValueError("receipt schema is missing required receipt fields")
-    if not isinstance(properties, dict) or set(
-        properties.get("event", {}).get("enum", [])
-    ) != {"Stop", "SessionEnd"}:
+    if not isinstance(properties, dict) or set(properties) != set(required):
+        raise ValueError("receipt schema properties must exactly match runtime fields")
+    if set(properties.get("event", {}).get("enum", [])) != {"Stop", "SessionEnd"}:
         raise ValueError("receipt schema must allow Stop and SessionEnd events")
     if value.get("additionalProperties") is not False:
         raise ValueError("receipt schema must reject additional properties")
     identifier = properties.get("id", {})
-    if identifier.get("maxLength") != MAX_IDENTIFIER_CHARS or identifier.get("pattern") != "^[A-Za-z0-9._-]+$":
-        raise ValueError("receipt ID schema must match safe filenames")
+    _string_contract(
+        identifier,
+        minimum=1,
+        maximum=MAX_IDENTIFIER_CHARS,
+        pattern="^[A-Za-z0-9._-]+$",
+        label="receipt ID",
+    )
     captured = properties.get("captured_at", {})
-    if captured.get("format") != "date-time" or captured.get("maxLength") != 64:
+    if (
+        captured.get("type") != "string"
+        or captured.get("format") != "date-time"
+        or captured.get("maxLength") != 64
+        or captured.get("pattern") != _RFC3339_UTC_PATTERN
+    ):
         raise ValueError("receipt timestamp schema is weakened")
+    _string_contract(
+        properties.get("cwd"),
+        minimum=1,
+        maximum=MAX_RECEIPT_BYTES,
+        pattern="^[\\s\\S]*\\S[\\s\\S]*$",
+        label="receipt.cwd",
+    )
     payload = properties.get("payload", {})
     expected_payload = {"cwd", "last_assistant_message", "permission_mode", "reason", "session_id", "stop_hook_active", "transcript_path", "turn_id", "extra_keys"}
     if (payload.get("type") != "object" or payload.get("additionalProperties") is not False
             or payload.get("required") != ["session_id"]
             or set(payload.get("properties", {})) != expected_payload):
         raise ValueError("receipt payload schema must match normalized runtime fields")
+    payload_properties = payload["properties"]
+    for field in expected_payload - {"stop_hook_active", "extra_keys", "session_id"}:
+        _string_contract(
+            payload_properties[field],
+            minimum=None,
+            maximum=MAX_RECEIPT_BYTES,
+            label=f"receipt.payload.{field}",
+        )
+    _string_contract(
+        payload_properties["session_id"],
+        minimum=1,
+        maximum=MAX_RECEIPT_BYTES,
+        pattern="^[\\s\\S]*\\S[\\s\\S]*$",
+        label="receipt.payload.session_id",
+    )
+    if payload_properties["stop_hook_active"] != {"type": "boolean"}:
+        raise ValueError("receipt.payload.stop_hook_active must be boolean")
+    extra_keys = _array_contract(
+        payload_properties["extra_keys"],
+        maximum=10_000,
+        unique=False,
+        label="receipt.payload.extra_keys",
+    )
+    _string_contract(
+        extra_keys,
+        minimum=None,
+        maximum=MAX_RECEIPT_BYTES,
+        label="receipt.payload.extra_keys.items",
+    )
 
 
 def _exact_integer(schema: dict, field: str, expected: int, label: str) -> None:
@@ -620,21 +672,10 @@ def _guard_is_locked(root: Path) -> bool:
 
 def _archived_receipt(path: Path) -> tuple[dict, str]:
     value = _strict_json(path)
-    if not isinstance(value, dict) or set(value) - {"id", "event", "captured_at", "cwd", "payload"}:
-        raise ValueError("receipt must be an object")
-    receipt_id = value.get("id")
-    if (not isinstance(receipt_id, str) or re.fullmatch(r"[A-Za-z0-9._-]+", receipt_id) is None
-            or len(receipt_id) > MAX_IDENTIFIER_CHARS or value.get("event") not in {
-        "Stop",
-        "SessionEnd",
-    }):
-        raise ValueError("receipt identity or event is invalid")
-    if (not isinstance(value.get("captured_at"), str)
-            or not isinstance(value.get("cwd"), str)
-            or not isinstance(value.get("payload"), dict)
-            or not isinstance(value["payload"].get("session_id"), str)
-            or not value["payload"]["session_id"].strip()):
-        raise ValueError("receipt timestamp or payload is invalid")
+    receipt_id = value.get("id") if isinstance(value, dict) else None
+    if not isinstance(receipt_id, str):
+        raise ValueError("receipt identity is invalid")
+    value = _valid_receipt(path, expected_id=receipt_id)
     collision_name = re.fullmatch(
         rf"{re.escape(receipt_id)}\.({_BATCH_ID.pattern})\.json", path.name
     )
@@ -715,15 +756,15 @@ def diagnose(
     if transaction_dir.is_symlink():
         findings.append(Finding("ERROR", "transaction", "transaction directory is a symlink"))
     elif transaction_dir.exists() and any(transaction_dir.glob("*.json")):
-        if _guard_is_locked(profile_root):
-            findings.append(Finding("ERROR", "transaction", "interrupted transaction is still locked"))
-        else:
-            try:
+        try:
+            with ProfileLease(profile_root, stale_timeout=effective_stale_timeout):
                 recovered = recover_transactions(profile_root)
-            except (OSError, ValueError) as error:
-                findings.append(Finding("ERROR", "transaction", f"recovery failed: {error}"))
-            else:
-                findings.append(Finding("OK", "transaction", f"recovered {len(recovered)} interrupted transaction(s)"))
+        except LeaseBusyError:
+            findings.append(Finding("ERROR", "transaction", "interrupted transaction is actively locked; recovery was not attempted"))
+        except (OSError, ValueError) as error:
+            findings.append(Finding("ERROR", "transaction", f"recovery failed: {error}"))
+        else:
+            findings.append(Finding("OK", "transaction", f"recovered {len(recovered)} interrupted transaction(s) while holding the profile lease"))
 
     for relative in RUNTIME_DIRECTORIES:
         path = profile_root / relative

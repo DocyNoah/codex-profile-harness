@@ -17,6 +17,7 @@ from .fs import require_safe_path
 
 
 MAX_INPUT_BYTES = 1024 * 1024
+MAX_EXTRA_KEYS = 10_000
 SUPPORTED_EVENTS = frozenset({"Stop", "SessionEnd"})
 KNOWN_FIELDS = frozenset(
     {
@@ -126,6 +127,8 @@ def _normalized_payload(payload: dict[str, Any], maximum: int) -> dict[str, Any]
         for key in payload
         if key not in KNOWN_FIELDS
     )
+    if len(extra_keys) > MAX_EXTRA_KEYS:
+        raise CaptureError("payload contains too many extra keys")
     if extra_keys:
         normalized["extra_keys"] = extra_keys
     return normalized

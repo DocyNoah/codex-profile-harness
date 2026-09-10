@@ -22,8 +22,13 @@ from profile_harness.curation import (  # noqa: E402
     load_result,
     prepare_curation,
     validate_actions,
+    _valid_receipt,
+    recover_transactions,
 )
 from profile_harness.doctor import diagnose  # noqa: E402
+import profile_harness.curation as curation_module  # noqa: E402
+import profile_harness.doctor as doctor_module  # noqa: E402
+from profile_harness.locking import LeaseBusyError, ProfileLease  # noqa: E402
 from profile_harness.runner import run_codex  # noqa: E402
 
 
@@ -245,6 +250,157 @@ class FinalHardeningTests(unittest.TestCase):
         self.assertIn("\\S", schema["$defs"]["content"]["pattern"])
         pattern = schema["$defs"]["repoDecision"]["properties"]["supersedes"]["items"]["pattern"]
         self.assertEqual("^[0-9]+$", pattern)
+
+    def test_receipt_timestamp_runtime_and_schema_share_strict_utc_policy(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root, _ = self.make_profile(Path(temporary_directory))
+            receipt = self.add_receipt(root)
+            schema = json.loads((ROOT / "schemas/hook-receipt.schema.json").read_text())
+            self.assertEqual(
+                r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,6})?Z$",
+                schema["properties"]["captured_at"].get("pattern"),
+            )
+            for invalid in (
+                "not-a-time",
+                "2026-02-30T00:00:00Z",
+                "2026-09-11T00:00:00+00:00",
+                "2026-09-11 00:00:00Z",
+            ):
+                with self.subTest(invalid=invalid):
+                    value = json.loads(receipt.read_text())
+                    value["captured_at"] = invalid
+                    receipt.write_text(json.dumps(value), encoding="utf-8")
+                    with self.assertRaisesRegex(CurationError, "captured_at"):
+                        _valid_receipt(receipt)
+            value["captured_at"] = "2026-09-11T00:00:00.123456Z"
+            receipt.write_text(json.dumps(value), encoding="utf-8")
+            self.assertEqual(value, _valid_receipt(receipt))
+
+    def test_doctor_rejects_every_weakened_receipt_payload_constraint(self) -> None:
+        schema = json.loads((ROOT / "schemas/hook-receipt.schema.json").read_text())
+        mutations = {
+            "top property": lambda value: value["properties"].update({"unexpected": {"type": "string"}}),
+            "cwd type": lambda value: value["properties"]["cwd"].update({"type": ["string", "null"]}),
+            "timestamp pattern": lambda value: value["properties"]["captured_at"].pop("pattern", None),
+            "payload required": lambda value: value["properties"]["payload"].update({"required": []}),
+            "session pattern": lambda value: value["properties"]["payload"]["properties"]["session_id"].pop("pattern", None),
+            "text max": lambda value: value["properties"]["payload"]["properties"]["reason"].update({"maxLength": 2000000}),
+            "boolean type": lambda value: value["properties"]["payload"]["properties"]["stop_hook_active"].update({"type": "string"}),
+            "array max": lambda value: value["properties"]["payload"]["properties"]["extra_keys"].update({"maxItems": 20000}),
+            "array item type": lambda value: value["properties"]["payload"]["properties"]["extra_keys"]["items"].update({"type": "number"}),
+            "array item max": lambda value: value["properties"]["payload"]["properties"]["extra_keys"]["items"].update({"maxLength": 2000000}),
+            "payload additional": lambda value: value["properties"]["payload"].update({"additionalProperties": True}),
+        }
+        for label, mutate in mutations.items():
+            with self.subTest(label=label):
+                weakened = json.loads(json.dumps(schema))
+                mutate(weakened)
+                with self.assertRaises(ValueError):
+                    doctor_module._validate_receipt_schema(weakened)
+
+    def test_capture_rejects_more_extra_keys_than_receipt_schema_allows(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root, _ = self.make_profile(Path(temporary_directory))
+            payload = {
+                "hook_event_name": "Stop",
+                "session_id": "session",
+                "cwd": str(root),
+                **{f"k{index}": "x" for index in range(10_001)},
+            }
+            with self.assertRaisesRegex(CaptureError, "extra keys"):
+                capture_event(payload)
+
+    def test_doctor_holds_profile_lease_through_transaction_recovery(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root, _ = self.make_profile(Path(temporary_directory))
+            transactions = root / ".harness/state/transactions"
+            transactions.mkdir()
+            (transactions / "pending.json").write_text("{}", encoding="utf-8")
+            observed = []
+
+            def recovery(profile_root: Path) -> tuple[str, ...]:
+                try:
+                    with ProfileLease(profile_root):
+                        observed.append("unlocked")
+                except LeaseBusyError:
+                    observed.append("held")
+                return ()
+
+            with mock.patch.object(doctor_module, "recover_transactions", side_effect=recovery):
+                diagnose(root)
+            self.assertEqual(["held"], observed)
+
+    def test_doctor_never_recovers_while_curator_owns_lease(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root, _ = self.make_profile(Path(temporary_directory))
+            transactions = root / ".harness/state/transactions"
+            transactions.mkdir()
+            (transactions / "pending.json").write_text("{}", encoding="utf-8")
+            with ProfileLease(root), mock.patch.object(doctor_module, "recover_transactions") as recover:
+                report = diagnose(root)
+            recover.assert_not_called()
+            self.assertIn("actively locked", report.format())
+
+    def _crash_apply(self, root: Path, batch_id: str, action: dict, stage: str) -> None:
+        script = (
+            "import sys;from pathlib import Path;"
+            f"sys.path.insert(0,{str(ROOT / 'src')!r});"
+            "from profile_harness.curation import apply_actions;"
+            f"apply_actions(Path({str(root)!r}),{batch_id!r},"
+            f"{{'actions':[{action!r}]}},crash_after_stage={stage!r})"
+        )
+        crashed = subprocess.run([sys.executable, "-c", script], check=False)
+        self.assertEqual(91, crashed.returncode)
+
+    def test_recovery_fsyncs_unlinks_before_deleting_precommit_descriptor(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root, _ = self.make_profile(Path(temporary_directory))
+            self.add_receipt(root)
+            batch = prepare_curation(root)
+            self._crash_apply(root, batch.batch_id, {
+                "type": "profile_proposal", "title": "New", "content": "body", "source_receipt_ids": ["one"]
+            }, "after_journal")
+            descriptor = (root / ".harness/state/transactions" / f"{batch.batch_id}.json").resolve()
+            proposal_parent = (root / ".harness/improvements/proposed").resolve()
+            journal_parent = (root / ".harness/memory/journal").resolve()
+            events = []
+            real_unlink = Path.unlink
+
+            def unlink(path: Path, *args, **kwargs):
+                if path == descriptor:
+                    events.append(("descriptor", path))
+                return real_unlink(path, *args, **kwargs)
+
+            with mock.patch.object(curation_module, "fsync_directory", side_effect=lambda path: events.append(("fsync", Path(path)))), mock.patch.object(Path, "unlink", autospec=True, side_effect=unlink):
+                recover_transactions(root)
+            descriptor_index = events.index(("descriptor", descriptor))
+            self.assertLess(events.index(("fsync", proposal_parent)), descriptor_index)
+            self.assertLess(events.index(("fsync", journal_parent)), descriptor_index)
+
+    def test_recovery_fsyncs_archive_and_processing_before_committed_descriptor(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root, _ = self.make_profile(Path(temporary_directory))
+            self.add_receipt(root)
+            batch = prepare_curation(root)
+            self._crash_apply(root, batch.batch_id, {
+                "type": "repo_status", "repository": "api", "content": "done", "source_receipt_ids": ["one"]
+            }, "after_commit")
+            descriptor = (root / ".harness/state/transactions" / f"{batch.batch_id}.json").resolve()
+            archive = (root / ".harness/memory/archive/processed").resolve()
+            processing = (root / ".harness/memory/processing").resolve()
+            events = []
+            real_unlink = Path.unlink
+
+            def unlink(path: Path, *args, **kwargs):
+                if path == descriptor:
+                    events.append(("descriptor", path))
+                return real_unlink(path, *args, **kwargs)
+
+            with mock.patch.object(curation_module, "fsync_directory", side_effect=lambda path: events.append(("fsync", Path(path)))), mock.patch.object(Path, "unlink", autospec=True, side_effect=unlink):
+                recover_transactions(root)
+            descriptor_index = events.index(("descriptor", descriptor))
+            self.assertLess(events.index(("fsync", archive)), descriptor_index)
+            self.assertLess(events.index(("fsync", processing)), descriptor_index)
 
 
 if __name__ == "__main__":

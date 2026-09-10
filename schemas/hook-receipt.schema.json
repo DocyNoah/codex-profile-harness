@@ -26,11 +26,14 @@
     "captured_at": {
       "type": "string",
       "format": "date-time",
-      "maxLength": 64
+      "maxLength": 64,
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\\.[0-9]{1,6})?Z$"
     },
     "cwd": {
       "type": "string",
-      "maxLength": 1048576
+      "minLength": 1,
+      "maxLength": 1048576,
+      "pattern": "^[\\s\\S]*\\S[\\s\\S]*$"
     },
     "payload": {
       "type": "object",

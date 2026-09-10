@@ -21,6 +21,10 @@
 - Batch manifests bind canonical receipt bytes with SHA-256. Journal entries bind
   the consumed receipt digests, accepted result digest, resulting target digests,
   and archived receipt names/digests.
+- Receipt timestamps use a strict uppercase-`Z` UTC RFC 3339 subset (optional one
+  to six fractional digits); numeric offsets and malformed calendar dates are
+  rejected consistently by runtime validation and the bundled schema. Doctor
+  verifies the complete bounded payload schema, not only its top-level keys.
 
 ## Hook approval
 
@@ -58,6 +62,13 @@ commit marker restores all targets, journal state, and receipts. A crash after
 the commit marker preserves the committed targets/journal and idempotently
 finishes receipt archival and batch cleanup. Directory fsync is attempted where
 the host filesystem supports it.
+
+Recovery holds the same exclusive `ProfileLease` for the complete operation.
+Doctor never performs a check-then-act recovery: when a curator owns the lease,
+doctor reports the active lock and leaves the transaction untouched. Every
+recovery unlink, cross-directory receipt rename, and batch-tree removal is
+followed by the affected parent-directory fsync calls before the transaction
+descriptor is deleted.
 
 The curator sets `PROFILE_HARNESS_CURATOR=1` only in its child process
 environment. Lifecycle capture checks that inherited marker before parsing hook

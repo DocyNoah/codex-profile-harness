@@ -83,7 +83,9 @@ profile-harness doctor
 Failed application restores snapshots and returns valid receipts to the inbox.
 Process crashes are recovered from the durable transaction descriptor by the
 next curate command; `doctor` also recovers an interrupted transaction when no
-curator holds the lease.
+curator holds the lease. Doctor holds the profile lease until recovery and all
+directory durability barriers finish; if curation is active it reports the lock
+and does not attempt repair.
 
 With an installed, authenticated `codex` executable:
 
