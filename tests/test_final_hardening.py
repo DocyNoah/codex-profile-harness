@@ -462,7 +462,7 @@ class FinalHardeningTests(unittest.TestCase):
             journal = root / ".harness/memory/journal/curation.jsonl"
             from profile_harness.journal import append_entry
             append_entry(journal, {"unexpected": "unbound"})
-            descriptor = root / ".harness/state/transactions" / f"{batch.batch_id}.json"
+            descriptor = (root / ".harness/state/transactions" / f"{batch.batch_id}.json").resolve()
             protected = {
                 root / "IDENTITY.md": (root / "IDENTITY.md").read_bytes(),
                 repo / "STATUS.md": (repo / "STATUS.md").read_bytes(),
@@ -475,6 +475,190 @@ class FinalHardeningTests(unittest.TestCase):
             self.assertFalse(report.ok)
             self.assertIn("recovery failed", report.format())
             self.assertEqual(protected, {path: path.read_bytes() for path in protected})
+
+    def test_committed_cleanup_retries_after_batch_removal_before_descriptor_unlink(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root, repo = self.make_profile(Path(temporary_directory))
+            self.add_receipt(root)
+            batch = prepare_curation(root)
+            self._crash_apply(root, batch.batch_id, {
+                "type": "repo_status", "repository": "api", "content": "# committed",
+                "source_receipt_ids": ["one"],
+            }, "after_commit")
+            descriptor = (root / ".harness/state/transactions" / f"{batch.batch_id}.json").resolve()
+            real_unlink = curation_module._durable_unlink
+            failed = False
+
+            def fail_descriptor_once(path: Path) -> None:
+                nonlocal failed
+                if path == descriptor and not failed:
+                    failed = True
+                    raise OSError("injected descriptor unlink failure")
+                real_unlink(path)
+
+            with mock.patch.object(curation_module, "_durable_unlink", side_effect=fail_descriptor_once):
+                with self.assertRaisesRegex(OSError, "injected"):
+                    recover_transactions(root, checkpoint=False)
+
+            self.assertFalse(batch.path.exists())
+            self.assertTrue(descriptor.exists())
+            self.assertEqual(("one.json",), tuple(
+                path.name for path in (root / ".harness/memory/archive/processed").glob("*.json")
+            ))
+
+            self.assertEqual((batch.batch_id,), recover_transactions(root, checkpoint=False))
+            self.assertFalse(descriptor.exists())
+            self.assertEqual("# committed", (repo / "STATUS.md").read_text())
+
+    def test_precommit_receipt_return_resumes_after_each_durable_move(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root, repo = self.make_profile(Path(temporary_directory))
+            self.add_receipt(root, "one")
+            self.add_receipt(root, "two")
+            batch = prepare_curation(root)
+            self._crash_apply(root, batch.batch_id, {
+                "type": "repo_status", "repository": "api", "content": "# crashed",
+                "source_receipt_ids": ["one", "two"],
+            }, "after_first_write")
+            descriptor = root / ".harness/state/transactions" / f"{batch.batch_id}.json"
+            real_replace = curation_module._durable_replace
+            interrupted = False
+
+            def interrupt_after_first_return(source: Path, destination: Path) -> None:
+                nonlocal interrupted
+                real_replace(source, destination)
+                if destination.parent == (root / ".harness/memory/inbox").resolve() and not interrupted:
+                    interrupted = True
+                    raise OSError("injected receipt return interruption")
+
+            with mock.patch.object(curation_module, "_durable_replace", side_effect=interrupt_after_first_return):
+                with self.assertRaisesRegex(OSError, "injected"):
+                    recover_transactions(root, checkpoint=False)
+
+            self.assertTrue(descriptor.exists())
+            self.assertEqual(1, len(list((root / ".harness/memory/inbox").glob("*.json"))))
+            self.assertEqual((batch.batch_id,), recover_transactions(root, checkpoint=False))
+            self.assertEqual({"one.json", "two.json"}, {
+                path.name for path in (root / ".harness/memory/inbox").glob("*.json")
+            })
+            self.assertFalse(batch.path.exists())
+            self.assertIn("No current status", (repo / "STATUS.md").read_text())
+
+    def test_precommit_recovery_rejects_wrong_inbox_receipt_after_partial_return(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root, _ = self.make_profile(Path(temporary_directory))
+            self.add_receipt(root)
+            batch = prepare_curation(root)
+            self._crash_apply(root, batch.batch_id, {
+                "type": "profile_proposal", "title": "Crash", "content": "body",
+                "source_receipt_ids": ["one"],
+            }, "after_first_write")
+            source = batch.path / "one.json"
+            inbox = root / ".harness/memory/inbox/one.json"
+            source.replace(inbox)
+            receipt = json.loads(inbox.read_text())
+            receipt["payload"]["session_id"] = "wrong"
+            inbox.write_text(json.dumps(receipt), encoding="utf-8")
+            descriptor = root / ".harness/state/transactions" / f"{batch.batch_id}.json"
+            before = {inbox: inbox.read_bytes(), descriptor: descriptor.read_bytes()}
+
+            with self.assertRaises(CurationError):
+                recover_transactions(root, checkpoint=False)
+
+            self.assertEqual(before, {path: path.read_bytes() for path in before})
+
+    def test_repeated_target_write_crash_gaps_remain_recoverable(self) -> None:
+        for stage in ("after_repeat_descriptor", "after_repeat_write"):
+            with self.subTest(stage=stage), tempfile.TemporaryDirectory() as temporary_directory:
+                root, repo = self.make_profile(Path(temporary_directory))
+                self.add_receipt(root)
+                batch = prepare_curation(root)
+                original = (repo / "STATUS.md").read_bytes()
+                actions = [
+                    {"type": "repo_status", "repository": "api", "content": "# first", "source_receipt_ids": ["one"]},
+                    {"type": "repo_status", "repository": "api", "content": "# second", "source_receipt_ids": ["one"]},
+                ]
+                script = (
+                    "import sys;from pathlib import Path;"
+                    f"sys.path.insert(0,{str(ROOT / 'src')!r});"
+                    "from profile_harness.curation import apply_actions;"
+                    f"apply_actions(Path({str(root)!r}),{batch.batch_id!r},{{'actions':{actions!r}}},"
+                    f"crash_after_stage={stage!r})"
+                )
+                crashed = subprocess.run([sys.executable, "-c", script], check=False)
+                self.assertEqual(91, crashed.returncode)
+
+                self.assertEqual((batch.batch_id,), recover_transactions(root, checkpoint=False))
+                self.assertEqual(original, (repo / "STATUS.md").read_bytes())
+                self.assertTrue((root / ".harness/memory/inbox/one.json").is_file())
+
+    def test_legacy_v1_wal_recovers_only_unambiguous_precommit_and_committed_states(self) -> None:
+        for stage, committed in (("after_first_write", False), ("after_commit", True)):
+            with self.subTest(stage=stage), tempfile.TemporaryDirectory() as temporary_directory:
+                root, repo = self.make_profile(Path(temporary_directory))
+                self.add_receipt(root)
+                batch = prepare_curation(root)
+                original = (repo / "STATUS.md").read_bytes()
+                self._crash_apply(root, batch.batch_id, {
+                    "type": "repo_status", "repository": "api", "content": "# legacy",
+                    "source_receipt_ids": ["one"],
+                }, stage)
+                descriptor = root / ".harness/state/transactions" / f"{batch.batch_id}.json"
+                value = json.loads(descriptor.read_text())
+                value["version"] = 1
+                for target in value["targets"]:
+                    target.pop("snapshot_digest", None)
+                    target.pop("previous_digest", None)
+                value["journal"].pop("snapshot_digest", None)
+                if not committed:
+                    snapshot = root / value["targets"][0]["snapshot"]
+                    (repo / "STATUS.md").write_bytes(snapshot.read_bytes())
+                else:
+                    journal = root / ".harness/memory/journal/curation.jsonl"
+                    legacy_entry = json.loads(journal.read_text())
+                    legacy_entry.pop("type")
+                    legacy_entry.pop("status")
+                    legacy_entry.pop("entry_hash")
+                    canonical = json.dumps(
+                        legacy_entry, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+                    ).encode("utf-8")
+                    legacy_entry["entry_hash"] = __import__("hashlib").sha256(canonical).hexdigest()
+                    journal.write_text(
+                        json.dumps(legacy_entry, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n",
+                        encoding="utf-8",
+                    )
+                descriptor.write_text(json.dumps(value), encoding="utf-8")
+
+                self.assertEqual((batch.batch_id,), recover_transactions(root, checkpoint=False))
+                if committed:
+                    self.assertEqual("# legacy", (repo / "STATUS.md").read_text())
+                else:
+                    self.assertEqual(original, (repo / "STATUS.md").read_bytes())
+                    self.assertTrue((root / ".harness/memory/inbox/one.json").is_file())
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root, _ = self.make_profile(Path(temporary_directory))
+            self.add_receipt(root)
+            batch = prepare_curation(root)
+            self._crash_apply(root, batch.batch_id, {
+                "type": "profile_proposal", "title": "Ambiguous", "content": "legacy",
+                "source_receipt_ids": ["one"],
+            }, "after_first_write")
+            descriptor = root / ".harness/state/transactions" / f"{batch.batch_id}.json"
+            value = json.loads(descriptor.read_text())
+            value["version"] = 1
+            for target in value["targets"]:
+                target.pop("snapshot_digest", None)
+                target.pop("previous_digest", None)
+            value["journal"].pop("snapshot_digest", None)
+            descriptor.write_text(json.dumps(value), encoding="utf-8")
+            proposal = root / value["targets"][0]["path"]
+            before = {proposal: proposal.read_bytes(), descriptor: descriptor.read_bytes()}
+
+            with self.assertRaisesRegex(CurationError, "ambiguous"):
+                recover_transactions(root, checkpoint=False)
+
+            self.assertEqual(before, {path: path.read_bytes() for path in before})
 
     def test_recovery_fsyncs_archive_and_processing_before_committed_descriptor(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
