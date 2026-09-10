@@ -201,8 +201,21 @@ class MaintenanceTests(unittest.TestCase):
             parent = Path(temporary_directory)
             root = self.make_profile(parent)
             for index in range(9):
+                receipt_id = f"prior-{index}"
+                receipt_digest = f"{index + 1:064x}"[-64:]
                 append_entry(root / ".harness/memory/journal/curation.jsonl", {
-                    "batch_id": f"old-{index}", "actions": 0,
+                    "type": "curation", "status": "success",
+                    "batch_id": f"20260911T100000000000Z-{index:012x}",
+                    "receipt_ids": [receipt_id],
+                    "receipt_digests": {receipt_id: receipt_digest},
+                    "archived_receipts": [{
+                        "filename": f"{receipt_id}.json",
+                        "receipt_id": receipt_id,
+                        "digest": receipt_digest,
+                    }],
+                    "result_digest": "a" * 64,
+                    "target_digests": {},
+                    "actions": 0, "changed_paths": [],
                     "applied_at": "2026-09-11T10:00:00Z",
                 })
             for index in range(30):
@@ -232,6 +245,31 @@ class MaintenanceTests(unittest.TestCase):
             self.assertEqual(10, output["improvement"]["new_curations"])
             self.assertEqual(2, len(calls.read_text().splitlines()))
             self.assertEqual(1, len(list((root / ".harness/improvements/proposed").glob("*.md"))))
+
+    def test_injected_clock_is_the_committed_curation_time_used_by_schedule(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            parent = Path(temporary_directory)
+            root = self.make_profile(parent)
+            for index in range(30):
+                self.add_receipt(root, index, NOW)
+            fake = parent / "fake-codex"
+            fake.write_text(
+                "#!/usr/bin/env python3\nimport pathlib,sys\n"
+                "pathlib.Path(sys.argv[sys.argv.index('-o')+1]).write_text('{\"actions\":[]}')\n",
+                encoding="utf-8",
+            )
+            fake.chmod(fake.stat().st_mode | stat.S_IXUSR)
+            config = root / ".harness/config.toml"
+            config.write_text(config.read_text() + f'\n[curation]\ncodex_command = {json.dumps(str(fake))}\n')
+
+            run_maintenance(root, now=NOW)
+
+            entry = json.loads(
+                (root / ".harness/memory/journal/curation.jsonl").read_text().splitlines()[-1]
+            )
+            self.assertEqual("2026-09-11T12:00:00Z", entry["applied_at"])
+            self.assertEqual("curation", entry["type"])
+            self.assertEqual("success", entry["status"])
 
 
 if __name__ == "__main__":

@@ -40,9 +40,23 @@ class ImprovementTests(unittest.TestCase):
         journal = root / ".harness/memory/journal/curation.jsonl"
         entries = []
         for index in range(count):
+            receipt_id = f"curation-receipt-{index}"
+            receipt_digest = f"{index + 1:064x}"[-64:]
             entries.append(append_entry(journal, {
-                "batch_id": f"batch-{index}",
+                "type": "curation",
+                "status": "success",
+                "batch_id": f"20260911T100000000000Z-{index:012x}",
+                "receipt_ids": [receipt_id],
+                "receipt_digests": {receipt_id: receipt_digest},
+                "archived_receipts": [{
+                    "filename": f"{receipt_id}.json",
+                    "receipt_id": receipt_id,
+                    "digest": receipt_digest,
+                }],
+                "result_digest": "a" * 64,
+                "target_digests": {},
                 "actions": 0,
+                "changed_paths": [],
                 "applied_at": (start + timedelta(minutes=index)).isoformat().replace("+00:00", "Z"),
             }))
         return entries
@@ -141,7 +155,10 @@ class ImprovementTests(unittest.TestCase):
             self.assertEqual(protected, {name: (root / name).read_bytes() for name in protected})
             call = json.loads(invocation.read_text())
             self.assertEqual(str(root.resolve()), call["cwd"])
-            self.assertIn('"batch_id": "batch-0"', call["stdin"])
+            self.assertIn(
+                '"batch_id": "20260911T100000000000Z-000000000000"',
+                call["stdin"],
+            )
             self.assertNotIn("session_id", call["stdin"])
             self.assertEqual([
                 "exec", "--model", "gpt-6-astra", "-c", 'model_reasoning_effort="high"',
@@ -310,13 +327,122 @@ class ImprovementTests(unittest.TestCase):
                 descriptor = root / ".harness/state/improvement-transaction.json"
                 descriptor.write_text(json.dumps({
                     "version": 1, "state": state,
-                    "targets": [str(proposal.relative_to(root))],
+                    "targets": [{
+                        "path": str(proposal.relative_to(root)),
+                        "digest": __import__("hashlib").sha256(b"proposal").hexdigest(),
+                    }],
                     "journal_existed": False,
+                    "journal_snapshot": None,
+                    "journal_snapshot_digest": None,
                 }), encoding="utf-8")
                 recover_improvement_transaction(root)
                 self.assertEqual(keep, proposal.exists())
                 self.assertEqual(keep, journal.exists())
                 self.assertFalse(descriptor.exists())
+
+    def test_recovery_rejects_policy_snapshot_and_tampered_members_before_any_mutation(self) -> None:
+        mutations = (
+            {"journal_snapshot": "AGENTS.md", "journal_snapshot_digest": None},
+            {"journal_snapshot": ".harness/state/improvement-journal.before", "journal_snapshot_digest": "0" * 64},
+            {"targets": [{"path": "IDENTITY.md", "digest": "0" * 64}]},
+        )
+        for mutation in mutations:
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as temporary_directory:
+                root = self.make_profile(Path(temporary_directory))
+                journal = root / ".harness/memory/journal/improvement.jsonl"
+                journal.write_text("original journal\n", encoding="utf-8")
+                snapshot = root / ".harness/state/improvement-journal.before"
+                snapshot.write_text("original snapshot\n", encoding="utf-8")
+                descriptor = root / ".harness/state/improvement-transaction.json"
+                transaction = {
+                    "version": 1,
+                    "state": "applying",
+                    "targets": [],
+                    "journal_existed": True,
+                    "journal_snapshot": ".harness/state/improvement-journal.before",
+                    "journal_snapshot_digest": __import__("hashlib").sha256(b"original snapshot\n").hexdigest(),
+                }
+                transaction.update(mutation)
+                descriptor.write_text(json.dumps(transaction), encoding="utf-8")
+                protected = {
+                    path: path.read_bytes()
+                    for path in (root / "AGENTS.md", root / "IDENTITY.md", journal, snapshot, descriptor)
+                }
+
+                with self.assertRaises(ImprovementError):
+                    recover_improvement_transaction(root)
+
+                self.assertEqual(protected, {path: path.read_bytes() for path in protected})
+
+    def test_only_semantically_valid_successful_curation_events_are_counted(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = self.make_profile(Path(temporary_directory))
+            journal = root / ".harness/memory/journal/curation.jsonl"
+            for index in range(10):
+                append_entry(journal, {
+                    "type": "curation", "status": "failed",
+                    "batch_id": f"20260911T100000000000Z-{index:012x}",
+                    "applied_at": "2026-09-11T10:00:00Z",
+                })
+
+            with self.assertRaisesRegex(ImprovementError, "curation journal"):
+                improvement_due(root, now=NOW)
+            report = diagnose(root)
+            self.assertFalse(report.ok)
+            self.assertIn("curation journal event", report.format())
+
+        malformed_values = (
+            {"receipt_ids": [["not-hashable"]]},
+            {"changed_paths": [{"not": "a path"}]},
+            {"archived_receipts": [{
+                "filename": "one.json", "receipt_id": ["not-hashable"],
+                "digest": "a" * 64,
+            }]},
+        )
+        for mutation in malformed_values:
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as temporary_directory:
+                root = self.make_profile(Path(temporary_directory))
+                payload = {
+                    "type": "curation", "status": "success",
+                    "batch_id": "20260911T100000000000Z-000000000000",
+                    "receipt_ids": ["one"],
+                    "receipt_digests": {"one": "a" * 64},
+                    "archived_receipts": [{
+                        "filename": "one.json", "receipt_id": "one", "digest": "a" * 64,
+                    }],
+                    "result_digest": "b" * 64,
+                    "target_digests": {}, "changed_paths": [], "actions": 0,
+                    "applied_at": "2026-09-11T10:00:00Z",
+                }
+                payload.update(mutation)
+                append_entry(root / ".harness/memory/journal/curation.jsonl", payload)
+
+                with self.assertRaisesRegex(ImprovementError, "curation journal"):
+                    improvement_due(root, now=NOW)
+                report = diagnose(root)
+                self.assertFalse(report.ok, report.format())
+
+    def test_journal_symlinks_fail_before_forced_model_invocation(self) -> None:
+        for relative in ("curation.jsonl", "improvement.jsonl"):
+            with self.subTest(relative=relative), tempfile.TemporaryDirectory() as temporary_directory:
+                parent = Path(temporary_directory)
+                root = self.make_profile(parent)
+                if relative == "improvement.jsonl":
+                    self.add_curations(root, 1, start=NOW)
+                outside = parent / "outside.jsonl"
+                outside.write_text("", encoding="utf-8")
+                link = root / ".harness/memory/journal" / relative
+                link.symlink_to(outside)
+                called = parent / "called"
+                fake = parent / "fake"
+                fake.write_text(f"#!/bin/sh\ntouch {str(called)!r}\n", encoding="utf-8")
+                fake.chmod(fake.stat().st_mode | stat.S_IXUSR)
+                self.configure_fake(root, fake)
+
+                with self.assertRaisesRegex(ImprovementError, "symlink"):
+                    run_improvement(root, now=NOW, force=True)
+
+                self.assertFalse(called.exists())
 
     def test_real_process_crashes_recover_precommit_or_finish_committed_state(self) -> None:
         for stage, keep in (("after_journal", False), ("after_commit", True)):
@@ -350,6 +476,16 @@ class ImprovementTests(unittest.TestCase):
             "\n[improvement]\nreasoning_effort = \"extreme\"\n",
             "\n[curation]\nmaintenance_receipt_threshold = 0\n",
             "\n[curation]\nmaintenance_max_receipts = 31\n",
+            "\n[curation]\ncodex_timeout_seconds = nan\n",
+            "\n[curation]\nstale_timeout_seconds = inf\n",
+            "\n[curation]\nmaintenance_max_age_seconds = -inf\n",
+            "\n[improvement]\ncooldown_seconds = nan\n",
+            "\n[improvement]\nlow_interval_seconds = inf\n",
+            "\n[capture]\nmax_text_chars = nan\n",
+            "\n[curation]\nmaintenance_receipt_threshold = inf\n",
+            "\n[curation]\nmaintenance_max_receipts = nan\n",
+            "\n[improvement]\nhigh_threshold = inf\n",
+            "\n[improvement]\nlow_minimum = nan\n",
         )
         for fragment in invalid_fragments:
             with self.subTest(fragment=fragment), tempfile.TemporaryDirectory() as temporary_directory:

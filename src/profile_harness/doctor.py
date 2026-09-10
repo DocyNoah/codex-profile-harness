@@ -32,6 +32,7 @@ from .curation import (
     _strict_json,
     _BATCH_ID,
     recover_transactions,
+    successful_curation_entries,
 )
 from .journal import verify_journal
 from .fs import require_safe_path
@@ -926,7 +927,7 @@ def diagnose(
     journal = profile_root / ".harness/memory/journal/curation.jsonl"
     try:
         require_safe_path(profile_root, journal, directory=False)
-        entries = verify_journal(journal)
+        entries = successful_curation_entries(journal)
     except (OSError, UnicodeError, ValueError) as error:
         findings.append(Finding("ERROR", "journal", str(error)))
     else:

@@ -19,7 +19,6 @@ sys.path.insert(0, str(ROOT / "src"))
 from profile_harness.config import init_profile, register_repo  # noqa: E402
 from profile_harness.dashboard import generate_dashboard  # noqa: E402
 from profile_harness.doctor import diagnose  # noqa: E402
-from profile_harness.journal import append_entry  # noqa: E402
 from profile_harness.locking import ProfileLease  # noqa: E402
 
 
@@ -107,11 +106,6 @@ class DoctorTests(unittest.TestCase):
             api = root / "projects/api"
             api.mkdir()
             register_repo(root, "api", api)
-            append_entry(
-                root / ".harness/memory/journal/curation.jsonl",
-                {"batch_id": "verified", "actions": 0},
-            )
-
             report = diagnose(root)
 
             self.assertTrue(report.ok, report.format())

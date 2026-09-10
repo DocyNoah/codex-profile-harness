@@ -70,6 +70,105 @@ class ApplyResult:
     journal_entry: dict[str, Any]
 
 
+CURATION_JOURNAL_REQUIRED_FIELDS = frozenset({
+    "type", "status", "batch_id", "receipt_ids", "receipt_digests",
+    "archived_receipts", "result_digest", "target_digests", "actions",
+    "changed_paths", "applied_at", "sequence", "previous_hash", "entry_hash",
+})
+
+
+def _is_digest(value: object) -> bool:
+    return isinstance(value, str) and re.fullmatch(r"[a-f0-9]{64}", value) is not None
+
+
+def _journal_timestamp(value: object) -> datetime:
+    if not isinstance(value, str) or not value.endswith("Z"):
+        raise CurationError("curation journal applied_at must be strict UTC")
+    try:
+        parsed = datetime.fromisoformat(value[:-1] + "+00:00")
+    except ValueError as error:
+        raise CurationError("curation journal applied_at must be strict UTC") from error
+    return parsed.astimezone(timezone.utc)
+
+
+def validate_curation_journal_entry(entry: object) -> dict[str, Any]:
+    """Require the complete semantics of one successfully committed curation."""
+    if not isinstance(entry, dict) or not CURATION_JOURNAL_REQUIRED_FIELDS <= set(entry):
+        raise CurationError("curation journal event is missing required fields")
+    if entry.get("type") != "curation" or entry.get("status") != "success":
+        raise CurationError("curation journal event must be a successful curation")
+    if not isinstance(entry.get("batch_id"), str) or _BATCH_ID.fullmatch(entry["batch_id"]) is None:
+        raise CurationError("curation journal batch provenance is invalid")
+    receipt_ids = entry.get("receipt_ids")
+    if (
+        not isinstance(receipt_ids, list)
+        or not 1 <= len(receipt_ids) <= MAX_ARRAY_ITEMS
+        or any(not isinstance(item, str) or _RECEIPT_ID.fullmatch(item) is None for item in receipt_ids)
+        or len(receipt_ids) != len(set(receipt_ids))
+    ):
+        raise CurationError("curation journal receipt provenance is invalid")
+    receipt_digests = entry.get("receipt_digests")
+    if (
+        not isinstance(receipt_digests, dict)
+        or set(receipt_digests) != set(receipt_ids)
+        or any(not _is_digest(value) for value in receipt_digests.values())
+    ):
+        raise CurationError("curation journal receipt evidence is invalid")
+    archived = entry.get("archived_receipts")
+    if not isinstance(archived, list) or len(archived) != len(receipt_ids):
+        raise CurationError("curation journal archived evidence is invalid")
+    archived_ids: list[str] = []
+    for reference in archived:
+        if (
+            not isinstance(reference, dict)
+            or set(reference) != {"filename", "receipt_id", "digest"}
+            or not isinstance(reference.get("filename"), str)
+            or Path(reference["filename"]).name != reference["filename"]
+            or not isinstance(reference.get("receipt_id"), str)
+            or reference.get("receipt_id") not in receipt_digests
+            or reference.get("digest") != receipt_digests.get(reference.get("receipt_id"))
+        ):
+            raise CurationError("curation journal archived evidence is invalid")
+        archived_ids.append(reference["receipt_id"])
+    if len(archived_ids) != len(set(archived_ids)) or set(archived_ids) != set(receipt_ids):
+        raise CurationError("curation journal archived evidence is invalid")
+    if not _is_digest(entry.get("result_digest")):
+        raise CurationError("curation journal result evidence is invalid")
+    targets = entry.get("target_digests")
+    changed = entry.get("changed_paths")
+    if (
+        not isinstance(targets, dict)
+        or not isinstance(changed, list)
+        or any(not isinstance(relative, str) for relative in changed)
+        or set(changed) != set(targets)
+    ):
+        raise CurationError("curation journal target evidence is invalid")
+    for relative, digest in targets.items():
+        if (
+            not isinstance(relative, str)
+            or not relative
+            or Path(relative).is_absolute()
+            or ".." in Path(relative).parts
+            or (digest is not None and not _is_digest(digest))
+        ):
+            raise CurationError("curation journal target evidence is invalid")
+    actions = entry.get("actions")
+    if isinstance(actions, bool) or not isinstance(actions, int) or not 0 <= actions <= MAX_ACTIONS:
+        raise CurationError("curation journal action count is invalid")
+    _journal_timestamp(entry.get("applied_at"))
+    return entry
+
+
+def successful_curation_entries(path: Path) -> list[dict[str, Any]]:
+    """Verify the hash chain and semantic success contract for every row."""
+    from .journal import verify_journal
+
+    entries = verify_journal(path)
+    for entry in entries:
+        validate_curation_journal_entry(entry)
+    return entries
+
+
 def _strict_json(path: Path) -> Any:
     def reject(value: str) -> None:
         raise ValueError(f"non-standard JSON constant: {value}")
@@ -571,9 +670,14 @@ def apply_actions(
     *,
     fail_after_writes: int | None = None,
     crash_after_stage: str | None = None,
+    now: datetime | None = None,
 ) -> ApplyResult:
     """Apply one validated batch transactionally, restoring it on any failure."""
     profile = load_profile(root)
+    applied_at = now or datetime.now(timezone.utc)
+    if applied_at.tzinfo is None or applied_at.utcoffset() is None:
+        raise CurationError("curation clock must be timezone-aware")
+    applied_at = applied_at.astimezone(timezone.utc)
     if not isinstance(batch_id, str) or _BATCH_ID.fullmatch(batch_id) is None:
         raise CurationError("batch ID is invalid")
     batch_path = profile.root / ".harness/memory/processing" / batch_id
@@ -730,6 +834,8 @@ def apply_actions(
         journal_entry = append_entry(
             journal,
             {
+                "type": "curation",
+                "status": "success",
                 "batch_id": batch_id,
                 "receipt_ids": list(receipt_ids),
                 "receipt_digests": receipt_digests,
@@ -738,7 +844,7 @@ def apply_actions(
                 "archived_receipts": archived_evidence,
                 "actions": len(actions),
                 "changed_paths": [str(path.relative_to(profile.root)) for path in changed],
-                "applied_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                "applied_at": applied_at.isoformat().replace("+00:00", "Z"),
             },
         )
         crash("after_journal")

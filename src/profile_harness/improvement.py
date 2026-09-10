@@ -13,6 +13,7 @@ from typing import Any
 
 from .config import PLUGIN_ROOT, load_profile_config
 from .fs import atomic_copy_file, atomic_write_text, exclusive_write_text, fsync_directory, require_safe_path
+from .curation import successful_curation_entries
 from .journal import append_entry, verify_journal
 from .locking import ProfileLease
 from .runner import run_codex
@@ -27,6 +28,9 @@ MAX_RESULT_BYTES = 1024 * 1024
 IMPROVEMENT_SCHEMA = PLUGIN_ROOT / "schemas/improvement-result.schema.json"
 IMPROVEMENT_PROMPT = PLUGIN_ROOT / "templates/prompts/improve.md"
 _HASH = re.compile(r"[a-f0-9]{64}")
+_CURATION_JOURNAL = ".harness/memory/journal/curation.jsonl"
+_IMPROVEMENT_JOURNAL = ".harness/memory/journal/improvement.jsonl"
+_IMPROVEMENT_SNAPSHOT = ".harness/state/improvement-journal.before"
 
 
 class ImprovementError(ValueError):
@@ -60,13 +64,25 @@ def _timestamp(value: object, label: str) -> datetime:
     return parsed.astimezone(timezone.utc)
 
 
+def _safe_journal(root: Path, relative: str) -> Path:
+    try:
+        return require_safe_path(root, root / relative, directory=False)
+    except ValueError as error:
+        raise ImprovementError(str(error)) from error
+
+
 def improvement_due(root: Path, *, now: datetime | None = None) -> ImprovementDue:
     """Compute improvement eligibility from verified journals only."""
     profile_root = Path(root).resolve()
     config = load_profile_config(profile_root).improvement
     current = _now(now)
-    curations = verify_journal(profile_root / ".harness/memory/journal/curation.jsonl")
-    improvements = verify_journal(profile_root / ".harness/memory/journal/improvement.jsonl")
+    curation_journal = _safe_journal(profile_root, _CURATION_JOURNAL)
+    improvement_journal = _safe_journal(profile_root, _IMPROVEMENT_JOURNAL)
+    try:
+        curations = successful_curation_entries(curation_journal)
+    except ValueError as error:
+        raise ImprovementError(f"invalid curation journal: {error}") from error
+    improvements = verify_journal(improvement_journal)
     if not config.enabled:
         return ImprovementDue(False, "disabled", 0, (), 0.0, None)
     last = improvements[-1] if improvements else None
@@ -107,6 +123,14 @@ def _canonical(value: object) -> bytes:
 
 def _digest(value: object) -> str:
     return hashlib.sha256(_canonical(value)).hexdigest()
+
+
+def _file_digest(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while chunk := handle.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _slug(value: str) -> str:
@@ -184,44 +208,117 @@ def _bounded_state(root: Path, entries: list[dict[str, Any]]) -> str:
     return prompt
 
 
+def _validated_transaction(
+    root: Path, transaction: object
+) -> tuple[dict[str, Any], Path, Path | None, tuple[Path, ...]]:
+    fields = {
+        "version", "state", "targets", "journal_existed",
+        "journal_snapshot", "journal_snapshot_digest",
+    }
+    if (
+        not isinstance(transaction, dict)
+        or set(transaction) != fields
+        or transaction.get("version") != 1
+        or transaction.get("state") not in {"applying", "committed"}
+        or not isinstance(transaction.get("journal_existed"), bool)
+        or not isinstance(transaction.get("targets"), list)
+        or len(transaction["targets"]) > MAX_PROPOSALS
+    ):
+        raise ImprovementError("invalid improvement transaction descriptor")
+    journal = _safe_journal(root, _IMPROVEMENT_JOURNAL)
+    snapshot: Path | None = None
+    if transaction["journal_existed"]:
+        if (
+            transaction.get("journal_snapshot") != _IMPROVEMENT_SNAPSHOT
+            or not isinstance(transaction.get("journal_snapshot_digest"), str)
+            or _HASH.fullmatch(transaction["journal_snapshot_digest"]) is None
+        ):
+            raise ImprovementError("improvement journal snapshot member is invalid")
+        try:
+            snapshot = require_safe_path(
+                root, root / _IMPROVEMENT_SNAPSHOT, directory=False
+            )
+        except ValueError as error:
+            raise ImprovementError(str(error)) from error
+        if (
+            not snapshot.is_file()
+            or snapshot.stat().st_nlink != 1
+            or _file_digest(snapshot) != transaction["journal_snapshot_digest"]
+        ):
+            raise ImprovementError("improvement journal snapshot digest is invalid")
+    elif transaction.get("journal_snapshot") is not None or transaction.get("journal_snapshot_digest") is not None:
+        raise ImprovementError("improvement journal snapshot member is invalid")
+
+    proposed_root = root / ".harness/improvements/proposed"
+    validated_targets: list[Path] = []
+    seen: set[str] = set()
+    for member in transaction["targets"]:
+        if (
+            not isinstance(member, dict)
+            or set(member) != {"path", "digest"}
+            or not isinstance(member.get("path"), str)
+            or not isinstance(member.get("digest"), str)
+            or _HASH.fullmatch(member["digest"]) is None
+            or member["path"] in seen
+        ):
+            raise ImprovementError("improvement transaction target member is invalid")
+        relative = Path(member["path"])
+        if relative.is_absolute() or ".." in relative.parts:
+            raise ImprovementError("improvement transaction target member is invalid")
+        try:
+            target = require_safe_path(root, root / relative, directory=False)
+        except ValueError as error:
+            raise ImprovementError(str(error)) from error
+        if target.parent != proposed_root or target.suffix != ".md":
+            raise ImprovementError("improvement transaction escapes proposal scope")
+        if target.exists():
+            if target.stat().st_nlink != 1 or _file_digest(target) != member["digest"]:
+                raise ImprovementError("improvement transaction target digest is invalid")
+        if transaction["state"] == "committed" and not target.is_file():
+            raise ImprovementError("committed improvement proposal is missing")
+        seen.add(member["path"])
+        validated_targets.append(target)
+    return transaction, journal, snapshot, tuple(validated_targets)
+
+
 def recover_improvement_transaction(root: Path) -> bool:
-    """Roll back a precommit improvement or finish committed cleanup."""
+    """Validate every WAL member, then roll back or finish cleanup."""
     profile_root = Path(root).resolve()
-    descriptor = require_safe_path(profile_root, profile_root / ".harness/state/improvement-transaction.json", directory=False)
+    try:
+        descriptor = require_safe_path(
+            profile_root,
+            profile_root / ".harness/state/improvement-transaction.json",
+            directory=False,
+        )
+    except ValueError as error:
+        raise ImprovementError(str(error)) from error
     if not descriptor.exists():
         return False
     try:
-        transaction = json.loads(descriptor.read_text(encoding="utf-8"))
-    except (OSError, ValueError, json.JSONDecodeError) as error:
+        with descriptor.open("rb") as handle:
+            raw = handle.read(MAX_RESULT_BYTES + 1)
+        if len(raw) > MAX_RESULT_BYTES:
+            raise ImprovementError("invalid improvement transaction descriptor")
+        value = json.loads(raw.decode("utf-8"))
+    except ImprovementError:
+        raise
+    except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as error:
         raise ImprovementError("invalid improvement transaction descriptor") from error
-    if not isinstance(transaction, dict) or transaction.get("version") != 1 or transaction.get("state") not in {"applying", "committed"}:
-        raise ImprovementError("invalid improvement transaction descriptor")
-    journal = require_safe_path(profile_root, profile_root / ".harness/memory/journal/improvement.jsonl", directory=False)
+    transaction, journal, snapshot, targets = _validated_transaction(profile_root, value)
+
     if transaction["state"] == "applying":
-        for relative in transaction.get("targets", []):
-            if not isinstance(relative, str) or Path(relative).is_absolute() or ".." in Path(relative).parts:
-                raise ImprovementError("improvement transaction contains an unsafe path")
-            target = require_safe_path(profile_root, profile_root / relative, directory=False)
-            expected = profile_root / ".harness/improvements/proposed"
-            if target.parent != expected:
-                raise ImprovementError("improvement transaction escapes proposal scope")
+        for target in targets:
             target.unlink(missing_ok=True)
             fsync_directory(target.parent)
-        if transaction.get("journal_existed"):
-            snapshot_value = transaction.get("journal_snapshot")
-            if not isinstance(snapshot_value, str):
-                raise ImprovementError("improvement journal snapshot is invalid")
-            snapshot = require_safe_path(profile_root, profile_root / snapshot_value, directory=False)
+        if snapshot is not None:
             atomic_copy_file(snapshot, journal)
         else:
             journal.unlink(missing_ok=True)
             fsync_directory(journal.parent)
     descriptor.unlink()
     fsync_directory(descriptor.parent)
-    snapshot_value = transaction.get("journal_snapshot")
-    if isinstance(snapshot_value, str):
-        snapshot = require_safe_path(profile_root, profile_root / snapshot_value, directory=False)
-        snapshot.unlink(missing_ok=True)
+    if snapshot is not None:
+        snapshot.unlink()
         fsync_directory(snapshot.parent)
     return True
 
@@ -246,7 +343,11 @@ def _run_locked(
         }
     if not due.source_journal_hashes:
         raise ImprovementError("improvement requires at least one successful curation source")
-    curations = verify_journal(root / ".harness/memory/journal/curation.jsonl")
+    curation_journal = _safe_journal(root, _CURATION_JOURNAL)
+    try:
+        curations = successful_curation_entries(curation_journal)
+    except ValueError as error:
+        raise ImprovementError(f"invalid curation journal: {error}") from error
     source_set = set(due.source_journal_hashes)
     source_entries = [entry for entry in curations if entry["entry_hash"] in source_set]
     prompt_path = root / ".harness/state/improvement-prompt.md"
@@ -267,17 +368,20 @@ def _run_locked(
         proposals = _validate_result(result, source_set)
         try:
             proposed_root = require_safe_path(root, root / ".harness/improvements/proposed", directory=True)
-            journal = require_safe_path(root, root / ".harness/memory/journal/improvement.jsonl", directory=False)
+            journal = _safe_journal(root, _IMPROVEMENT_JOURNAL)
             descriptor = require_safe_path(root, root / ".harness/state/improvement-transaction.json", directory=False)
         except ValueError as error:
             raise ImprovementError(str(error)) from error
-        snapshot = root / ".harness/state/improvement-journal.before"
+        snapshot = root / _IMPROVEMENT_SNAPSHOT
+        snapshot_digest = None
         if journal.exists():
             atomic_copy_file(journal, snapshot)
+            snapshot_digest = _file_digest(snapshot)
         transaction = {
             "version": 1, "state": "applying", "targets": [],
             "journal_existed": journal.exists(),
             "journal_snapshot": str(snapshot.relative_to(root)) if journal.exists() else None,
+            "journal_snapshot_digest": snapshot_digest,
         }
         atomic_write_text(descriptor, json.dumps(transaction, sort_keys=True, indent=2) + "\n")
         created = []
@@ -290,7 +394,10 @@ def _run_locked(
                 require_safe_path(root, target, directory=False)
                 if target.exists():
                     raise ImprovementError("immutable proposal already exists")
-                transaction["targets"].append(str(target.relative_to(root)))
+                transaction["targets"].append({
+                    "path": str(target.relative_to(root)),
+                    "digest": hashlib.sha256(body.encode()).hexdigest(),
+                })
                 atomic_write_text(descriptor, json.dumps(transaction, sort_keys=True, indent=2) + "\n")
                 if not exclusive_write_text(target, body):
                     raise ImprovementError("immutable proposal already exists")

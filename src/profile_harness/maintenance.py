@@ -89,7 +89,9 @@ def run_maintenance(root: Path, *, now: datetime | None = None) -> dict[str, Any
                         reasoning_effort=config.curation.reasoning_effort,
                         timeout=config.curation.codex_timeout_seconds,
                     )
-                    applied = apply_actions(profile_root, batch.batch_id, load_result(result_path))
+                    applied = apply_actions(
+                        profile_root, batch.batch_id, load_result(result_path), now=current
+                    )
                 except BaseException:
                     if batch.path.exists():
                         try:

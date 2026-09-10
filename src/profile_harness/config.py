@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+import math
 from pathlib import Path
 import tomllib
 
@@ -148,7 +149,12 @@ def find_profile_marker_root(start: Path) -> Path:
 
 
 def _positive_number(value: object, field: str, errors: list[str]) -> float:
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+        or value <= 0
+    ):
         errors.append(f"{field} must be a positive number")
         return 1.0
     return float(value)
