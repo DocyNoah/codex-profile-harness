@@ -13,7 +13,7 @@ import time
 import uuid
 from typing import Any, BinaryIO
 
-from .fs import atomic_write_text
+from .fs import atomic_write_text, ensure_safe_directory, require_safe_path
 
 
 class LeaseBusyError(RuntimeError):
@@ -49,7 +49,9 @@ class ProfileLease:
         if stale_timeout <= 0:
             raise ValueError("stale_timeout must be positive")
         self.root = Path(profile_root).resolve()
+        ensure_safe_directory(self.root, self.root / ".harness/state")
         self.path = self.root / ".harness/state/curation.lock"
+        require_safe_path(self.root, self.path, directory=True)
         self.stale_timeout = float(stale_timeout)
         self.token = uuid.uuid4().hex
         self.owner = owner or {
@@ -68,7 +70,10 @@ class ProfileLease:
 
     def _existing_metadata(self) -> dict[str, Any]:
         try:
-            value = json.loads((self.path / "owner.json").read_text(encoding="utf-8"))
+            owner_path = require_safe_path(
+                self.root, self.path / "owner.json", directory=False
+            )
+            value = json.loads(owner_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             value = {}
         return value if isinstance(value, dict) else {}
@@ -87,8 +92,9 @@ class ProfileLease:
     def acquire(self) -> "ProfileLease":
         if self._acquired:
             raise RuntimeError("curation lease is already acquired by this owner")
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        ensure_safe_directory(self.root, self.path.parent)
         guard_path = self.path.parent / "curation.guard"
+        require_safe_path(self.root, guard_path, directory=False)
         guard = guard_path.open("a+b")
         try:
             fcntl.flock(guard.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -106,7 +112,7 @@ class ProfileLease:
                     owner = json.dumps(metadata.get("owner", {}), sort_keys=True)
                     raise LeaseBusyError(f"curation lease is live: {owner}")
                 quarantine = self.path.parent / "quarantine"
-                quarantine.mkdir(parents=True, exist_ok=True)
+                ensure_safe_directory(self.root, quarantine)
                 destination = quarantine / f"curation.lock.{uuid.uuid4().hex}"
                 os.replace(self.path, destination)
                 self.path.mkdir()

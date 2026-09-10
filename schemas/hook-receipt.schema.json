@@ -7,12 +7,15 @@
     "id",
     "event",
     "captured_at",
+    "cwd",
     "payload"
   ],
   "properties": {
     "id": {
       "type": "string",
-      "minLength": 1
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9._-]+$"
     },
     "event": {
       "enum": [
@@ -22,16 +25,28 @@
     },
     "captured_at": {
       "type": "string",
-      "format": "date-time"
+      "format": "date-time",
+      "maxLength": 64
     },
     "cwd": {
-      "type": [
-        "string",
-        "null"
-      ]
+      "type": "string",
+      "maxLength": 1048576
     },
     "payload": {
-      "type": "object"
+      "type": "object",
+      "required": ["session_id"],
+      "properties": {
+        "cwd": {"type": "string", "maxLength": 1048576},
+        "last_assistant_message": {"type": "string", "maxLength": 1048576},
+        "permission_mode": {"type": "string", "maxLength": 1048576},
+        "reason": {"type": "string", "maxLength": 1048576},
+        "session_id": {"type": "string", "minLength": 1, "maxLength": 1048576, "pattern": "^[\\s\\S]*\\S[\\s\\S]*$"},
+        "stop_hook_active": {"type": "boolean"},
+        "transcript_path": {"type": "string", "maxLength": 1048576},
+        "turn_id": {"type": "string", "maxLength": 1048576},
+        "extra_keys": {"type": "array", "maxItems": 10000, "items": {"type": "string", "maxLength": 1048576}}
+      },
+      "additionalProperties": false
     }
   },
   "additionalProperties": false

@@ -67,6 +67,9 @@ BATCH_ID="$(printf '%s\n' "$BATCH_JSON" | python3 -c 'import json, sys; print(js
 printf '%s\n' "$BATCH_JSON"
 ```
 
+If `status` is `no_op`, stop here: the inbox was empty and no batch, model call,
+or journal entry was created.
+
 Review the `prompt.md` inside `.harness/memory/processing/$BATCH_ID`, create
 `$PROFILE_ROOT/curation-result.json` conforming to the bundled curation schema,
 then apply that exact batch:
@@ -78,6 +81,9 @@ profile-harness doctor
 ```
 
 Failed application restores snapshots and returns valid receipts to the inbox.
+Process crashes are recovered from the durable transaction descriptor by the
+next curate command; `doctor` also recovers an interrupted transaction when no
+curator holds the lease.
 
 With an installed, authenticated `codex` executable:
 
@@ -99,7 +105,8 @@ crontab -e
 ```
 
 Cron uses the saved Codex authentication of the account that owns the crontab.
-It does not need a separate provider key.
+It does not need a separate provider key. Empty hourly runs are true no-ops and
+do not invoke Codex or create batches/journal entries.
 
 ## Backup and restore
 

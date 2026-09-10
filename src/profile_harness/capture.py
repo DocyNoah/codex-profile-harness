@@ -13,6 +13,7 @@ import tempfile
 from typing import Any
 
 from .config import DEFAULT_MAX_TEXT_CHARS, find_profile_root, load_profile_config
+from .fs import require_safe_path
 
 
 MAX_INPUT_BYTES = 1024 * 1024
@@ -167,6 +168,8 @@ def _publish_exclusively(path: Path, content: str) -> bool:
 
 def capture_event(payload: dict, cwd: Path | None = None) -> CaptureResult:
     """Validate and persist one immutable Stop or SessionEnd receipt."""
+    if os.environ.get("PROFILE_HARNESS_CURATOR") == "1":
+        return CaptureResult(True, "curator_noop")
     if not isinstance(payload, dict):
         raise CaptureError("payload must be a JSON object")
     if _serialized_size(payload) > MAX_INPUT_BYTES:
@@ -199,6 +202,13 @@ def capture_event(payload: dict, cwd: Path | None = None) -> CaptureResult:
         normalized.get("last_assistant_message", ""),
     )
     receipt_path = profile_root / ".harness/memory/inbox" / f"{receipt_id}.json"
+    try:
+        require_safe_path(
+            profile_root, profile_root / ".harness/memory/inbox", directory=True
+        )
+        require_safe_path(profile_root, receipt_path, directory=False)
+    except ValueError as error:
+        raise CaptureError(str(error)) from error
     receipt = {
         "id": receipt_id,
         "event": event,

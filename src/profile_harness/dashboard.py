@@ -6,7 +6,7 @@ from pathlib import Path
 from urllib.parse import quote
 
 from .config import load_profile
-from .fs import atomic_write_text
+from .fs import atomic_write_text, require_safe_path
 
 
 INDEXES = (
@@ -63,6 +63,7 @@ def generate_dashboard(root: Path) -> Path:
         lines.extend(("", f"## {registered.name}", ""))
         for label, filename in INDEXES:
             source = repository / filename
+            require_safe_path(profile.root, source, directory=False)
             try:
                 relative = source.relative_to(profile.root).as_posix()
             except ValueError as error:
@@ -70,5 +71,6 @@ def generate_dashboard(root: Path) -> Path:
             link = quote(relative, safe="/")
             lines.append(f"- [{label}]({link}): {_summary(source)}")
     target = profile.root / "DASHBOARD.md"
+    require_safe_path(profile.root, target, directory=False)
     atomic_write_text(target, "\n".join(lines) + "\n")
     return target

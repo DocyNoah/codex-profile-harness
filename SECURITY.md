@@ -15,6 +15,12 @@
   files are never model-writable.
 - Curation calls `codex exec` with a read-only sandbox. Application is local,
   deterministic, snapshot-backed, and journaled.
+- Every fixed profile and repository path is checked lexically for symlink
+  components before it is read or written. Existing ordinary directories are
+  allowed; a link anywhere inside the trusted profile boundary is rejected.
+- Batch manifests bind canonical receipt bytes with SHA-256. Journal entries bind
+  the consumed receipt digests, accepted result digest, resulting target digests,
+  and archived receipt names/digests.
 
 ## Hook approval
 
@@ -35,15 +41,27 @@ before registering it with Codex.
 ## Data integrity and recovery
 
 Run `profile-harness doctor` after installation, upgrades, restores, or suspected
-tampering. It checks registry containment, runtime directories, active receipts,
-journal hash continuity, and stale locks. A nonzero exit requires operator
-attention.
+tampering. It checks registry containment and symlinks, runtime directories,
+active and archived receipts, evidence-to-journal bindings, journal hash
+continuity, interrupted transactions, and stale locks. A nonzero exit requires
+operator attention.
 
 Application snapshots are under `.harness/memory/archive/snapshots/`; processed
 receipts are under `.harness/memory/archive/processed/`. The append-only journal
 detects modification but does not prevent an attacker with filesystem access
 from replacing the profile and its backups. Keep independent backups and use
 filesystem permissions appropriate for the profile's sensitivity.
+
+Before any target mutation, curation atomically publishes and fsyncs a
+write-ahead descriptor under `.harness/state/transactions/`. A crash before the
+commit marker restores all targets, journal state, and receipts. A crash after
+the commit marker preserves the committed targets/journal and idempotently
+finishes receipt archival and batch cleanup. Directory fsync is attempted where
+the host filesystem supports it.
+
+The curator sets `PROFILE_HARNESS_CURATOR=1` only in its child process
+environment. Lifecycle capture checks that inherited marker before parsing hook
+payloads, preventing curation from capturing its own child lifecycle events.
 
 Do not store API keys in profile files. `curate --run` reuses Codex's existing
 authentication and requires no separate provider credential.

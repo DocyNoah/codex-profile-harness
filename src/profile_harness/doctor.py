@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import fcntl
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -17,6 +18,7 @@ from .config import (
     DEFAULT_STALE_TIMEOUT_SECONDS,
     PLUGIN_ROOT,
     PROFILE_DIRECTORIES,
+    OPTIONAL_RUNTIME_DIRECTORIES,
     load_profile_config,
 )
 from .curation import (
@@ -26,8 +28,12 @@ from .curation import (
     MAX_IDENTIFIER_CHARS,
     CurationError,
     _valid_receipt,
+    _strict_json,
+    _BATCH_ID,
+    recover_transactions,
 )
 from .journal import verify_journal
+from .fs import require_safe_path
 
 
 REQUIRED_PLUGIN_FILES = (
@@ -221,12 +227,13 @@ def _validate_receipt_schema(value: object) -> None:
         raise ValueError("receipt schema root must be an object")
     required = value.get("required")
     properties = value.get("properties")
-    if not isinstance(required, list) or not {
+    if not isinstance(required, list) or set(required) != {
         "id",
         "event",
         "captured_at",
+        "cwd",
         "payload",
-    } <= set(required):
+    }:
         raise ValueError("receipt schema is missing required receipt fields")
     if not isinstance(properties, dict) or set(
         properties.get("event", {}).get("enum", [])
@@ -234,6 +241,18 @@ def _validate_receipt_schema(value: object) -> None:
         raise ValueError("receipt schema must allow Stop and SessionEnd events")
     if value.get("additionalProperties") is not False:
         raise ValueError("receipt schema must reject additional properties")
+    identifier = properties.get("id", {})
+    if identifier.get("maxLength") != MAX_IDENTIFIER_CHARS or identifier.get("pattern") != "^[A-Za-z0-9._-]+$":
+        raise ValueError("receipt ID schema must match safe filenames")
+    captured = properties.get("captured_at", {})
+    if captured.get("format") != "date-time" or captured.get("maxLength") != 64:
+        raise ValueError("receipt timestamp schema is weakened")
+    payload = properties.get("payload", {})
+    expected_payload = {"cwd", "last_assistant_message", "permission_mode", "reason", "session_id", "stop_hook_active", "transcript_path", "turn_id", "extra_keys"}
+    if (payload.get("type") != "object" or payload.get("additionalProperties") is not False
+            or payload.get("required") != ["session_id"]
+            or set(payload.get("properties", {})) != expected_payload):
+        raise ValueError("receipt payload schema must match normalized runtime fields")
 
 
 def _exact_integer(schema: dict, field: str, expected: int, label: str) -> None:
@@ -343,12 +362,14 @@ def _validate_curation_schema(value: object) -> None:
         source_items,
         minimum=1,
         maximum=MAX_IDENTIFIER_CHARS,
+        pattern="^[A-Za-z0-9._-]+$",
         label="sources.items",
     )
     _string_contract(
         definitions["content"],
         minimum=1,
         maximum=MAX_CONTENT_CHARS,
+        pattern="^[\\s\\S]*\\S[\\s\\S]*$",
         label="content",
     )
 
@@ -394,6 +415,7 @@ def _validate_curation_schema(value: object) -> None:
             repository,
             minimum=1,
             maximum=MAX_IDENTIFIER_CHARS,
+            pattern="^[\\s\\S]*\\S[\\s\\S]*$",
             label=f"{name}.repository",
         )
 
@@ -421,6 +443,7 @@ def _validate_curation_schema(value: object) -> None:
         discard_sources,
         minimum=1,
         maximum=MAX_IDENTIFIER_CHARS,
+        pattern="^[A-Za-z0-9._-]+$",
         label="discard.source_receipt_ids.items",
     )
 
@@ -505,6 +528,11 @@ def _registry_findings(root: Path) -> tuple[list[Finding], tuple[Path, ...]]:
             )
             continue
         candidate = root / value
+        try:
+            require_safe_path(root, candidate, directory=True)
+        except ValueError:
+            findings.append(Finding("ERROR", "registry", f"{name} contains an unsafe symlink path"))
+            continue
         resolved = candidate.resolve()
         try:
             relative = resolved.relative_to(projects)
@@ -549,6 +577,10 @@ def _registry_findings(root: Path) -> tuple[list[Finding], tuple[Path, ...]]:
                         f"{name} has missing or unsafe {filename}",
                     )
                 )
+        for relative in ("docs", "docs/decisions", "docs/decisions/archive"):
+            path = resolved / relative
+            if path.is_symlink() or not path.is_dir():
+                findings.append(Finding("ERROR", "registry", f"{name} has missing or unsafe {relative}"))
     if not any(item.subject == "registry" for item in findings):
         findings.append(
             Finding(
@@ -586,22 +618,30 @@ def _guard_is_locked(root: Path) -> bool:
             return False
 
 
-def _archived_receipt(path: Path) -> None:
-    def reject(value: str) -> None:
-        raise ValueError(f"non-standard JSON constant: {value}")
-
-    value = json.loads(path.read_text(encoding="utf-8"), parse_constant=reject)
-    if not isinstance(value, dict):
+def _archived_receipt(path: Path) -> tuple[dict, str]:
+    value = _strict_json(path)
+    if not isinstance(value, dict) or set(value) - {"id", "event", "captured_at", "cwd", "payload"}:
         raise ValueError("receipt must be an object")
-    if not isinstance(value.get("id"), str) or value.get("event") not in {
+    receipt_id = value.get("id")
+    if (not isinstance(receipt_id, str) or re.fullmatch(r"[A-Za-z0-9._-]+", receipt_id) is None
+            or len(receipt_id) > MAX_IDENTIFIER_CHARS or value.get("event") not in {
         "Stop",
         "SessionEnd",
-    }:
+    }):
         raise ValueError("receipt identity or event is invalid")
-    if not isinstance(value.get("captured_at"), str) or not isinstance(
-        value.get("payload"), dict
-    ):
+    if (not isinstance(value.get("captured_at"), str)
+            or not isinstance(value.get("cwd"), str)
+            or not isinstance(value.get("payload"), dict)
+            or not isinstance(value["payload"].get("session_id"), str)
+            or not value["payload"]["session_id"].strip()):
         raise ValueError("receipt timestamp or payload is invalid")
+    collision_name = re.fullmatch(
+        rf"{re.escape(receipt_id)}\.({_BATCH_ID.pattern})\.json", path.name
+    )
+    if path.name != f"{receipt_id}.json" and collision_name is None:
+        raise ValueError("receipt filename does not match its ID")
+    canonical = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+    return value, hashlib.sha256(canonical).hexdigest()
 
 
 def diagnose(
@@ -611,11 +651,14 @@ def diagnose(
     check_codex: bool = False,
     codex_command: str | None = None,
 ) -> DoctorReport:
-    """Inspect plugin and profile state without repairing or mutating it."""
+    """Inspect integrity, recovering durable interrupted transactions when idle."""
     profile_root = Path(root).expanduser().resolve()
     findings = _plugin_findings()
     for relative in PROFILE_FILES:
-        if not (profile_root / relative).is_file():
+        path = profile_root / relative
+        if path.is_symlink():
+            findings.append(Finding("ERROR", "profile", f"symlink is unsafe: {relative}"))
+        elif not path.is_file():
             findings.append(
                 Finding(
                     "ERROR",
@@ -624,7 +667,10 @@ def diagnose(
                 )
             )
     for relative in PROFILE_LAYOUT_DIRECTORIES:
-        if not (profile_root / relative).is_dir():
+        path = profile_root / relative
+        if path.is_symlink():
+            findings.append(Finding("ERROR", "profile", f"symlink is unsafe: {relative}"))
+        elif not path.is_dir():
             findings.append(
                 Finding(
                     "ERROR",
@@ -665,9 +711,25 @@ def diagnose(
     registry_findings, _ = _registry_findings(profile_root)
     findings.extend(registry_findings)
 
+    transaction_dir = profile_root / ".harness/state/transactions"
+    if transaction_dir.is_symlink():
+        findings.append(Finding("ERROR", "transaction", "transaction directory is a symlink"))
+    elif transaction_dir.exists() and any(transaction_dir.glob("*.json")):
+        if _guard_is_locked(profile_root):
+            findings.append(Finding("ERROR", "transaction", "interrupted transaction is still locked"))
+        else:
+            try:
+                recovered = recover_transactions(profile_root)
+            except (OSError, ValueError) as error:
+                findings.append(Finding("ERROR", "transaction", f"recovery failed: {error}"))
+            else:
+                findings.append(Finding("OK", "transaction", f"recovered {len(recovered)} interrupted transaction(s)"))
+
     for relative in RUNTIME_DIRECTORIES:
         path = profile_root / relative
-        if not path.is_dir():
+        if path.is_symlink():
+            findings.append(Finding("ERROR", "runtime", f"symlink is unsafe: {relative}"))
+        elif not path.is_dir():
             findings.append(
                 Finding(
                     "ERROR",
@@ -676,6 +738,14 @@ def diagnose(
                 )
             )
         elif not os.access(path, os.W_OK):
+            findings.append(Finding("ERROR", "runtime", f"directory is not writable: {relative}"))
+    for relative in OPTIONAL_RUNTIME_DIRECTORIES:
+        path = profile_root / relative
+        if path.is_symlink():
+            findings.append(Finding("ERROR", "runtime", f"symlink is unsafe: {relative}"))
+        elif path.exists() and not path.is_dir():
+            findings.append(Finding("ERROR", "runtime", f"unsafe runtime path: {relative}"))
+        elif path.exists() and not os.access(path, os.W_OK):
             findings.append(
                 Finding(
                     "ERROR", "runtime", f"directory is not writable: {relative}"
@@ -689,16 +759,20 @@ def diagnose(
         )
 
     receipt_errors = 0
-    receipt_paths = list((profile_root / ".harness/memory/inbox").glob("*.json"))
-    receipt_paths.extend(
-        (profile_root / ".harness/memory/processing").glob("*/*.json")
-    )
+    receipt_paths: list[Path] = []
+    inbox_root = profile_root / ".harness/memory/inbox"
+    processing_root = profile_root / ".harness/memory/processing"
+    if not inbox_root.is_symlink():
+        receipt_paths.extend(inbox_root.glob("*.json"))
+    if not processing_root.is_symlink():
+        receipt_paths.extend(processing_root.glob("*/*.json"))
     for path in receipt_paths:
         if path.name in {"batch.json", "result.json"}:
             continue
         try:
+            require_safe_path(profile_root, path, directory=False)
             _valid_receipt(path)
-        except (OSError, CurationError) as error:
+        except (OSError, ValueError, CurationError) as error:
             receipt_errors += 1
             findings.append(
                 Finding("ERROR", "receipt", f"invalid {path.name}: {error}")
@@ -711,9 +785,14 @@ def diagnose(
                 f"{len(receipt_paths)} active receipt files parse",
             )
         )
-    for path in (profile_root / ".harness/memory/archive/processed").glob("*.json"):
+    archive_digests: dict[str, tuple[str, str]] = {}
+    processed_root = profile_root / ".harness/memory/archive/processed"
+    archived_paths = () if processed_root.is_symlink() else processed_root.glob("*.json")
+    for path in archived_paths:
         try:
-            _archived_receipt(path)
+            require_safe_path(profile_root, path, directory=False)
+            value, digest = _archived_receipt(path)
+            archive_digests[path.name] = (value["id"], digest)
         except (OSError, UnicodeError, ValueError) as error:
             findings.append(
                 Finding("ERROR", "receipt", f"invalid {path.name}: {error}")
@@ -721,10 +800,38 @@ def diagnose(
 
     journal = profile_root / ".harness/memory/journal/curation.jsonl"
     try:
+        require_safe_path(profile_root, journal, directory=False)
         entries = verify_journal(journal)
     except (OSError, UnicodeError, ValueError) as error:
         findings.append(Finding("ERROR", "journal", str(error)))
     else:
+        for entry in entries:
+            references = entry.get("archived_receipts")
+            receipt_digests = entry.get("receipt_digests")
+            if references is None and receipt_digests is None:
+                continue
+            if not isinstance(references, list) or not isinstance(receipt_digests, dict):
+                findings.append(Finding("ERROR", "journal", "evidence binding fields are invalid"))
+                continue
+            for reference in references:
+                if not isinstance(reference, dict) or set(reference) != {"filename", "receipt_id", "digest"}:
+                    findings.append(Finding("ERROR", "journal", "archived receipt reference is invalid"))
+                    continue
+                actual = archive_digests.get(reference["filename"])
+                expected = (reference["receipt_id"], reference["digest"])
+                if actual != expected or receipt_digests.get(reference["receipt_id"]) != reference["digest"]:
+                    findings.append(Finding("ERROR", "journal", f"archived receipt evidence mismatch: {reference['filename']}"))
+            targets = entry.get("target_digests")
+            if not isinstance(entry.get("result_digest"), str) or len(entry["result_digest"]) != 64 or not isinstance(targets, dict):
+                findings.append(Finding("ERROR", "journal", "result or target digest binding is invalid"))
+            elif any(
+                not isinstance(relative, str)
+                or Path(relative).is_absolute()
+                or ".." in Path(relative).parts
+                or (digest is not None and (not isinstance(digest, str) or re.fullmatch(r"[a-f0-9]{64}", digest) is None))
+                for relative, digest in targets.items()
+            ):
+                findings.append(Finding("ERROR", "journal", "target digest map is invalid"))
         findings.append(
             Finding(
                 "OK", "journal", f"hash chain verified ({len(entries)} entries)"

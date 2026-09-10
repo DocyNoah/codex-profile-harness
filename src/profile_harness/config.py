@@ -7,7 +7,13 @@ import json
 from pathlib import Path
 import tomllib
 
-from .fs import atomic_write_text, atomic_write_text_if_missing, exclusive_write_text
+from .fs import (
+    atomic_write_text,
+    atomic_write_text_if_missing,
+    ensure_safe_directory,
+    exclusive_write_text,
+    require_safe_path,
+)
 
 
 PLUGIN_ROOT = Path(__file__).resolve().parents[2]
@@ -28,6 +34,12 @@ PROFILE_DIRECTORIES = (
     ".harness/improvements/accepted",
     ".harness/improvements/rejected",
     "projects",
+)
+OPTIONAL_RUNTIME_DIRECTORIES = (
+    ".harness/state/transactions",
+    ".harness/memory/archive/processed",
+    ".harness/memory/archive/dead-letter",
+    ".harness/memory/archive/snapshots",
 )
 DEFAULT_MAX_TEXT_CHARS = 4096
 DEFAULT_CODEX_COMMAND = "codex"
@@ -115,7 +127,10 @@ def _positive_number(value: object, field: str, errors: list[str]) -> float:
 def load_profile_config(root: Path) -> HarnessConfig:
     """Load the complete validated harness configuration."""
     profile_root = Path(root).expanduser().resolve()
-    config = _read_toml(profile_root / ".harness" / "config.toml")
+    config_path = require_safe_path(
+        profile_root, profile_root / ".harness" / "config.toml", directory=False
+    )
+    config = _read_toml(config_path)
     errors: list[str] = []
     version = config.get("version")
     name = config.get("name")
@@ -169,7 +184,10 @@ def load_profile(root: Path) -> ProfileConfig:
     profile_root = Path(root).expanduser().resolve()
     config = load_profile_config(profile_root)
 
-    projects = _read_toml(profile_root / "PROJECTS.toml")
+    projects_path = require_safe_path(
+        profile_root, profile_root / "PROJECTS.toml", directory=False
+    )
+    projects = _read_toml(projects_path)
     raw_repositories = projects.get("repositories", [])
     if projects.get("version") != 1 or not isinstance(raw_repositories, list):
         raise ValueError("PROJECTS.toml must contain version = 1 and repositories")
@@ -184,9 +202,9 @@ def load_profile(root: Path) -> ProfileConfig:
             raise ValueError("each repository must have a non-empty name")
         if not isinstance(relative_path, str) or not relative_path.strip():
             raise ValueError("each repository must have a non-empty path")
-        repositories.append(
-            RepositoryConfig(repo_name, (profile_root / relative_path).resolve())
-        )
+        candidate = profile_root / relative_path
+        require_safe_path(profile_root, candidate, directory=True)
+        repositories.append(RepositoryConfig(repo_name, candidate.resolve()))
     return ProfileConfig(profile_root, config.name, tuple(repositories))
 
 
@@ -200,10 +218,14 @@ def init_profile(root: Path, name: str) -> None:
         raise ValueError("profile name must not be empty")
     profile_root = Path(root).expanduser().resolve()
     for relative_directory in PROFILE_DIRECTORIES:
-        (profile_root / relative_directory).mkdir(parents=True, exist_ok=True)
+        ensure_safe_directory(profile_root, profile_root / relative_directory)
+    for relative_directory in OPTIONAL_RUNTIME_DIRECTORIES:
+        require_safe_path(profile_root, profile_root / relative_directory, directory=True)
 
     for source in _template_files(PROFILE_TEMPLATE_ROOT):
         destination = profile_root / source.relative_to(PROFILE_TEMPLATE_ROOT)
+        require_safe_path(PROFILE_TEMPLATE_ROOT, source, directory=False)
+        require_safe_path(profile_root, destination, directory=False)
         exclusive_write_text(destination, source.read_text(encoding="utf-8"))
 
     atomic_write_text_if_missing(
@@ -236,12 +258,32 @@ def register_repo(root: Path, name: str, path: Path) -> None:
     """Register an existing directory below the profile's projects directory."""
     if not name.strip():
         raise ValueError("repository name must not be empty")
+    requested_root = Path(root).expanduser().absolute()
+    repository_input = Path(path).expanduser().absolute()
+    try:
+        repository_relative = repository_input.relative_to(requested_root)
+        projects_relative = repository_input.relative_to(requested_root / "projects")
+    except ValueError as error:
+        raise ValueError(f"repository path must be below {requested_root / 'projects'}") from error
+    if projects_relative == Path("."):
+        raise ValueError(f"repository path must be below {requested_root / 'projects'}")
     profile = load_profile(root)
-    repository = Path(path).expanduser()
+    repository = profile.root / repository_relative
     if not repository.exists() or not repository.is_dir():
         raise ValueError(f"repository path must be a real directory: {path}")
+    projects_root = require_safe_path(
+        profile.root, profile.root / "projects", directory=True
+    )
+    resolved_repository = repository_input.resolve()
+    try:
+        resolved_relative = resolved_repository.relative_to(projects_root)
+    except ValueError as error:
+        raise ValueError(f"repository path must be below {profile.root / 'projects'}") from error
+    if resolved_relative == Path("."):
+        raise ValueError(f"repository path must be below {profile.root / 'projects'}")
+    require_safe_path(requested_root, repository_input, directory=True)
+    require_safe_path(profile.root, repository, directory=True)
     repository = repository.resolve()
-    projects_root = (profile.root / "projects").resolve()
     try:
         repository.relative_to(projects_root)
     except ValueError as error:
@@ -259,9 +301,11 @@ def register_repo(root: Path, name: str, path: Path) -> None:
 
     for source in _template_files(REPO_TEMPLATE_ROOT):
         destination = repository / source.relative_to(REPO_TEMPLATE_ROOT)
+        require_safe_path(REPO_TEMPLATE_ROOT, source, directory=False)
+        require_safe_path(repository, destination, directory=False)
         exclusive_write_text(destination, source.read_text(encoding="utf-8"))
-    (repository / "docs" / "decisions" / "archive").mkdir(
-        parents=True, exist_ok=True
+    ensure_safe_directory(
+        repository, repository / "docs" / "decisions" / "archive"
     )
 
     registrations = profile.repositories + (RepositoryConfig(name, repository),)

@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 from pathlib import Path
 from typing import Any
+
+from .fs import atomic_append_bytes
 
 
 GENESIS_HASH = "0" * 64
@@ -61,9 +62,5 @@ def append_entry(path: Path, payload: dict[str, Any]) -> dict[str, Any]:
         "previous_hash": entries[-1]["entry_hash"] if entries else GENESIS_HASH,
     }
     entry["entry_hash"] = hashlib.sha256(_canonical(entry)).hexdigest()
-    journal.parent.mkdir(parents=True, exist_ok=True)
-    with journal.open("ab") as handle:
-        handle.write(_canonical(entry) + b"\n")
-        handle.flush()
-        os.fsync(handle.fileno())
+    atomic_append_bytes(journal, _canonical(entry) + b"\n")
     return entry

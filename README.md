@@ -5,8 +5,9 @@ remain nested below the profile's `projects/` directory and are selected through
 `PROJECTS.toml`; they are not separate Codex projects.
 
 The hook path only captures immutable, redacted receipts. Curation is a separate
-manual or scheduled operation that validates fixed action types, snapshots
-changed files, appends a hash-chained journal, and archives processed receipts.
+manual or scheduled operation that validates fixed action types, binds canonical
+receipt/result/target digests, uses a durable write-ahead transaction, appends a
+hash-chained journal, and archives processed receipts.
 Profile identity and policy files are outside the curation write boundary.
 
 ## Requirements
@@ -52,6 +53,11 @@ cd "$PROFILE_ROOT"
 profile-harness curate --run
 profile-harness dashboard
 ```
+
+An empty inbox returns `{"status":"no_op"}` without creating a batch, invoking
+Codex, or appending to the journal. Interrupted curation is recovered under the
+profile lease on the next curate command (or by `doctor` while no curator owns
+the lease).
 
 Use `profile-harness --help` and subcommand help for the authoritative CLI.
 `DASHBOARD.md` is a generated index; edit repository `STATUS.md`, `TASKS.md`, and

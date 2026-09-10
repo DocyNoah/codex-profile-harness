@@ -279,6 +279,11 @@ class DoctorTests(unittest.TestCase):
                     lambda value: value.update({"required": []}),
                     "actions",
                 ),
+                (
+                    "schemas/hook-receipt.schema.json",
+                    lambda value: value["properties"]["id"].pop("maxLength"),
+                    "receipt ID",
+                ),
             )
             for index, (relative, mutate, expected) in enumerate(mutations):
                 with self.subTest(relative=relative):

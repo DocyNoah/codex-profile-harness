@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import os
 import subprocess
 
 from .config import PLUGIN_ROOT
@@ -42,6 +43,7 @@ def run_codex(
         text=True,
         check=True,
         timeout=timeout,
+        env={**os.environ, "PROFILE_HARNESS_CURATOR": "1"},
     )
     if not output.is_file():
         raise RuntimeError("codex completed without producing the result file")

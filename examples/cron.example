@@ -1,5 +1,6 @@
 # Install with: crontab -e
 # This example expects the profile at $HOME/codex-profiles/work and the executable
 # at $HOME/.local/bin/profile-harness.
+# Empty inboxes return no_op without invoking Codex or producing curation state.
 PATH=/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin
 15 * * * * mkdir -p "$HOME/.local/state/profile-harness" && cd "$HOME/codex-profiles/work" && "$HOME/.local/bin/profile-harness" curate --run >> "$HOME/.local/state/profile-harness/work.log" 2>&1 && "$HOME/.local/bin/profile-harness" dashboard >> "$HOME/.local/state/profile-harness/work.log" 2>&1

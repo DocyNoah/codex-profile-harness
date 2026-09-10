@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
+import hashlib
 import os
 from pathlib import Path
 import re
@@ -13,7 +14,13 @@ import uuid
 from typing import Any
 
 from .config import PLUGIN_ROOT, load_profile
-from .fs import atomic_copy_file, atomic_write_bytes, atomic_write_text
+from .fs import (
+    atomic_copy_file,
+    atomic_write_text,
+    ensure_safe_directory,
+    fsync_directory,
+    require_safe_path,
+)
 from .journal import append_entry
 
 
@@ -23,6 +30,7 @@ MAX_CONTENT_CHARS = 64_000
 MAX_IDENTIFIER_CHARS = 128
 MAX_PROMPT_CHARS = 500_000
 MAX_RESULT_BYTES = 1024 * 1024
+MAX_RECEIPT_BYTES = 1024 * 1024
 ACTION_TYPES = frozenset(
     {
         "profile_memory",
@@ -62,7 +70,51 @@ def _strict_json(path: Path) -> Any:
     def reject(value: str) -> None:
         raise ValueError(f"non-standard JSON constant: {value}")
 
-    return json.loads(path.read_text(encoding="utf-8"), parse_constant=reject)
+    if path.is_symlink():
+        raise ValueError(f"symlink JSON path is unsafe: {path}")
+    with path.open("rb") as handle:
+        raw = handle.read(MAX_RECEIPT_BYTES + 1)
+    if len(raw) > MAX_RECEIPT_BYTES:
+        raise ValueError("JSON file exceeds the bounded size limit")
+    return json.loads(raw.decode("utf-8"), parse_constant=reject)
+
+
+def _canonical_bytes(value: Any) -> bytes:
+    return json.dumps(
+        value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+
+
+def _digest(value: Any) -> str:
+    return hashlib.sha256(_canonical_bytes(value)).hexdigest()
+
+
+def _file_digest(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while chunk := handle.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _receipt_record(path: Path) -> dict[str, Any]:
+    receipt = _valid_receipt(path)
+    canonical = _canonical_bytes(receipt)
+    return {"id": receipt["id"], "sha256": hashlib.sha256(canonical).hexdigest(), "size": len(canonical)}
+
+
+def _safe_dir(root: Path, relative: str) -> Path:
+    try:
+        return require_safe_path(root, root / relative, directory=True)
+    except ValueError as error:
+        raise CurationError(str(error)) from error
+
+
+def _ensure_dir(root: Path, relative: str) -> Path:
+    try:
+        return ensure_safe_directory(root, root / relative)
+    except ValueError as error:
+        raise CurationError(str(error)) from error
 
 
 def _valid_receipt(path: Path) -> dict[str, Any]:
@@ -84,19 +136,32 @@ def _valid_receipt(path: Path) -> dict[str, Any]:
         raise CurationError("receipt ID must match its filename")
     if receipt.get("event") not in {"Stop", "SessionEnd"}:
         raise CurationError("receipt event is unsupported")
-    if not isinstance(receipt.get("captured_at"), str):
+    if not isinstance(receipt.get("captured_at"), str) or len(receipt["captured_at"]) > 64:
         raise CurationError("receipt captured_at is required")
-    if not isinstance(receipt.get("payload"), dict):
+    if not isinstance(receipt.get("cwd"), str) or len(receipt["cwd"]) > MAX_RECEIPT_BYTES:
+        raise CurationError("receipt cwd is required")
+    payload = receipt.get("payload")
+    allowed_payload = {"cwd", "last_assistant_message", "permission_mode", "reason", "session_id", "stop_hook_active", "transcript_path", "turn_id", "extra_keys"}
+    text_payload = allowed_payload - {"stop_hook_active", "extra_keys"}
+    if (not isinstance(payload, dict) or set(payload) - allowed_payload
+            or not isinstance(receipt["payload"].get("session_id"), str)
+            or not receipt["payload"]["session_id"].strip()
+            or any(key in payload and (not isinstance(payload[key], str) or len(payload[key]) > MAX_RECEIPT_BYTES) for key in text_payload)
+            or ("stop_hook_active" in payload and not isinstance(payload["stop_hook_active"], bool))
+            or ("extra_keys" in payload and (not isinstance(payload["extra_keys"], list)
+                or len(payload["extra_keys"]) > 10_000
+                or any(not isinstance(item, str) or len(item) > MAX_RECEIPT_BYTES for item in payload["extra_keys"])) )):
         raise CurationError("receipt payload must be an object")
     return receipt
 
 
 def _dead_letter(root: Path, path: Path, reason: str) -> None:
-    destination_root = root / ".harness/memory/archive/dead-letter"
-    destination_root.mkdir(parents=True, exist_ok=True)
+    destination_root = _ensure_dir(root, ".harness/memory/archive/dead-letter")
     suffix = "" if not (destination_root / path.name).exists() else f".{uuid.uuid4().hex}"
     destination = destination_root / f"{path.stem}{suffix}.json"
+    require_safe_path(root, destination, directory=False)
     os.replace(path, destination)
+    fsync_directory(destination_root)
     atomic_write_text(destination.with_suffix(".reason"), reason.strip() + "\n")
 
 
@@ -112,10 +177,11 @@ def claim_receipts(root: Path, limit: int | None = None) -> CurationBatch:
     if limit is not None and (isinstance(limit, bool) or limit < 1):
         raise CurationError("limit must be a positive integer")
     batch_id = _batch_id()
-    batch_path = profile_root / ".harness/memory/processing" / batch_id
-    batch_path.mkdir(parents=True)
+    processing = _safe_dir(profile_root, ".harness/memory/processing")
+    batch_path = processing / batch_id
+    ensure_safe_directory(profile_root, batch_path)
     receipt_ids: list[str] = []
-    inbox = profile_root / ".harness/memory/inbox"
+    inbox = _safe_dir(profile_root, ".harness/memory/inbox")
     try:
         for path in sorted(inbox.glob("*.json")):
             if limit is not None and len(receipt_ids) >= limit:
@@ -128,6 +194,8 @@ def claim_receipts(root: Path, limit: int | None = None) -> CurationBatch:
             destination = batch_path / path.name
             try:
                 os.replace(path, destination)
+                fsync_directory(inbox)
+                fsync_directory(batch_path)
             except FileNotFoundError:
                 continue
             receipt_ids.append(receipt["id"])
@@ -138,8 +206,7 @@ def claim_receipts(root: Path, limit: int | None = None) -> CurationBatch:
 
 
 def _return_receipts(root: Path, batch_path: Path) -> None:
-    inbox = root / ".harness/memory/inbox"
-    inbox.mkdir(parents=True, exist_ok=True)
+    inbox = _safe_dir(root, ".harness/memory/inbox")
     if not batch_path.exists():
         return
     for receipt in batch_path.glob("*.json"):
@@ -155,6 +222,7 @@ def _return_receipts(root: Path, batch_path: Path) -> None:
             _dead_letter(root, receipt, "duplicate receipt while returning failed batch")
         else:
             os.replace(receipt, destination)
+            fsync_directory(inbox)
     shutil.rmtree(batch_path, ignore_errors=True)
 
 
@@ -163,6 +231,10 @@ def prepare_curation(root: Path, limit: int | None = None) -> CurationBatch:
     profile_root = Path(root).resolve()
     batch = claim_receipts(profile_root, limit)
     try:
+        if not batch.receipt_ids:
+            batch.path.rmdir()
+            fsync_directory(batch.path.parent)
+            return batch
         receipts = [
             _valid_receipt(batch.path / f"{receipt_id}.json")
             for receipt_id in batch.receipt_ids
@@ -177,6 +249,10 @@ def prepare_curation(root: Path, limit: int | None = None) -> CurationBatch:
         manifest = {
             "batch_id": batch.batch_id,
             "receipt_ids": list(batch.receipt_ids),
+            "receipts": [
+                _receipt_record(batch.path / f"{receipt_id}.json")
+                for receipt_id in batch.receipt_ids
+            ],
             "created_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         }
         atomic_write_text(
@@ -232,6 +308,7 @@ def validate_actions(
             not isinstance(item, str)
             or not item
             or len(item) > MAX_IDENTIFIER_CHARS
+            or _RECEIPT_ID.fullmatch(item) is None
             for item in sources
         ):
             raise CurationError("source receipt IDs must be an array of strings")
@@ -255,7 +332,7 @@ def validate_actions(
             repository = action.get("repository")
             if (
                 not isinstance(repository, str)
-                or not repository
+                or not repository.strip()
                 or len(repository) > MAX_IDENTIFIER_CHARS
             ):
                 raise CurationError("repository name must be a bounded string")
@@ -266,7 +343,7 @@ def validate_actions(
             if not isinstance(supersedes, list) or any(
                 not isinstance(value, str)
                 or len(value) > 20
-                or not value.isdigit()
+                or re.fullmatch(r"[0-9]+", value) is None
                 for value in supersedes
             ):
                 raise CurationError("supersedes must contain only numeric ADR IDs")
@@ -290,7 +367,7 @@ def _read_batch(batch_path: Path) -> tuple[str, ...]:
     except (OSError, ValueError, json.JSONDecodeError) as error:
         raise CurationError("processing batch manifest is invalid") from error
     if not isinstance(manifest, dict) or set(manifest) != {
-        "batch_id", "receipt_ids", "created_at"
+        "batch_id", "receipt_ids", "receipts", "created_at"
     }:
         raise CurationError("processing batch manifest has an invalid shape")
     if manifest["batch_id"] != batch_path.name:
@@ -310,8 +387,11 @@ def _read_batch(batch_path: Path) -> tuple[str, ...]:
     }
     if set(ids) != set(actual_paths):
         raise CurationError("processing manifest receipt set does not match its files")
-    for item in ids:
-        _valid_receipt(actual_paths[item])
+    records = manifest.get("receipts")
+    if not isinstance(records, list) or records != [
+        _receipt_record(actual_paths[item]) for item in ids
+    ]:
+        raise CurationError("processing receipt digest does not match its manifest")
     return tuple(ids)
 
 
@@ -395,51 +475,186 @@ def _require_safe_target(root: Path, scope: Path, target: Path) -> Path:
     return target
 
 
+def _transaction_path(root: Path, batch_id: str) -> Path:
+    transactions = root / ".harness/state/transactions"
+    try:
+        ensure_safe_directory(root, transactions)
+    except ValueError as error:
+        raise CurationError(str(error)) from error
+    return transactions / f"{batch_id}.json"
+
+
+def _publish_transaction(path: Path, transaction: dict[str, Any]) -> None:
+    atomic_write_text(path, json.dumps(transaction, sort_keys=True, indent=2) + "\n")
+
+
+def _transaction_member(root: Path, value: object, *, directory: bool | None = None) -> Path:
+    if not isinstance(value, str) or not value or Path(value).is_absolute() or ".." in Path(value).parts:
+        raise CurationError("transaction contains an unsafe path")
+    try:
+        return require_safe_path(root, root / value, directory=directory)
+    except ValueError as error:
+        raise CurationError(str(error)) from error
+
+
+def _restore_transaction(root: Path, transaction_path: Path, transaction: dict[str, Any]) -> None:
+    batch_path = _transaction_member(root, transaction["batch_path"], directory=True)
+    for archive in reversed(transaction.get("archives", [])):
+        source = _transaction_member(root, archive["source"], directory=False)
+        destination = _transaction_member(root, archive["destination"], directory=False)
+        if destination.exists() and not source.exists():
+            source.parent.mkdir(parents=True, exist_ok=True)
+            os.replace(destination, source)
+    for target_data in reversed(transaction.get("targets", [])):
+        target = _transaction_member(root, target_data["path"], directory=False)
+        if target_data["existed"]:
+            snapshot = _transaction_member(root, target_data["snapshot"], directory=False)
+            if snapshot.is_file():
+                atomic_copy_file(snapshot, target)
+                if isinstance(target_data.get("mode"), int):
+                    target.chmod(target_data["mode"])
+        else:
+            target.unlink(missing_ok=True)
+    journal_data = transaction.get("journal", {})
+    journal = root / ".harness/memory/journal/curation.jsonl"
+    if journal_data.get("existed"):
+        snapshot = _transaction_member(root, journal_data["snapshot"], directory=False)
+        if snapshot.is_file():
+            atomic_copy_file(snapshot, journal)
+            if isinstance(journal_data.get("mode"), int):
+                journal.chmod(journal_data["mode"])
+    else:
+        journal.unlink(missing_ok=True)
+    _return_receipts(root, batch_path)
+    transaction_path.unlink(missing_ok=True)
+    fsync_directory(transaction_path.parent)
+
+
+def _complete_transaction(root: Path, transaction_path: Path, transaction: dict[str, Any]) -> None:
+    for archive in transaction.get("archives", []):
+        source = _transaction_member(root, archive["source"], directory=False)
+        destination = _transaction_member(root, archive["destination"], directory=False)
+        if source.exists() and not destination.exists():
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            os.replace(source, destination)
+    batch_path = _transaction_member(root, transaction["batch_path"], directory=True)
+    if batch_path.exists():
+        shutil.rmtree(batch_path)
+    transaction_path.unlink(missing_ok=True)
+    fsync_directory(transaction_path.parent)
+
+
+def recover_transactions(root: Path) -> tuple[str, ...]:
+    """Recover durable pre-commit transactions or finish committed cleanup."""
+    profile_root = Path(root).resolve()
+    directory = profile_root / ".harness/state/transactions"
+    try:
+        require_safe_path(profile_root, directory, directory=True)
+    except ValueError as error:
+        raise CurationError(str(error)) from error
+    if not directory.exists():
+        return ()
+    recovered: list[str] = []
+    for transaction_path in sorted(directory.glob("*.json")):
+        transaction = _strict_json(transaction_path)
+        if not isinstance(transaction, dict) or transaction.get("version") != 1:
+            raise CurationError(f"invalid transaction descriptor: {transaction_path.name}")
+        batch_id = transaction.get("batch_id")
+        if not isinstance(batch_id, str) or _BATCH_ID.fullmatch(batch_id) is None or transaction_path.name != f"{batch_id}.json":
+            raise CurationError(f"invalid transaction identity: {transaction_path.name}")
+        if transaction.get("state") == "committed":
+            _complete_transaction(profile_root, transaction_path, transaction)
+        else:
+            _restore_transaction(profile_root, transaction_path, transaction)
+        recovered.append(str(transaction.get("batch_id", transaction_path.stem)))
+    return tuple(recovered)
+
+
 def apply_actions(
     root: Path,
     batch_id: str,
     result: dict[str, Any],
     *,
     fail_after_writes: int | None = None,
+    crash_after_stage: str | None = None,
 ) -> ApplyResult:
     """Apply one validated batch transactionally, restoring it on any failure."""
     profile = load_profile(root)
     if not isinstance(batch_id, str) or _BATCH_ID.fullmatch(batch_id) is None:
         raise CurationError("batch ID is invalid")
     batch_path = profile.root / ".harness/memory/processing" / batch_id
-    receipt_ids: tuple[str, ...] = ()
-    snapshots: dict[Path, Path] = {}
-    created: set[Path] = set()
-    changed: list[Path] = []
     journal = profile.root / ".harness/memory/journal/curation.jsonl"
-    journal_before = journal.read_bytes() if journal.exists() else None
-    journal_before_mode = journal.stat().st_mode if journal.exists() else None
+    _safe_dir(profile.root, ".harness/memory/processing")
+    try:
+        require_safe_path(profile.root, batch_path, directory=True)
+        require_safe_path(profile.root, journal.parent, directory=True)
+        require_safe_path(profile.root, journal, directory=False)
+    except ValueError as error:
+        raise CurationError(str(error)) from error
+    receipt_ids: tuple[str, ...] = ()
+    changed: list[Path] = []
     snapshot_root = profile.root / ".harness/memory/archive/snapshots" / batch_id
     repositories = {
         repository.name: repository.path for repository in profile.repositories
     }
     writes = 0
-    archived_receipts: list[tuple[Path, Path]] = []
+    transaction_path = _transaction_path(profile.root, batch_id)
+    transaction: dict[str, Any] | None = None
+
+    def crash(stage: str) -> None:
+        if crash_after_stage == stage:
+            os._exit(91)
 
     def write(target: Path, content: str, allowed_scope: Path) -> None:
         nonlocal writes
         safe_target = _require_safe_target(profile.root, allowed_scope, target)
-        if safe_target not in snapshots and safe_target not in created:
+        assert transaction is not None
+        known = {item["path"] for item in transaction["targets"]}
+        relative_target = str(safe_target.relative_to(profile.root))
+        if relative_target not in known:
             if safe_target.exists():
                 snapshot = _snapshot_path(profile.root, snapshot_root, safe_target)
-                snapshot.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(safe_target, snapshot)
-                snapshots[safe_target] = snapshot
+                ensure_safe_directory(profile.root, snapshot.parent)
+                atomic_copy_file(safe_target, snapshot)
+                record = {"path": relative_target, "existed": True, "snapshot": str(snapshot.relative_to(profile.root)), "mode": safe_target.stat().st_mode}
             else:
-                created.add(safe_target)
+                record = {"path": relative_target, "existed": False, "snapshot": None, "mode": None}
+            transaction["targets"].append(record)
+        record = next(item for item in transaction["targets"] if item["path"] == relative_target)
+        record["intended_digest"] = hashlib.sha256(content.encode("utf-8")).hexdigest()
+        _publish_transaction(transaction_path, transaction)
         atomic_write_text(safe_target, content)
         changed.append(safe_target)
         writes += 1
         if fail_after_writes is not None and writes >= fail_after_writes:
             raise RuntimeError("injected write failure")
+        if writes == 1:
+            crash("after_first_write")
 
     try:
         receipt_ids = _read_batch(batch_path)
+        ensure_safe_directory(profile.root, snapshot_root)
+        journal_snapshot = snapshot_root / "journal.before"
+        if journal.exists():
+            atomic_copy_file(journal, journal_snapshot)
+        archive = _ensure_dir(profile.root, ".harness/memory/archive/processed")
+        archives = []
+        for receipt_id in receipt_ids:
+            source = batch_path / f"{receipt_id}.json"
+            destination = archive / source.name
+            if destination.exists():
+                destination = archive / f"{receipt_id}.{batch_id}.json"
+            archives.append({"source": str(source.relative_to(profile.root)), "destination": str(destination.relative_to(profile.root)), "digest": _receipt_record(source)["sha256"]})
+        transaction = {
+            "version": 1,
+            "batch_id": batch_id,
+            "state": "applying",
+            "batch_path": str(batch_path.relative_to(profile.root)),
+            "targets": [],
+            "archives": archives,
+            "journal": {"existed": journal.exists(), "snapshot": str(journal_snapshot.relative_to(profile.root)) if journal.exists() else None, "mode": journal.stat().st_mode if journal.exists() else None},
+        }
+        _publish_transaction(transaction_path, transaction)
         projects_root = (profile.root / "projects").resolve()
         for repository in repositories.values():
             try:
@@ -452,6 +667,14 @@ def apply_actions(
                 raise CurationError(
                     "registered repository must remain below the profile projects directory"
                 )
+            try:
+                require_safe_path(profile.root, repository, directory=True)
+                for relative in ("docs", "docs/decisions", "docs/decisions/archive"):
+                    require_safe_path(profile.root, repository / relative, directory=True)
+                for filename in ("STATUS.md", "TASKS.md", "DECISIONS.md"):
+                    require_safe_path(profile.root, repository / filename, directory=False)
+            except ValueError as error:
+                raise CurationError(str(error)) from error
         actions = validate_actions(result, set(receipt_ids), set(repositories))
         for action in actions:
             action_type = action["type"]
@@ -498,46 +721,54 @@ def apply_actions(
                 active[number_text] = (filename, action["title"].strip())
                 write(repository / "DECISIONS.md", _decision_index(active), repository)
 
+        receipt_digests = {
+            receipt_id: _receipt_record(batch_path / f"{receipt_id}.json")["sha256"]
+            for receipt_id in receipt_ids
+        }
+        target_digests = {
+            str(path.relative_to(profile.root)): _file_digest(path) if path.exists() else None
+            for path in dict.fromkeys(changed)
+        }
+        archived_evidence = [
+            {"filename": Path(item["destination"]).name, "receipt_id": receipt_id, "digest": receipt_digests[receipt_id]}
+            for receipt_id, item in zip(receipt_ids, transaction["archives"])
+        ]
         journal_entry = append_entry(
             journal,
             {
                 "batch_id": batch_id,
                 "receipt_ids": list(receipt_ids),
+                "receipt_digests": receipt_digests,
+                "result_digest": _digest(result),
+                "target_digests": target_digests,
+                "archived_receipts": archived_evidence,
                 "actions": len(actions),
                 "changed_paths": [str(path.relative_to(profile.root)) for path in changed],
                 "applied_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
             },
         )
-        archive = profile.root / ".harness/memory/archive/processed"
-        archive.mkdir(parents=True, exist_ok=True)
-        for receipt_id in receipt_ids:
-            source = batch_path / f"{receipt_id}.json"
-            destination = archive / source.name
-            if destination.exists():
-                destination = archive / f"{receipt_id}.{batch_id}.json"
+        crash("after_journal")
+        transaction["state"] = "committed"
+        _publish_transaction(transaction_path, transaction)
+        crash("after_commit")
+        for item in transaction["archives"]:
+            source = profile.root / item["source"]
+            destination = profile.root / item["destination"]
             os.replace(source, destination)
-            archived_receipts.append((source, destination))
+            fsync_directory(destination.parent)
         shutil.rmtree(batch_path)
+        fsync_directory(batch_path.parent)
+        transaction_path.unlink(missing_ok=True)
+        fsync_directory(transaction_path.parent)
         return ApplyResult(batch_id, tuple(dict.fromkeys(changed)), journal_entry)
     except BaseException:
-        for source, destination in reversed(archived_receipts):
-            source.parent.mkdir(parents=True, exist_ok=True)
-            if destination.exists():
-                os.replace(destination, source)
-        for target in reversed(tuple(created)):
-            target.unlink(missing_ok=True)
-        for target, snapshot in snapshots.items():
-            target.parent.mkdir(parents=True, exist_ok=True)
-            atomic_copy_file(snapshot, target)
-            target.chmod(snapshot.stat().st_mode)
-        if journal_before is None:
-            journal.unlink(missing_ok=True)
+        if transaction is not None and transaction_path.exists():
+            if transaction.get("state") == "committed":
+                _complete_transaction(profile.root, transaction_path, transaction)
+            else:
+                _restore_transaction(profile.root, transaction_path, transaction)
         else:
-            journal.parent.mkdir(parents=True, exist_ok=True)
-            atomic_write_bytes(journal, journal_before)
-            if journal_before_mode is not None:
-                journal.chmod(journal_before_mode)
-        _return_receipts(profile.root, batch_path)
+            _return_receipts(profile.root, batch_path)
         raise
 
 

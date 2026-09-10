@@ -21,6 +21,7 @@ from .curation import (
     find_single_batch,
     load_result,
     prepare_curation,
+    recover_transactions,
 )
 from .dashboard import generate_dashboard
 from .doctor import diagnose
@@ -116,12 +117,13 @@ def _curate(arguments: argparse.Namespace) -> int:
     root = find_profile_root(Path.cwd())
     command, timeout, stale_timeout = _curation_settings(root)
     with ProfileLease(root, stale_timeout=stale_timeout):
+        recover_transactions(root)
         if arguments.prepare:
             if arguments.batch_id is not None:
                 raise ValueError("--batch is only valid with --apply")
             batch = prepare_curation(root, arguments.limit)
             output = {
-                "status": "prepared",
+                "status": "prepared" if batch.receipt_ids else "no_op",
                 "batch_id": batch.batch_id,
                 "receipt_ids": list(batch.receipt_ids),
                 "prompt_path": str(batch.prompt_path),
@@ -140,6 +142,9 @@ def _curate(arguments: argparse.Namespace) -> int:
             if arguments.batch_id is not None:
                 raise ValueError("--batch is only valid with --apply")
             batch = prepare_curation(root, arguments.limit)
+            if not batch.receipt_ids:
+                print(json.dumps({"status": "no_op", "receipt_ids": []}, sort_keys=True))
+                return 0
             result_path = batch.path / "result.json"
             try:
                 run_codex(
