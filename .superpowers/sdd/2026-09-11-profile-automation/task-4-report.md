@@ -81,3 +81,59 @@ binary release files.
   still present in development history. The controller must exclude them and use
   the approved single-release-root history before public push.
 - GitHub repository creation and push were explicitly left to the controller.
+
+## Reviewer fix round 1
+
+Implementation commit: `0e3006dd6047fc098eb29eebd0723c6141940861`.
+
+RED evidence: the expanded public-package suite initially ran 13 tests with one
+failure and six errors. It demonstrated that unrelated/profile targets were not
+strongly identified, Codex/file rollback state was not modeled, malformed
+manifest/skill fixtures had no standalone validators, and README incorrectly
+claimed generated config contained explicit defaults. Additional RED assertions
+showed failed installations left the newly created binary directory and a failed
+marketplace tree behind.
+
+Fixes:
+
+- Existing destinations now require the exact Harness marketplace name, one
+  fixed plugin selector/source/policy, a semver Harness manifest/author, the
+  reviewed hook commands, and the Harness executable. Profile markers,
+  unrelated directories, unsafe identity files, and unrelated executable links
+  are rejected before mutation.
+- All filesystem and binary validation/replacement occurs before Codex
+  registration. The explicit Codex boundary inspects marketplace/plugin state,
+  confirms success, and compensates partial failures to the inspected prior
+  state. New-install, upgrade, and mutate-then-fail cases verify complete file,
+  link, marketplace, and plugin restoration.
+- CI now covers Python 3.11 and current Python 3.14 and accurately names the
+  standalone contract validation step.
+- The dependency-free validator actually parses and validates manifest JSON and
+  the supported YAML frontmatter mapping/skill contract. Malformed fixtures are
+  executable regression tests.
+- README now states that initialization writes minimal config and provides an
+  exact optional override example matching runtime fields/defaults.
+
+Fresh verification:
+
+```text
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -q
+Ran 170 tests in 42.347s — OK
+
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_public_package -q
+Ran 15 tests — OK
+
+PYTHONDONTWRITEBYTECODE=1 python3 scripts/validate_release.py
+release validation: ok
+```
+
+Official local plugin and skill validators also passed through the temporary
+PyYAML compatibility shim. Compileall, cache cleanup, `git diff --check`, secret,
+absolute-path, placeholder, cache, `.DS_Store`, large-file, and binary scans
+passed for the intended public tree.
+
+Remaining concern: real Codex configuration was not mutated. The subprocess
+boundary was checked against actual read-only `codex plugin ... list --json`
+output; all mutation and compensation paths use stateful injected boundaries in
+tests. The controller must still exclude internal planning/review files from the
+single-root public history.
