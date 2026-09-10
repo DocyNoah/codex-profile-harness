@@ -7,6 +7,7 @@ from urllib.parse import quote
 
 from .config import load_profile
 from .fs import atomic_write_text, require_safe_path
+from .profile_git import inspect_profile_git
 
 
 INDEXES = (
@@ -56,6 +57,22 @@ def generate_dashboard(root: Path) -> Path:
         "This is a generated index. Edit each repository's source indexes, "
         "not this file.",
     ]
+    git = inspect_profile_git(profile.root)
+    if git.initialized:
+        head = git.last_commit_sha[:12] if git.last_commit_sha else "none"
+        location = "detached HEAD" if git.detached else (git.branch or "unborn branch")
+        dirty = ", ".join(git.dirty_paths) if git.dirty_paths else "clean"
+        lines.extend((
+            "",
+            "## Git checkpoint",
+            "",
+            f"- Branch: {location}",
+            f"- Last commit: {head}" + (f" — {git.last_subject}" if git.last_subject else ""),
+            f"- Managed paths: {dirty}",
+            f"- Remote: {'configured' if git.has_remote else 'not configured'}",
+        ))
+    else:
+        lines.extend(("", "## Git checkpoint", "", f"Unavailable: {git.error or 'not initialized'}"))
     if not profile.repositories:
         lines.extend(("", "No repositories are registered yet."))
     for registered in profile.repositories:

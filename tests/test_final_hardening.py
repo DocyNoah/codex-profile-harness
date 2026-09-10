@@ -318,7 +318,7 @@ class FinalHardeningTests(unittest.TestCase):
             (transactions / "pending.json").write_text("{}", encoding="utf-8")
             observed = []
 
-            def recovery(profile_root: Path) -> tuple[str, ...]:
+            def recovery(profile_root: Path, **_options) -> tuple[str, ...]:
                 try:
                     with ProfileLease(profile_root):
                         observed.append("unlocked")
@@ -401,6 +401,43 @@ class FinalHardeningTests(unittest.TestCase):
             descriptor_index = events.index(("descriptor", descriptor))
             self.assertLess(events.index(("fsync", archive)), descriptor_index)
             self.assertLess(events.index(("fsync", processing)), descriptor_index)
+            self.assertEqual(
+                "harness: recover profile state",
+                subprocess.run(
+                    ["git", "-C", str(root), "log", "-1", "--format=%s"],
+                    text=True, capture_output=True, check=True,
+                ).stdout.strip(),
+            )
+
+    def test_precommit_recovery_does_not_checkpoint_unrelated_managed_dirtiness(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root, _ = self.make_profile(Path(temporary_directory))
+            (root / "MEMORY.md").write_text("user work in progress\n", encoding="utf-8")
+            self.add_receipt(root)
+            batch = prepare_curation(root)
+            self._crash_apply(root, batch.batch_id, {
+                "type": "profile_proposal",
+                "title": "Rolled back",
+                "content": "body",
+                "source_receipt_ids": ["one"],
+            }, "after_first_write")
+
+            recover_transactions(root)
+
+            self.assertNotEqual(
+                "harness: recover profile state",
+                subprocess.run(
+                    ["git", "-C", str(root), "log", "-1", "--format=%s"],
+                    text=True, capture_output=True, check=True,
+                ).stdout.strip(),
+            )
+            self.assertIn(
+                "MEMORY.md",
+                subprocess.run(
+                    ["git", "-C", str(root), "status", "--short"],
+                    text=True, capture_output=True, check=True,
+                ).stdout,
+            )
 
 
 if __name__ == "__main__":

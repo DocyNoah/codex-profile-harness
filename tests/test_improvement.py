@@ -150,6 +150,13 @@ class ImprovementTests(unittest.TestCase):
             output = run_improvement(root, now=NOW, force=True)
 
             self.assertEqual("performed", output["status"])
+            self.assertEqual(
+                "harness: propose profile improvement",
+                subprocess.run(
+                    ["git", "-C", str(root), "log", "-1", "--format=%s"],
+                    text=True, capture_output=True, check=True,
+                ).stdout.strip(),
+            )
             proposals = list((root / ".harness/improvements/proposed").glob("*.md"))
             self.assertEqual(1, len(proposals))
             journal = verify_journal(root / ".harness/memory/journal/improvement.jsonl")
@@ -534,6 +541,14 @@ class ImprovementTests(unittest.TestCase):
                 self.assertEqual(keep, bool(list((root / ".harness/improvements/proposed").glob("*.md"))))
                 self.assertEqual(keep, (root / ".harness/memory/journal/improvement.jsonl").exists())
                 self.assertFalse((root / ".harness/state/improvement-transaction.json").exists())
+                if keep:
+                    self.assertEqual(
+                        "harness: recover profile state",
+                        subprocess.run(
+                            ["git", "-C", str(root), "log", "-1", "--format=%s"],
+                            text=True, capture_output=True, check=True,
+                        ).stdout.strip(),
+                    )
 
     def test_authentic_legacy_curation_is_normalized_in_memory_without_rewrite(self) -> None:
         legacy_receipt = (

@@ -649,7 +649,7 @@ def _complete_transaction(root: Path, transaction_path: Path, transaction: dict[
     _durable_unlink(transaction_path)
 
 
-def recover_transactions(root: Path) -> tuple[str, ...]:
+def recover_transactions(root: Path, *, checkpoint: bool = True) -> tuple[str, ...]:
     """Recover durable pre-commit transactions or finish committed cleanup."""
     profile_root = Path(root).resolve()
     directory = profile_root / ".harness/state/transactions"
@@ -660,6 +660,7 @@ def recover_transactions(root: Path) -> tuple[str, ...]:
     if not directory.exists():
         return ()
     recovered: list[str] = []
+    recovered_committed_state = False
     for transaction_path in sorted(directory.glob("*.json")):
         transaction = _strict_json(transaction_path)
         if not isinstance(transaction, dict) or transaction.get("version") != 1:
@@ -668,11 +669,17 @@ def recover_transactions(root: Path) -> tuple[str, ...]:
         if not isinstance(batch_id, str) or _BATCH_ID.fullmatch(batch_id) is None or transaction_path.name != f"{batch_id}.json":
             raise CurationError(f"invalid transaction identity: {transaction_path.name}")
         if transaction.get("state") == "committed":
+            recovered_committed_state = True
             _complete_transaction(profile_root, transaction_path, transaction)
         else:
             _restore_transaction(profile_root, transaction_path, transaction)
         recovered.append(str(transaction.get("batch_id", transaction_path.stem)))
-    return tuple(recovered)
+    result = tuple(recovered)
+    if recovered_committed_state and checkpoint:
+        from .profile_git import RECOVERY_SUBJECT, checkpoint_profile
+
+        checkpoint_profile(profile_root, RECOVERY_SUBJECT)
+    return result
 
 
 def apply_actions(
@@ -869,7 +876,11 @@ def apply_actions(
             _durable_replace(source, destination)
         _durable_rmtree(batch_path)
         _durable_unlink(transaction_path)
-        return ApplyResult(batch_id, tuple(dict.fromkeys(changed)), journal_entry)
+        applied = ApplyResult(batch_id, tuple(dict.fromkeys(changed)), journal_entry)
+        from .profile_git import CURATION_SUBJECT, checkpoint_profile
+
+        checkpoint_profile(profile.root, CURATION_SUBJECT)
+        return applied
     except BaseException:
         if transaction is not None and transaction_path.exists():
             if transaction.get("state") == "committed":

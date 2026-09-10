@@ -347,7 +347,7 @@ def _validated_transaction(
     return transaction, journal, snapshot, tuple(validated_targets)
 
 
-def recover_improvement_transaction(root: Path) -> bool:
+def recover_improvement_transaction(root: Path, *, checkpoint: bool = True) -> bool:
     """Validate every WAL member, then roll back or finish cleanup."""
     profile_root = Path(root).resolve()
     try:
@@ -413,6 +413,10 @@ def recover_improvement_transaction(root: Path) -> bool:
     if snapshot is not None:
         snapshot.unlink()
         fsync_directory(snapshot.parent)
+    if matching and checkpoint:
+        from .profile_git import RECOVERY_SUBJECT, checkpoint_profile
+
+        checkpoint_profile(profile_root, RECOVERY_SUBJECT)
     return True
 
 
@@ -521,12 +525,16 @@ def _run_locked(
             atomic_write_text(descriptor, json.dumps(transaction, sort_keys=True, indent=2) + "\n")
             if crash_after_stage == "after_commit":
                 os._exit(91)
-            recover_improvement_transaction(root)
-            return {
+            recover_improvement_transaction(root, checkpoint=False)
+            output = {
                 "status": "performed", "reason": "forced" if force else due.reason,
                 "new_curations": due.new_curations,
                 "proposals": [str(path) for path in created], "journal_entry_hash": entry["entry_hash"],
             }
+            from .profile_git import IMPROVEMENT_SUBJECT, checkpoint_profile
+
+            checkpoint_profile(root, IMPROVEMENT_SUBJECT)
+            return output
         except BaseException:
             if descriptor.exists():
                 recover_improvement_transaction(root)

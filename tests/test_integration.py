@@ -49,6 +49,7 @@ class EndToEndTests(unittest.TestCase):
                     str(repository),
                 )
                 self.assertEqual(0, registered.returncode, registered.stderr)
+            (profile / "MEMORY.md").write_text("checkpoint before hook\n", encoding="utf-8")
             web_before = {
                 path.relative_to(web): path.read_bytes()
                 for path in web.rglob("*")
@@ -72,6 +73,21 @@ class EndToEndTests(unittest.TestCase):
                 )
                 self.assertEqual(0, captured.returncode, captured.stderr)
                 captures.append(json.loads(captured.stdout))
+                if len(captures) == 1:
+                    self.assertEqual(
+                        "harness: checkpoint profile documents",
+                        subprocess.run(
+                            ["git", "-C", str(profile), "log", "-1", "--format=%s"],
+                            text=True, capture_output=True, check=True,
+                        ).stdout.strip(),
+                    )
+                    self.assertEqual(
+                        "checkpoint before hook\n",
+                        subprocess.run(
+                            ["git", "-C", str(profile), "show", "HEAD:MEMORY.md"],
+                            text=True, capture_output=True, check=True,
+                        ).stdout,
+                    )
             receipt_ids = [item["receipt_id"] for item in captures]
             self.assertEqual(2, len(set(receipt_ids)))
 
@@ -110,6 +126,13 @@ class EndToEndTests(unittest.TestCase):
                 batch_id,
             )
             self.assertEqual(0, applied.returncode, applied.stderr)
+            self.assertEqual(
+                "harness: curate profile memory",
+                subprocess.run(
+                    ["git", "-C", str(profile), "log", "-1", "--format=%s"],
+                    text=True, capture_output=True, check=True,
+                ).stdout.strip(),
+            )
 
             dashboard = self.run_cli(profile, "dashboard")
             self.assertEqual(0, dashboard.returncode, dashboard.stderr)

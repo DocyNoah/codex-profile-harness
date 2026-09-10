@@ -1,0 +1,13 @@
+projects/
+DASHBOARD.md
+.harness/memory/inbox/
+.harness/memory/processing/
+.harness/memory/archive/
+.harness/memory/episodes/
+.harness/state/
+.harness/logs/
+.harness/config.local.toml
+.DS_Store
+__pycache__/
+*.py[cod]
+.pytest_cache/

@@ -29,6 +29,7 @@ from .locking import ProfileLease
 from .maintenance import run_maintenance
 from .improvement import run_improvement
 from .runner import run_codex
+from .profile_git import CHECKPOINT_SUBJECT, checkpoint_profile, inspect_profile_git, profile_git_log
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -78,6 +79,14 @@ def _parser() -> argparse.ArgumentParser:
         type=Path,
         help="profile root to diagnose, including when config.toml is broken",
     )
+    git = commands.add_parser("git", help="inspect or checkpoint profile documents")
+    git_commands = git.add_subparsers(dest="git_command", required=True)
+    git_status = git_commands.add_parser("status", help="show managed profile Git status")
+    git_status.add_argument("--json", action="store_true")
+    git_commands.add_parser("checkpoint", help="checkpoint changed managed documents")
+    git_log = git_commands.add_parser("log", help="show the local profile checkpoint log")
+    git_log.add_argument("--json", action="store_true")
+    git_log.add_argument("--limit", type=int, default=20)
     return parser
 
 
@@ -220,6 +229,28 @@ def main(argv: list[str] | None = None) -> int:
             )
             print(report.format())
             return 0 if report.ok else 1
+        elif arguments.command == "git":
+            root = find_profile_root(Path.cwd())
+            if arguments.git_command == "status":
+                status = inspect_profile_git(root)
+                if arguments.json:
+                    print(json.dumps(status.as_json_object(), ensure_ascii=False, sort_keys=True))
+                else:
+                    location = "detached HEAD" if status.detached else (status.branch or "unborn branch")
+                    dirty = ", ".join(status.dirty_paths) if status.dirty_paths else "clean"
+                    print(f"Git: {location}; managed paths: {dirty}")
+                return 0 if status.initialized else 1
+            if arguments.git_command == "checkpoint":
+                result = checkpoint_profile(root, CHECKPOINT_SUBJECT)
+                print(json.dumps(result.as_json_object(), ensure_ascii=False, sort_keys=True))
+                return 0 if result.error is None else 1
+            entries = profile_git_log(root, arguments.limit)
+            if arguments.json:
+                print(json.dumps(entries, ensure_ascii=False, sort_keys=True))
+            else:
+                for entry in entries:
+                    print(f"{entry['sha'][:12]} {entry['time']} {entry['subject']}")
+            return 0
     except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
         parser.error(str(error))
     return 0

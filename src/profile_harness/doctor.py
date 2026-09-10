@@ -57,6 +57,7 @@ REQUIRED_PLUGIN_FILES = (
     "skills/profile-harness/SKILL.md",
     "scripts/build_local_marketplace.py",
     "src/profile_harness/packaging.py",
+    "src/profile_harness/profile_git.py",
     "src/profile_harness/maintenance.py",
     "src/profile_harness/improvement.py",
     "src/profile_harness/receipt.py",
@@ -64,6 +65,7 @@ REQUIRED_PLUGIN_FILES = (
     "templates/prompts/curate.md",
     "templates/prompts/improve.md",
     "templates/profile/AGENTS.md",
+    "templates/profile/.gitignore",
     "templates/profile/CONTEXT.md",
     "templates/profile/DASHBOARD.md",
     "templates/profile/IDENTITY.md",
@@ -75,6 +77,7 @@ REQUIRED_PLUGIN_FILES = (
     "templates/repo/TASKS.md",
 )
 PROFILE_FILES = (
+    ".gitignore",
     "AGENTS.md",
     "IDENTITY.md",
     "USER.md",
@@ -824,13 +827,52 @@ def diagnose(
     registry_findings, _ = _registry_findings(profile_root)
     findings.extend(registry_findings)
 
+    from .profile_git import (
+        inspect_profile_git,
+        missing_ignore_rules,
+        tracked_forbidden_paths,
+    )
+
+    git_status = inspect_profile_git(profile_root)
+    if not git_status.initialized:
+        findings.append(Finding("ERROR", "git", git_status.error or "profile Git is not initialized"))
+    else:
+        try:
+            forbidden = tracked_forbidden_paths(profile_root)
+        except (OSError, ValueError, RuntimeError) as error:
+            findings.append(Finding("ERROR", "git", f"cannot inspect tracked paths: {error}"))
+        else:
+            if forbidden:
+                findings.append(Finding("ERROR", "git", "tracked forbidden runtime paths: " + ", ".join(forbidden)))
+        missing_rules = missing_ignore_rules(profile_root)
+        if missing_rules:
+            findings.append(Finding("WARN", "git", "missing required ignore rules: " + ", ".join(missing_rules)))
+        if git_status.dirty_paths:
+            findings.append(Finding("WARN", "git", "managed paths are dirty: " + ", ".join(git_status.dirty_paths)))
+        if git_status.detached:
+            findings.append(Finding("WARN", "git", "profile repository has detached HEAD"))
+        if not git_status.has_remote:
+            findings.append(Finding("WARN", "git", "no remote is configured; local Git does not protect against disk loss"))
+        if not any(item.subject == "git" and item.severity == "ERROR" for item in findings):
+            findings.append(Finding("OK", "git", "local profile repository is readable"))
+    checkpoint_failure = profile_root / ".harness/state/profile-git-failure.json"
+    if checkpoint_failure.is_symlink():
+        findings.append(Finding("ERROR", "git", "pending checkpoint diagnostic path is unsafe"))
+    elif checkpoint_failure.is_file():
+        try:
+            failure = _json_file(checkpoint_failure)
+            detail = failure.get("error") if isinstance(failure, dict) else None
+        except (OSError, ValueError) as error:
+            detail = f"unreadable diagnostic: {error}"
+        findings.append(Finding("ERROR", "git", f"failed pending checkpoint: {detail or 'unknown Git failure'}"))
+
     transaction_dir = profile_root / ".harness/state/transactions"
     if transaction_dir.is_symlink():
         findings.append(Finding("ERROR", "transaction", "transaction directory is a symlink"))
     elif transaction_dir.exists() and any(transaction_dir.glob("*.json")):
         try:
             with ProfileLease(profile_root, stale_timeout=effective_stale_timeout):
-                recovered = recover_transactions(profile_root)
+                recovered = recover_transactions(profile_root, checkpoint=False)
         except LeaseBusyError:
             findings.append(Finding("ERROR", "transaction", "interrupted transaction is actively locked; recovery was not attempted"))
         except (OSError, ValueError) as error:
@@ -844,7 +886,7 @@ def diagnose(
     elif improvement_transaction.exists():
         try:
             with ProfileLease(profile_root, stale_timeout=effective_stale_timeout):
-                recover_improvement_transaction(profile_root)
+                recover_improvement_transaction(profile_root, checkpoint=False)
         except LeaseBusyError:
             findings.append(Finding("ERROR", "transaction", "interrupted improvement is actively locked; recovery was not attempted"))
         except (OSError, ValueError) as error:

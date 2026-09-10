@@ -360,6 +360,9 @@ def init_profile(root: Path, name: str) -> None:
     atomic_write_text_if_missing(
         profile_root / "PROJECTS.toml", "version = 1\nrepositories = []\n"
     )
+    from .profile_git import initialize_profile_git
+
+    initialize_profile_git(profile_root)
 
 
 def _serialize_projects(repositories: tuple[RepositoryConfig, ...], root: Path) -> str:
@@ -438,3 +441,6 @@ def register_repo(root: Path, name: str, path: Path) -> None:
         profile.root / "PROJECTS.toml",
         _serialize_projects(registrations, profile.root),
     )
+    from .profile_git import REGISTRY_SUBJECT, checkpoint_profile
+
+    checkpoint_profile(profile.root, REGISTRY_SUBJECT)

@@ -112,6 +112,7 @@ class ProfileInitializationTests(unittest.TestCase):
                 "MEMORY.md",
                 "PROJECTS.toml",
                 "DASHBOARD.md",
+                ".gitignore",
                 ".harness/config.toml",
             }
             expected_directories = {
@@ -135,6 +136,9 @@ class ProfileInitializationTests(unittest.TestCase):
                     str(path.relative_to(root))
                     for path in root.rglob("*")
                     if path.is_file()
+                    and ".git" not in path.relative_to(root).parts
+                    and path.relative_to(root).as_posix()
+                    != ".harness/state/profile-git.guard"
                 },
             )
             self.assertTrue(
