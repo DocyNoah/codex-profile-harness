@@ -7,6 +7,9 @@ from pathlib import Path
 import tempfile
 
 
+COPY_CHUNK_BYTES = 1024 * 1024
+
+
 def _write_temporary_file(path: Path, content: str) -> Path:
     """Write and flush complete content to a same-directory temporary file."""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -51,6 +54,26 @@ def atomic_write_bytes(path: Path, content: bytes) -> None:
     except BaseException:
         temporary_path.unlink(missing_ok=True)
         raise
+
+
+def atomic_copy_file(source: Path, path: Path) -> None:
+    """Atomically replace *path* by streaming *source* in bounded chunks."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with source.open("rb") as source_handle:
+        descriptor, temporary_name = tempfile.mkstemp(
+            dir=path.parent, prefix=f".{path.name}.", suffix=".tmp"
+        )
+        temporary_path = Path(temporary_name)
+        try:
+            with os.fdopen(descriptor, "wb") as target_handle:
+                while chunk := source_handle.read(COPY_CHUNK_BYTES):
+                    target_handle.write(chunk)
+                target_handle.flush()
+                os.fsync(target_handle.fileno())
+            os.replace(temporary_path, path)
+        except BaseException:
+            temporary_path.unlink(missing_ok=True)
+            raise
 
 
 def atomic_write_text_if_missing(path: Path, content: str) -> None:

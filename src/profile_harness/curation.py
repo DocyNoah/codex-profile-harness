@@ -13,7 +13,7 @@ import uuid
 from typing import Any
 
 from .config import PLUGIN_ROOT, load_profile
-from .fs import atomic_write_bytes, atomic_write_text
+from .fs import atomic_copy_file, atomic_write_bytes, atomic_write_text
 from .journal import append_entry
 
 
@@ -528,7 +528,7 @@ def apply_actions(
             target.unlink(missing_ok=True)
         for target, snapshot in snapshots.items():
             target.parent.mkdir(parents=True, exist_ok=True)
-            atomic_write_bytes(target, snapshot.read_bytes())
+            atomic_copy_file(snapshot, target)
             target.chmod(snapshot.stat().st_mode)
         if journal_before is None:
             journal.unlink(missing_ok=True)

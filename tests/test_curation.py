@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -415,6 +416,69 @@ class CurationTests(unittest.TestCase):
 
             self.assertEqual(journal_before, journal.read_bytes())
             self.assertIn("No current status", (api / "STATUS.md").read_text())
+
+    def test_rollback_streams_snapshot_without_an_unbounded_read(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root, api, _ = self.make_profile(Path(temporary_directory))
+            self.add_receipt(root, "one")
+            batch = prepare_curation(root)
+            status_before = (api / "STATUS.md").read_bytes()
+            real_read_bytes = Path.read_bytes
+            real_open = Path.open
+
+            class BoundedSnapshotReader:
+                def __init__(self, handle) -> None:
+                    self.handle = handle
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, exc_type, exc_value, traceback) -> None:
+                    self.handle.close()
+
+                def read(self, size: int = -1) -> bytes:
+                    if size < 1 or size > 1_048_576:
+                        raise AssertionError("rollback attempted an unbounded read")
+                    return self.handle.read(size)
+
+            def reject_snapshot_read_bytes(path: Path) -> bytes:
+                if ".harness/memory/archive/snapshots" in path.as_posix():
+                    raise AssertionError("rollback attempted an unbounded snapshot read")
+                return real_read_bytes(path)
+
+            def guard_snapshot_open(path: Path, *args, **kwargs):
+                handle = real_open(path, *args, **kwargs)
+                mode = args[0] if args else kwargs.get("mode", "r")
+                if (
+                    ".harness/memory/archive/snapshots" in path.as_posix()
+                    and mode == "rb"
+                ):
+                    return BoundedSnapshotReader(handle)
+                return handle
+
+            with (
+                mock.patch.object(Path, "read_bytes", reject_snapshot_read_bytes),
+                mock.patch.object(Path, "open", guard_snapshot_open),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "injected"):
+                    apply_actions(
+                        root,
+                        batch.batch_id,
+                        {
+                            "actions": [
+                                {
+                                    "type": "repo_status",
+                                    "repository": "api",
+                                    "content": "# Changed",
+                                    "source_receipt_ids": ["one"],
+                                }
+                            ]
+                        },
+                        fail_after_writes=1,
+                    )
+
+            self.assertEqual(status_before, (api / "STATUS.md").read_bytes())
+            self.assertTrue((root / ".harness/memory/inbox/one.json").exists())
 
     def test_failed_apply_dead_letters_a_receipt_tampered_after_preparation(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
