@@ -227,20 +227,31 @@ class TranscriptCaptureTests(unittest.TestCase):
                 self.assertEqual("duplicate", exact_redelivery.status)
                 self.assertEqual(second.receipt_id, exact_redelivery.receipt_id)
 
-    def test_legacy_cursor_reuses_valid_legacy_receipt_and_promotes_metadata(self) -> None:
+    def test_legacy_cursor_publishes_one_safe_migration_receipt(self) -> None:
         transcript = self.codex_home / "legacy.jsonl"
         transcript.write_bytes(jsonl(response_message("assistant", "legacy evidence")))
         legacy_path, cursor_path = self.downgrade_capture_to_legacy_cursor(transcript)
         original = legacy_path.read_bytes()
 
+        migration = self.capture(transcript, "turn-1")
         redelivery = self.capture(transcript, "turn-1")
 
+        self.assertEqual("captured", migration.status)
+        self.assertNotEqual(legacy_path, migration.receipt_path)
         self.assertEqual("duplicate", redelivery.status)
-        self.assertEqual(legacy_path, redelivery.receipt_path)
+        self.assertEqual(migration.receipt_path, redelivery.receipt_path)
         self.assertEqual(original, legacy_path.read_bytes())
-        self.assertEqual(1, len(list(legacy_path.parent.glob("*.json"))))
+        self.assertEqual(2, len(list(legacy_path.parent.glob("*.json"))))
+        migration_payload = self.receipt(migration)["payload"]
+        self.assertEqual([], migration_payload["user_messages"])
+        self.assertEqual([], migration_payload["assistant_messages"])
+        self.assertEqual(
+            hashlib.sha256(b"").hexdigest(),
+            migration_payload["transcript_digest"],
+        )
+        self.assertEqual("partial", migration_payload["capture_quality"])
         promoted = json.loads(cursor_path.read_text(encoding="utf-8"))
-        self.assertEqual(legacy_path.stem, promoted["receipt_id"])
+        self.assertEqual(migration.receipt_id, promoted["receipt_id"])
         self.assertEqual(legacy_path.stem, promoted["delivery_digest"])
 
     def test_legacy_receipt_is_not_reused_without_a_matching_legacy_cursor(self) -> None:
@@ -254,7 +265,7 @@ class TranscriptCaptureTests(unittest.TestCase):
         self.assertEqual("captured", redelivery.status)
         self.assertNotEqual(legacy_path, redelivery.receipt_path)
 
-    def test_legacy_cursor_reuses_last_receipt_after_multiple_megabyte_captures(
+    def test_legacy_cursor_migrates_after_multiple_megabyte_captures(
         self,
     ) -> None:
         transcript = self.codex_home / "legacy-large.jsonl"
@@ -282,6 +293,12 @@ class TranscriptCaptureTests(unittest.TestCase):
             "cd2c4df30a689e004c3fa9b79e7ec67fafed92f62a1b3885948f9c59712959de",
         )
 
+        migration = self.capture(
+            transcript,
+            "turn-2",
+            last=fallback,
+            session=session,
+        )
         redelivery = self.capture(
             transcript,
             "turn-2",
@@ -290,11 +307,16 @@ class TranscriptCaptureTests(unittest.TestCase):
         )
 
         self.assertGreater(transcript.stat().st_size, 1024 * 1024)
+        self.assertEqual("captured", migration.status)
+        self.assertNotEqual(legacy_path, migration.receipt_path)
         self.assertEqual("duplicate", redelivery.status)
-        self.assertEqual(legacy_path, redelivery.receipt_path)
-        self.assertEqual(2, len(list(legacy_path.parent.glob("*.json"))))
+        self.assertEqual(migration.receipt_path, redelivery.receipt_path)
+        self.assertEqual(3, len(list(legacy_path.parent.glob("*.json"))))
+        migration_payload = self.receipt(migration)["payload"]
+        self.assertEqual([], migration_payload["assistant_messages"])
+        self.assertEqual("partial", migration_payload["capture_quality"])
         promoted = json.loads(cursor_path.read_text(encoding="utf-8"))
-        self.assertEqual(legacy_path.stem, promoted["receipt_id"])
+        self.assertEqual(migration.receipt_id, promoted["receipt_id"])
         self.assertEqual(legacy_path.stem, promoted["delivery_digest"])
 
     def test_legacy_cursor_rejects_tampered_receipt_payload(self) -> None:
@@ -302,22 +324,42 @@ class TranscriptCaptureTests(unittest.TestCase):
         transcript.write_bytes(jsonl(response_message("assistant", "legacy evidence")))
         legacy_path, cursor_path = self.downgrade_capture_to_legacy_cursor(transcript)
         tampered = json.loads(legacy_path.read_text(encoding="utf-8"))
-        tampered["payload"]["last_assistant_message"] = "mismatched fallback"
+        tampered["payload"]["assistant_messages"] = ["malicious legacy evidence"]
         legacy_path.write_text(json.dumps(tampered), encoding="utf-8")
 
+        migration = self.capture(transcript, "turn-1")
         redelivery = self.capture(transcript, "turn-1")
 
-        self.assertEqual("captured", redelivery.status)
-        self.assertNotEqual(legacy_path, redelivery.receipt_path)
-        recovery_payload = self.receipt(redelivery)["payload"]
+        self.assertEqual("captured", migration.status)
+        self.assertNotEqual(legacy_path, migration.receipt_path)
+        self.assertEqual("duplicate", redelivery.status)
+        self.assertEqual(migration.receipt_path, redelivery.receipt_path)
+        self.assertEqual(2, len(list(legacy_path.parent.glob("*.json"))))
+        recovery_payload = self.receipt(migration)["payload"]
         self.assertEqual([], recovery_payload["assistant_messages"])
         self.assertEqual(
             hashlib.sha256(b"").hexdigest(),
             recovery_payload["transcript_digest"],
         )
+        self.assertEqual("partial", recovery_payload["capture_quality"])
         promoted = json.loads(cursor_path.read_text(encoding="utf-8"))
-        self.assertEqual(redelivery.receipt_id, promoted["receipt_id"])
+        self.assertEqual(migration.receipt_id, promoted["receipt_id"])
         self.assertEqual(legacy_path.stem, promoted["delivery_digest"])
+
+    def test_legacy_cursor_with_new_delta_captures_only_the_new_evidence(self) -> None:
+        transcript = self.codex_home / "legacy-new-delta.jsonl"
+        transcript.write_bytes(jsonl(response_message("assistant", "old evidence")))
+        legacy_path, _ = self.downgrade_capture_to_legacy_cursor(transcript)
+        with transcript.open("ab") as handle:
+            handle.write(jsonl(response_message("assistant", "new evidence")))
+
+        captured = self.capture(transcript, "turn-2")
+
+        self.assertEqual("captured", captured.status)
+        self.assertNotEqual(legacy_path, captured.receipt_path)
+        captured_payload = self.receipt(captured)["payload"]
+        self.assertEqual(["new evidence"], captured_payload["assistant_messages"])
+        self.assertEqual("complete", captured_payload["capture_quality"])
 
     def test_redelivery_is_duplicate_and_does_not_move_cursor(self) -> None:
         transcript = self.codex_home / "session.jsonl"

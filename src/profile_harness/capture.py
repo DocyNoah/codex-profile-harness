@@ -245,30 +245,6 @@ def _duplicate_published_same_transcript(
     )
 
 
-def _duplicate_published_legacy_delivery(
-    receipt_path: Path, expected_receipt: dict[str, Any]
-) -> bool:
-    """Confirm a valid legacy receipt matches the current hook delivery."""
-    receipt = _read_valid_receipt(receipt_path, expected_receipt["id"])
-    if receipt is None:
-        return False
-    receipt_payload = receipt["payload"]
-    if any(field not in receipt_payload for field in _TRANSCRIPT_EVIDENCE_FIELDS):
-        return False
-    base_payload = {
-        key: value
-        for key, value in receipt_payload.items()
-        if key not in _TRANSCRIPT_EVIDENCE_FIELDS
-    }
-    return (
-        receipt_path.stem == expected_receipt["id"]
-        and receipt["id"] == expected_receipt["id"]
-        and receipt["event"] == expected_receipt["event"]
-        and receipt["cwd"] == expected_receipt["cwd"]
-        and base_payload == expected_receipt["payload"]
-    )
-
-
 def capture_event(payload: dict, cwd: Path | None = None) -> CaptureResult:
     """Validate and persist one immutable Stop or SessionEnd receipt."""
     if os.environ.get("PROFILE_HARNESS_CURATOR") == "1":
@@ -295,15 +271,22 @@ def capture_event(payload: dict, cwd: Path | None = None) -> CaptureResult:
 
     maximum = _max_text_chars(profile_root)
     normalized = _normalized_payload(payload, maximum)
-    base_payload = dict(normalized)
     transcript = prepare_transcript_delta(
         profile_root,
         session_id.strip(),
         payload.get("transcript_path"),
         lambda text: _normalize_text(text, maximum),
     )
-    normalized.update(transcript.payload)
-    if transcript.payload.get("capture_quality") == "partial":
+    transcript_payload = transcript.payload
+    if transcript.legacy_cursor and not transcript.has_complete_delta:
+        transcript_payload = {
+            "user_messages": [],
+            "assistant_messages": [],
+            "transcript_digest": hashlib.sha256(b"").hexdigest(),
+            "capture_quality": "partial",
+        }
+    normalized.update(transcript_payload)
+    if transcript_payload.get("capture_quality") == "partial":
         normalized.pop("transcript_path", None)
     discriminator_value = payload.get("turn_id") or payload.get("reason") or ""
     if not isinstance(discriminator_value, str):
@@ -331,26 +314,6 @@ def capture_event(payload: dict, cwd: Path | None = None) -> CaptureResult:
     inbox = profile_root / ".harness/memory/inbox"
     receipt_cwd = _normalize_text(str(Path(start).expanduser().resolve()), maximum)
     captured_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-    legacy_expected_receipt = None
-    reused_legacy_receipt = False
-    if (
-        not transcript.has_complete_delta
-        and transcript.previous_receipt_id is None
-        and transcript.previous_delivery_digest is None
-        and transcript.legacy_cursor
-    ):
-        legacy_path = inbox / f"{delivery_digest}.json"
-        legacy_expected_receipt = {
-            "id": delivery_digest,
-            "event": event,
-            "cwd": receipt_cwd,
-            "payload": base_payload,
-        }
-        if _duplicate_published_legacy_delivery(
-            legacy_path, legacy_expected_receipt
-        ):
-            receipt_id = delivery_digest
-            reused_legacy_receipt = True
     if transcript.cursor is not None:
         transcript.cursor["receipt_id"] = receipt_id
         transcript.cursor["delivery_digest"] = delivery_digest
@@ -371,21 +334,10 @@ def capture_event(payload: dict, cwd: Path | None = None) -> CaptureResult:
     }
     content = json.dumps(receipt, ensure_ascii=False, sort_keys=True, indent=2) + "\n"
     created = _publish_exclusively(receipt_path, content)
-    published_receipt_expectation = (
-        legacy_expected_receipt if reused_legacy_receipt else receipt
-    )
     cursor_evidence_published = created or (
         transcript.cursor_path is not None
         and transcript.cursor is not None
-        and (
-            _duplicate_published_legacy_delivery(
-                receipt_path, published_receipt_expectation
-            )
-            if reused_legacy_receipt
-            else _duplicate_published_same_transcript(
-                receipt_path, published_receipt_expectation
-            )
-        )
+        and _duplicate_published_same_transcript(receipt_path, receipt)
     )
     if cursor_evidence_published:
         try:
