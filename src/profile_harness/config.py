@@ -29,6 +29,10 @@ PROFILE_DIRECTORIES = (
     ".harness/improvements/rejected",
     "projects",
 )
+DEFAULT_MAX_TEXT_CHARS = 4096
+DEFAULT_CODEX_COMMAND = "codex"
+DEFAULT_CODEX_TIMEOUT_SECONDS = 300.0
+DEFAULT_STALE_TIMEOUT_SECONDS = 300.0
 
 
 @dataclass(frozen=True)
@@ -42,6 +46,25 @@ class ProfileConfig:
     root: Path
     name: str
     repositories: tuple[RepositoryConfig, ...]
+
+
+@dataclass(frozen=True)
+class CaptureConfig:
+    max_text_chars: int = DEFAULT_MAX_TEXT_CHARS
+
+
+@dataclass(frozen=True)
+class CurationConfig:
+    codex_command: str = DEFAULT_CODEX_COMMAND
+    codex_timeout_seconds: float = DEFAULT_CODEX_TIMEOUT_SECONDS
+    stale_timeout_seconds: float = DEFAULT_STALE_TIMEOUT_SECONDS
+
+
+@dataclass(frozen=True)
+class HarnessConfig:
+    name: str
+    capture: CaptureConfig
+    curation: CurationConfig
 
 
 def _toml_string(value: str) -> str:
@@ -69,13 +92,82 @@ def find_profile_root(start: Path) -> Path:
     raise ValueError(f"no Codex profile found from {start}")
 
 
+def find_profile_marker_root(start: Path) -> Path:
+    """Find a profile by durable layout markers even when config is broken."""
+    current = Path(start).expanduser().resolve()
+    if current.is_file():
+        current = current.parent
+    for candidate in (current, *current.parents):
+        if (candidate / ".harness").is_dir() and (
+            candidate / "PROJECTS.toml"
+        ).is_file():
+            return candidate
+    raise ValueError(f"no Codex profile markers found from {start}")
+
+
+def _positive_number(value: object, field: str, errors: list[str]) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+        errors.append(f"{field} must be a positive number")
+        return 1.0
+    return float(value)
+
+
+def load_profile_config(root: Path) -> HarnessConfig:
+    """Load the complete validated harness configuration."""
+    profile_root = Path(root).expanduser().resolve()
+    config = _read_toml(profile_root / ".harness" / "config.toml")
+    errors: list[str] = []
+    version = config.get("version")
+    name = config.get("name")
+    if isinstance(version, bool) or version != 1:
+        errors.append("profile config version must equal 1")
+    if not isinstance(name, str) or not name.strip():
+        errors.append("profile config name must be a non-empty string")
+
+    capture = config.get("capture", {})
+    if not isinstance(capture, dict):
+        errors.append("capture configuration must be a TOML table")
+        capture = {}
+    max_text_chars = capture.get("max_text_chars", DEFAULT_MAX_TEXT_CHARS)
+    if (
+        isinstance(max_text_chars, bool)
+        or not isinstance(max_text_chars, int)
+        or max_text_chars < 1
+    ):
+        errors.append("capture.max_text_chars must be a positive integer")
+        max_text_chars = DEFAULT_MAX_TEXT_CHARS
+
+    curation = config.get("curation", {})
+    if not isinstance(curation, dict):
+        errors.append("curation configuration must be a TOML table")
+        curation = {}
+    codex_command = curation.get("codex_command", DEFAULT_CODEX_COMMAND)
+    if not isinstance(codex_command, str) or not codex_command.strip():
+        errors.append("curation.codex_command must be a non-empty string")
+        codex_command = DEFAULT_CODEX_COMMAND
+    codex_timeout = _positive_number(
+        curation.get("codex_timeout_seconds", DEFAULT_CODEX_TIMEOUT_SECONDS),
+        "curation.codex_timeout_seconds",
+        errors,
+    )
+    stale_timeout = _positive_number(
+        curation.get("stale_timeout_seconds", DEFAULT_STALE_TIMEOUT_SECONDS),
+        "curation.stale_timeout_seconds",
+        errors,
+    )
+    if errors:
+        raise ValueError("invalid profile configuration: " + "; ".join(errors))
+    return HarnessConfig(
+        name.strip(),
+        CaptureConfig(max_text_chars),
+        CurationConfig(codex_command.strip(), codex_timeout, stale_timeout),
+    )
+
+
 def load_profile(root: Path) -> ProfileConfig:
     """Load and validate profile identity and registered repositories."""
     profile_root = Path(root).expanduser().resolve()
-    config = _read_toml(profile_root / ".harness" / "config.toml")
-    name = config.get("name")
-    if config.get("version") != 1 or not isinstance(name, str) or not name.strip():
-        raise ValueError("profile config must contain version = 1 and a non-empty name")
+    config = load_profile_config(profile_root)
 
     projects = _read_toml(profile_root / "PROJECTS.toml")
     raw_repositories = projects.get("repositories", [])
@@ -95,7 +187,7 @@ def load_profile(root: Path) -> ProfileConfig:
         repositories.append(
             RepositoryConfig(repo_name, (profile_root / relative_path).resolve())
         )
-    return ProfileConfig(profile_root, name, tuple(repositories))
+    return ProfileConfig(profile_root, config.name, tuple(repositories))
 
 
 def _template_files(template_root: Path) -> tuple[Path, ...]:

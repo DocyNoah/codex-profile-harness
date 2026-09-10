@@ -10,14 +10,12 @@ import os
 from pathlib import Path
 import re
 import tempfile
-import tomllib
 from typing import Any
 
-from .config import find_profile_root
+from .config import DEFAULT_MAX_TEXT_CHARS, find_profile_root, load_profile_config
 
 
 MAX_INPUT_BYTES = 1024 * 1024
-DEFAULT_MAX_TEXT_CHARS = 4096
 SUPPORTED_EVENTS = frozenset({"Stop", "SessionEnd"})
 KNOWN_FIELDS = frozenset(
     {
@@ -86,17 +84,9 @@ def _serialized_size(payload: object) -> int:
 
 def _max_text_chars(profile_root: Path) -> int:
     try:
-        with (profile_root / ".harness/config.toml").open("rb") as handle:
-            config = tomllib.load(handle)
-    except (OSError, tomllib.TOMLDecodeError) as error:
+        return load_profile_config(profile_root).capture.max_text_chars
+    except (OSError, ValueError) as error:
         raise CaptureError("profile capture configuration is unreadable") from error
-    capture_config = config.get("capture", {})
-    if not isinstance(capture_config, dict):
-        raise CaptureError("capture configuration must be a TOML table")
-    value = capture_config.get("max_text_chars", DEFAULT_MAX_TEXT_CHARS)
-    if not isinstance(value, int) or isinstance(value, bool) or value < 1:
-        raise CaptureError("capture.max_text_chars must be a positive integer")
-    return value
 
 
 def _redact(text: str) -> str:

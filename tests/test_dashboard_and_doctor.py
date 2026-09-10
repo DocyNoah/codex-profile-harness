@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -252,6 +253,161 @@ class DoctorTests(unittest.TestCase):
 
             self.assertFalse(report.ok)
             self.assertIn("templates/prompts/curate.md", report.format())
+
+    def test_doctor_validates_plugin_json_semantics_not_only_parseability(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            parent = Path(temporary_directory)
+            root = parent / "profile"
+            init_profile(root, "Work")
+            mutations = (
+                (
+                    ".codex-plugin/plugin.json",
+                    lambda value: value.update({"name": "wrong-plugin"}),
+                    "codex-profile-harness",
+                ),
+                (
+                    "hooks/hooks.json",
+                    lambda value: value["hooks"]["Stop"][0]["hooks"][0].update(
+                        {"command": "python3 unsafe.py"}
+                    ),
+                    "hook",
+                ),
+                (
+                    "schemas/curation-result.schema.json",
+                    lambda value: value.update({"required": []}),
+                    "actions",
+                ),
+            )
+            for index, (relative, mutate, expected) in enumerate(mutations):
+                with self.subTest(relative=relative):
+                    plugin = parent / f"plugin-{index}"
+                    shutil.copytree(
+                        ROOT,
+                        plugin,
+                        ignore=shutil.ignore_patterns(
+                            ".git", ".superpowers", "__pycache__", "*.pyc"
+                        ),
+                    )
+                    path = plugin / relative
+                    value = json.loads(path.read_text(encoding="utf-8"))
+                    mutate(value)
+                    path.write_text(json.dumps(value), encoding="utf-8")
+
+                    with mock.patch("profile_harness.doctor.PLUGIN_ROOT", plugin):
+                        report = diagnose(root)
+
+                    self.assertFalse(report.ok)
+                    self.assertIn(expected, report.format())
+
+    def test_doctor_cli_diagnoses_profile_with_missing_config(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            parent = Path(temporary_directory)
+            root = parent / "profile"
+            init_profile(root, "Work")
+            (root / ".harness/config.toml").unlink()
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(ROOT / "bin/profile-harness"),
+                    "doctor",
+                    "--profile",
+                    str(root),
+                ],
+                cwd=parent,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertEqual(1, result.returncode, result.stderr)
+            self.assertIn("config.toml", result.stdout)
+            self.assertNotIn("no Codex profile", result.stderr)
+
+    def test_doctor_cli_uses_profile_markers_when_config_is_invalid(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory) / "profile"
+            init_profile(root, "Work")
+            repository = root / "projects/api"
+            repository.mkdir()
+            (root / ".harness/config.toml").write_text("[", encoding="utf-8")
+
+            result = subprocess.run(
+                [sys.executable, str(ROOT / "bin/profile-harness"), "doctor"],
+                cwd=repository,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertEqual(1, result.returncode, result.stderr)
+            self.assertIn("invalid toml", result.stdout.lower())
+            self.assertIn("config.toml", result.stdout)
+            self.assertNotIn("no Codex profile", result.stderr)
+
+    def test_doctor_validates_capture_and_curation_config_semantics(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory) / "profile"
+            init_profile(root, "Work")
+            (root / ".harness/config.toml").write_text(
+                'version = 1\nname = "Work"\n'
+                '[capture]\nmax_text_chars = 0\n'
+                '[curation]\ncodex_command = ""\n'
+                'codex_timeout_seconds = false\nstale_timeout_seconds = -1\n',
+                encoding="utf-8",
+            )
+
+            report = diagnose(root)
+            output = report.format()
+
+            self.assertFalse(report.ok)
+            self.assertIn("capture.max_text_chars", output)
+            self.assertIn("curation.codex_command", output)
+            self.assertIn("curation.codex_timeout_seconds", output)
+            self.assertIn("curation.stale_timeout_seconds", output)
+
+
+class PackagingTests(unittest.TestCase):
+    def test_local_marketplace_builder_uses_allowlist_and_fixed_selector(self) -> None:
+        from profile_harness.packaging import build_local_marketplace
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            parent = Path(temporary_directory)
+            source = parent / "source"
+            shutil.copytree(
+                ROOT,
+                source,
+                ignore=shutil.ignore_patterns(".git", "__pycache__", "*.pyc"),
+            )
+            (source / ".git").mkdir()
+            (source / ".git/config").write_text("private", encoding="utf-8")
+            (source / ".env").write_text("PRIVATE_VALUE=secret", encoding="utf-8")
+            cache = source / "src/profile_harness/__pycache__"
+            cache.mkdir()
+            (cache / "module.pyc").write_bytes(b"cache")
+            output = parent / "marketplace"
+
+            build_local_marketplace(source, output)
+
+            plugin = output / "plugins/codex-profile-harness"
+            marketplace = json.loads(
+                (output / ".agents/plugins/marketplace.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertTrue((plugin / "bin/profile-harness").is_file())
+            self.assertTrue((plugin / "src/profile_harness/doctor.py").is_file())
+            self.assertFalse((plugin / ".git").exists())
+            self.assertFalse((plugin / ".env").exists())
+            self.assertFalse((plugin / "tests").exists())
+            self.assertFalse(list(plugin.rglob("*.pyc")))
+            self.assertEqual("codex-profile-harness-local", marketplace["name"])
+            entry = marketplace["plugins"][0]
+            self.assertEqual("codex-profile-harness", entry["name"])
+            self.assertEqual(
+                "./plugins/codex-profile-harness", entry["source"]["path"]
+            )
+            self.assertEqual("AVAILABLE", entry["policy"]["installation"])
 
 
 if __name__ == "__main__":

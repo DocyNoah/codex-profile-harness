@@ -18,7 +18,8 @@ The runtime uses only the Python standard library.
 
 ## Quick start
 
-Install the local executable as described in [INSTALL.md](INSTALL.md), then:
+Build and install the allowlisted local marketplace as described in
+[INSTALL.md](INSTALL.md), then:
 
 ```sh
 PROFILE_ROOT="$HOME/codex-profiles/work"
@@ -59,5 +60,6 @@ Use `profile-harness --help` and subcommand help for the authoritative CLI.
 - [SECURITY.md](SECURITY.md): trust and data-boundary model
 - [examples/cron.example](examples/cron.example): hourly curation example
 
-This repository is a local plugin artifact. It contains no marketplace manifest
-and does not assume publication to a marketplace.
+This repository is a local plugin artifact. Its builder creates a fixed-name
+local marketplace for installation, but the project does not publish or depend
+on a remote marketplace.

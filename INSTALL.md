@@ -1,33 +1,31 @@
 # Installation and operations
 
-## Install the tested local executable
+## Build and install the local plugin
 
 Run these commands from an extracted or cloned copy of this repository:
 
 ```sh
-HARNESS_HOME="${XDG_DATA_HOME:-$HOME/.local/share}/codex-profile-harness"
+MARKETPLACE_ROOT="${XDG_DATA_HOME:-$HOME/.local/share}/codex-profile-harness-marketplace"
 BIN_HOME="$HOME/.local/bin"
-mkdir -p "$(dirname "$HARNESS_HOME")" "$BIN_HOME"
-cp -R . "$HARNESS_HOME"
-ln -sfn "$HARNESS_HOME/bin/profile-harness" "$BIN_HOME/profile-harness"
+python3 scripts/build_local_marketplace.py "$MARKETPLACE_ROOT"
+codex plugin marketplace add "$MARKETPLACE_ROOT"
+codex plugin add codex-profile-harness@codex-profile-harness-local
+mkdir -p "$BIN_HOME"
+ln -sfn "$MARKETPLACE_ROOT/plugins/codex-profile-harness/bin/profile-harness" "$BIN_HOME/profile-harness"
 export PATH="$BIN_HOME:$PATH"
 profile-harness --help
 ```
 
 Persist `$HOME/.local/bin` in the shell `PATH` using the shell's normal startup
-file. This source installation and every harness CLI command are covered by the
-repository tests.
-
-The current Codex CLI installs plugins only from a configured marketplace
-snapshot. This repository deliberately ships no marketplace file and requires
-no marketplace publication. If an administrator exposes this directory through
-an already configured, trusted local marketplace, install its plugin selector
-with `codex plugin add` and start a new Codex task. That Codex-app integration is
-environment-specific and is not exercised by the local unit tests.
+file. The builder copies a fixed runtime allowlist into a local marketplace; it
+does not copy `.git`, arbitrary untracked files, credentials, tests, caches, or
+profile state. It creates marketplace name `codex-profile-harness-local` and
+plugin selector `codex-profile-harness@codex-profile-harness-local`. This is a
+local installation, not marketplace publication.
 
 ## Hook trust
 
-An app-installed plugin discovers `hooks/hooks.json` and supplies `PLUGIN_ROOT`
+The installed plugin discovers `hooks/hooks.json` and supplies `PLUGIN_ROOT`
 to its commands. Before approving the Codex hook trust prompt, inspect that file
 and verify it invokes only:
 
@@ -35,10 +33,10 @@ and verify it invokes only:
 python3 "$PLUGIN_ROOT/bin/profile-harness" hook capture
 ```
 
-Approve only the exact plugin source you installed. Do not use
-`--dangerously-bypass-hook-trust`. A source-only executable installation does
-not automatically activate Codex hooks; events can still be supplied explicitly
-to `profile-harness hook capture` on standard input.
+Approve only the generated plugin below `$MARKETPLACE_ROOT`. Do not use
+`--dangerously-bypass-hook-trust`. Start a new Codex task after installation so
+the host discovers the plugin and prompts for trust. Events can also be supplied
+explicitly to `profile-harness hook capture` on standard input.
 
 ## Initialize a profile and register repositories
 
@@ -55,13 +53,8 @@ profile-harness doctor --check-codex
 Initialization preserves existing user files. Registration accepts only real
 directories below the profile's `projects/` directory.
 
-For a source-only installation, make the bundled skill visible inside this
-profile:
-
-```sh
-mkdir -p "$PROFILE_ROOT/.agents/skills"
-cp -R "$HARNESS_HOME/skills/profile-harness" "$PROFILE_ROOT/.agents/skills/"
-```
+The app-installed plugin provides the bundled skill. The profile-local
+`.agents/skills` directory remains available for user-owned skills.
 
 ## Manual curation
 
@@ -134,37 +127,46 @@ repositories. Keep it protected as confidential data.
 
 ## Upgrade
 
-Run from the newer source tree after pausing hooks and scheduled curation:
+Run from the newer source tree after pausing hooks and scheduled curation. The
+builder refuses to overwrite an existing output, so it builds a new tree before
+the installed tree is moved aside:
 
 ```sh
-HARNESS_HOME="${XDG_DATA_HOME:-$HOME/.local/share}/codex-profile-harness"
-OLD_HARNESS="${HARNESS_HOME}.previous.$(date -u +%Y%m%dT%H%M%SZ)"
+MARKETPLACE_ROOT="${XDG_DATA_HOME:-$HOME/.local/share}/codex-profile-harness-marketplace"
+NEW_MARKETPLACE="${MARKETPLACE_ROOT}.new.$(date -u +%Y%m%dT%H%M%SZ)"
+OLD_MARKETPLACE="${MARKETPLACE_ROOT}.previous.$(date -u +%Y%m%dT%H%M%SZ)"
 PROFILE_ROOT="$HOME/codex-profiles/work"
-mv "$HARNESS_HOME" "$OLD_HARNESS"
-cp -R . "$HARNESS_HOME"
-ln -sfn "$HARNESS_HOME/bin/profile-harness" "$HOME/.local/bin/profile-harness"
+python3 scripts/build_local_marketplace.py "$NEW_MARKETPLACE"
+codex plugin remove codex-profile-harness@codex-profile-harness-local
+codex plugin marketplace remove codex-profile-harness-local
+mv "$MARKETPLACE_ROOT" "$OLD_MARKETPLACE"
+mv "$NEW_MARKETPLACE" "$MARKETPLACE_ROOT"
+codex plugin marketplace add "$MARKETPLACE_ROOT"
+codex plugin add codex-profile-harness@codex-profile-harness-local
+ln -sfn "$MARKETPLACE_ROOT/plugins/codex-profile-harness/bin/profile-harness" "$HOME/.local/bin/profile-harness"
 profile-harness --help
 cd "$PROFILE_ROOT"
 profile-harness doctor --check-codex
 ```
 
-Profiles live outside the plugin installation and are not replaced. For an
-app-installed copy, reinstall it through the same trusted local plugin source
-and open a new Codex task.
+Profiles live outside the plugin installation and are not replaced. Open a new
+Codex task after the reinstall. Keep `$OLD_MARKETPLACE` until the upgraded
+installation has been verified.
 
 ## Uninstall
 
 Pause cron and remove its line, then remove the executable and installed source:
 
 ```sh
-HARNESS_HOME="${XDG_DATA_HOME:-$HOME/.local/share}/codex-profile-harness"
+MARKETPLACE_ROOT="${XDG_DATA_HOME:-$HOME/.local/share}/codex-profile-harness-marketplace"
+codex plugin remove codex-profile-harness@codex-profile-harness-local
+codex plugin marketplace remove codex-profile-harness-local
 rm "$HOME/.local/bin/profile-harness"
-rm -rf "$HARNESS_HOME"
+rm -rf "$MARKETPLACE_ROOT"
 ```
 
-If installed through Codex, first use `codex plugin list` to identify the exact
-selector and remove that selector with `codex plugin remove`. Profile directories
-are intentionally retained. Delete them only after verifying a backup.
+Profile directories and any `.previous` upgrade copies are intentionally
+retained. Delete them only after verifying a backup.
 
 ## Troubleshooting
 
@@ -175,7 +177,11 @@ are intentionally retained. Delete them only after verifying a backup.
   doctor` reports stale lock metadata; the next curation safely quarantines it.
 - invalid receipt or journal: do not edit evidence or journal files. Restore a
   verified backup or inspect the reported dead-letter/snapshot path.
-- missing `codex`: source-only prepare/apply and dashboards still work. Install
+- missing `codex`: manual prepare/apply and dashboards still work. Install
   Codex and authenticate before `curate --run`.
 - hooks do not fire: confirm the plugin is installed in the current Codex host,
-  start a new task, and approve the inspected hook source when prompted.
+  run `codex plugin list --marketplace codex-profile-harness-local`, start a new
+  task, and approve the inspected hook source when prompted.
+- broken or missing config: run `profile-harness doctor --profile
+  "$PROFILE_ROOT"`; doctor can diagnose an explicitly selected profile without
+  a valid config.

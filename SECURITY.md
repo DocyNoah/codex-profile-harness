@@ -23,6 +23,15 @@ and the installed source before accepting Codex's trust prompt. The bundled hook
 only invokes `profile-harness hook capture`; it never invokes a model or performs
 curation. Do not bypass hook trust for interactive use.
 
+## Installation boundary
+
+Build installable files with `scripts/build_local_marketplace.py`. The builder
+copies an explicit runtime allowlist and refuses to overwrite its output. It does
+not traverse the source tree, so `.git`, untracked files, credentials, tests,
+caches, and generated profile state cannot enter the marketplace artifact merely
+because they exist beside the source. Inspect the generated local marketplace
+before registering it with Codex.
+
 ## Data integrity and recovery
 
 Run `profile-harness doctor` after installation, upgrades, restores, or suspected

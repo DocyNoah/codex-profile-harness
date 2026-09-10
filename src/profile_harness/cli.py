@@ -7,11 +7,15 @@ import json
 from pathlib import Path
 import subprocess
 import sys
-import tomllib
 
 from .capture import MAX_INPUT_BYTES, CaptureError, CaptureResult, capture_event
-from .config import init_profile, register_repo
-from .config import find_profile_root
+from .config import (
+    find_profile_marker_root,
+    find_profile_root,
+    init_profile,
+    load_profile_config,
+    register_repo,
+)
 from .curation import (
     apply_actions,
     find_single_batch,
@@ -60,6 +64,11 @@ def _parser() -> argparse.ArgumentParser:
         action="store_true",
         help="also require the configured Codex executable",
     )
+    doctor.add_argument(
+        "--profile",
+        type=Path,
+        help="profile root to diagnose, including when config.toml is broken",
+    )
     return parser
 
 
@@ -95,26 +104,12 @@ def _capture_from_stdin() -> int:
 
 
 def _curation_settings(root: Path) -> tuple[str, float, float]:
-    try:
-        with (root / ".harness/config.toml").open("rb") as handle:
-            config = tomllib.load(handle)
-    except (OSError, tomllib.TOMLDecodeError) as error:
-        raise ValueError("profile curation configuration is unreadable") from error
-    section = config.get("curation", {})
-    if not isinstance(section, dict):
-        raise ValueError("curation configuration must be a TOML table")
-    command = section.get("codex_command", "codex")
-    timeout = section.get("codex_timeout_seconds", 300)
-    stale_timeout = section.get("stale_timeout_seconds", 300)
-    if not isinstance(command, str) or not command.strip():
-        raise ValueError("curation.codex_command must be a non-empty string")
-    for name, value in (
-        ("codex_timeout_seconds", timeout),
-        ("stale_timeout_seconds", stale_timeout),
-    ):
-        if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
-            raise ValueError(f"curation.{name} must be a positive number")
-    return command, float(timeout), float(stale_timeout)
+    config = load_profile_config(root).curation
+    return (
+        config.codex_command,
+        config.codex_timeout_seconds,
+        config.stale_timeout_seconds,
+    )
 
 
 def _curate(arguments: argparse.Namespace) -> int:
@@ -189,13 +184,16 @@ def main(argv: list[str] | None = None) -> int:
             root = find_profile_root(Path.cwd())
             print(generate_dashboard(root))
         elif arguments.command == "doctor":
-            root = find_profile_root(Path.cwd())
-            command, _, stale_timeout = _curation_settings(root)
+            if arguments.profile is not None:
+                root = arguments.profile.expanduser().resolve()
+            else:
+                try:
+                    root = find_profile_root(Path.cwd())
+                except ValueError:
+                    root = find_profile_marker_root(Path.cwd())
             report = diagnose(
                 root,
-                stale_timeout=stale_timeout,
                 check_codex=arguments.check_codex,
-                codex_command=command,
             )
             print(report.format())
             return 0 if report.ok else 1
