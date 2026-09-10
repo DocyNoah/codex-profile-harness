@@ -49,7 +49,9 @@ class EndToEndTests(unittest.TestCase):
                     str(repository),
                 )
                 self.assertEqual(0, registered.returncode, registered.stderr)
-            (profile / "MEMORY.md").write_text("checkpoint before hook\n", encoding="utf-8")
+            (profile / "MEMORY.md").write_text(
+                "checkpoint during scheduled maintenance\n", encoding="utf-8"
+            )
             web_before = {
                 path.relative_to(web): path.read_bytes()
                 for path in web.rglob("*")
@@ -73,23 +75,33 @@ class EndToEndTests(unittest.TestCase):
                 )
                 self.assertEqual(0, captured.returncode, captured.stderr)
                 captures.append(json.loads(captured.stdout))
-                if len(captures) == 1:
-                    self.assertEqual(
-                        "harness: checkpoint profile documents",
-                        subprocess.run(
-                            ["git", "-C", str(profile), "log", "-1", "--format=%s"],
-                            text=True, capture_output=True, check=True,
-                        ).stdout.strip(),
-                    )
-                    self.assertEqual(
-                        "checkpoint before hook\n",
-                        subprocess.run(
-                            ["git", "-C", str(profile), "show", "HEAD:MEMORY.md"],
-                            text=True, capture_output=True, check=True,
-                        ).stdout,
-                    )
             receipt_ids = [item["receipt_id"] for item in captures]
             self.assertEqual(2, len(set(receipt_ids)))
+            self.assertEqual(
+                "harness: update repository registry",
+                subprocess.run(
+                    ["git", "-C", str(profile), "log", "-1", "--format=%s"],
+                    text=True, capture_output=True, check=True,
+                ).stdout.strip(),
+            )
+
+            maintained = self.run_cli(profile, "maintain")
+            self.assertEqual(0, maintained.returncode, maintained.stderr)
+            self.assertEqual("no_op", json.loads(maintained.stdout)["curation"]["status"])
+            self.assertEqual(
+                "harness: checkpoint profile documents",
+                subprocess.run(
+                    ["git", "-C", str(profile), "log", "-1", "--format=%s"],
+                    text=True, capture_output=True, check=True,
+                ).stdout.strip(),
+            )
+            self.assertEqual(
+                "checkpoint during scheduled maintenance\n",
+                subprocess.run(
+                    ["git", "-C", str(profile), "show", "HEAD:MEMORY.md"],
+                    text=True, capture_output=True, check=True,
+                ).stdout,
+            )
 
             prepared = self.run_cli(profile, "curate", "--prepare")
             self.assertEqual(0, prepared.returncode, prepared.stderr)

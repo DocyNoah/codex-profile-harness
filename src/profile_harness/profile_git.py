@@ -190,6 +190,11 @@ def _git(
             os.killpg(process.pid, signal.SIGKILL)
         except ProcessLookupError:
             pass
+        except PermissionError:
+            try:
+                process.kill()
+            except OSError:
+                pass
 
     def read_bounded(stream, destination: str) -> None:
         nonlocal output_size

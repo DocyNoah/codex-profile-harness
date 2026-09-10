@@ -82,7 +82,10 @@
 - Produces `initialize_profile_git`, `checkpoint_profile`, and `inspect_profile_git` around one immutable managed-path tuple and deterministic commit metadata.
 
 - [ ] Write tests proving init creates one commit, existing Git and `.gitignore` are preserved, only managed files stage, nested repositories and secrets remain untouched, no diff creates no commit, and commit failures remain diagnosable/retryable.
-- [ ] Write tests proving capture, registry, curation, improvement, and recovery checkpoints have deterministic subjects and no network operation.
+- [ ] Write tests proving hook capture publishes durable evidence without Git,
+  scheduled maintenance checkpoints pending documents, and registry, curation,
+  improvement, and recovery checkpoints have deterministic subjects and no
+  network operation.
 - [ ] Write dashboard/doctor tests for branch, last commit, managed dirtiness, missing ignore rules, and missing remote warning.
 - [ ] Verify RED, implement with real temporary Git repositories, run focused and full tests, then commit.
 
@@ -124,4 +127,3 @@
 - [ ] Create a clean temporary Git repository from the tracked release tree, commit with deterministic release message, and verify its content independently.
 - [ ] Authenticate GitHub CLI if needed, create the public repository, push the clean `main` branch, and verify repository visibility and remote HEAD.
 - [ ] Return the GitHub URL, local package links, test evidence, and any operational limitations.
-

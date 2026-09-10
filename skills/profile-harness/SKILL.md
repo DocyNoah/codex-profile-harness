@@ -23,8 +23,10 @@ Improvement is proposal-only. Never apply a file under
 curation or improvement rewrite identity, user policy, or mandatory instructions.
 
 Run `profile-harness --help` and the relevant subcommand help before operating
-the harness. Capture hooks only record evidence. Use `curate --prepare` for
+the harness. Capture hooks only durably record receipt/cursor evidence and never
+wait for Git. Use `curate --prepare` for
 reviewable input, `curate --apply` for an approved result, `maintain` for one
 scheduled due check, `dashboard` to refresh the index, and `doctor` to inspect
 integrity. Use `git status` and `git log` subcommands to inspect automatic local
-profile checkpoints; the harness never pushes them.
+profile checkpoints. Each scheduled `maintain` also checkpoints pending managed
+documents, even when model work is empty or not due; the harness never pushes.

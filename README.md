@@ -49,6 +49,8 @@ profile/                         one Codex project and profile
 - **Captured** data is model-free, immutable, redacted evidence from lifecycle
   hooks. When a supported transcript delta is unavailable or unsafe, capture
   falls back to the bounded last assistant message and marks quality `partial`.
+  Hooks durably publish only the receipt and transcript cursor; they do not wait
+  for Git.
 - **Curated** data is a model-produced, schema-bounded reconciliation of missed,
   duplicate, or conflicting state. Normal work should update repository
   `STATUS.md` and `TASKS.md` directly and naturally.
@@ -106,6 +108,10 @@ Initialization creates a Git repository for profile-owned documents. The harness
 stages only code-owned managed paths, uses deterministic commit messages, ignores
 runtime evidence and nested `projects/`, and records failures for `doctor`. There
 is **no automatic push** and repository Git histories remain independent.
+Each scheduled `maintain` run checkpoints any pending managed documents after its
+maintenance work, including empty, not-due, and failed runs. Curation or
+improvement commits keep their more specific subject, and the final generic
+checkpoint creates no duplicate commit when no managed diff remains.
 
 ```sh
 profile-harness maintain

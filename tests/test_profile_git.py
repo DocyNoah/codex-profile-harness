@@ -50,6 +50,51 @@ def subjects(root: Path) -> list[str]:
 
 
 class ProfileGitTests(unittest.TestCase):
+    def test_hook_capture_never_invokes_slow_git_and_finishes_inside_envelope(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            parent = Path(temporary_directory)
+            profile = parent / "profile"
+            init_profile(profile, "Work")
+            (profile / "MEMORY.md").write_text("pending managed change\n", encoding="utf-8")
+            fake_bin = parent / "fake-bin"
+            fake_bin.mkdir()
+            marker = parent / "git-invoked"
+            fake_git = fake_bin / "git"
+            fake_git.write_text(
+                f"#!/bin/sh\ntouch {str(marker)!r}\n/bin/sleep 5\n",
+                encoding="utf-8",
+            )
+            fake_git.chmod(0o755)
+            environment = os.environ.copy()
+            environment["PATH"] = str(fake_bin) + os.pathsep + environment.get("PATH", "")
+            for event in ("Stop", "SessionEnd"):
+                with self.subTest(event=event):
+                    payload = json.dumps({
+                        "hook_event_name": event,
+                        "session_id": f"bounded-hook-{event}",
+                        "cwd": str(profile),
+                        "last_assistant_message": "durable receipt only",
+                    })
+                    started = time.monotonic()
+                    captured = subprocess.run(
+                        [sys.executable, str(ROOT / "bin/profile-harness"), "hook", "capture"],
+                        cwd=profile,
+                        input=payload,
+                        text=True,
+                        capture_output=True,
+                        check=False,
+                        env=environment,
+                        timeout=6,
+                    )
+                    elapsed = time.monotonic() - started
+                    self.assertEqual(0, captured.returncode, captured.stderr)
+                    self.assertLess(elapsed, 2.5)
+                    receipt_id = json.loads(captured.stdout)["receipt_id"]
+                    self.assertTrue(
+                        (profile / ".harness/memory/inbox" / f"{receipt_id}.json").is_file()
+                    )
+            self.assertFalse(marker.exists())
+
     def test_hostile_git_environment_cannot_redirect_profile_checkpoint(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             parent = Path(temporary_directory)
@@ -222,6 +267,36 @@ class ProfileGitTests(unittest.TestCase):
             observed = json.loads(env_dump.read_text(encoding="utf-8"))
             self.assertEqual("0", observed.get("GIT_OPTIONAL_LOCKS"))
 
+    def test_permission_denied_group_kill_does_not_escape_reader_thread(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            parent = Path(temporary_directory)
+            profile = parent / "profile"
+            init_profile(profile, "Work")
+            fake_root = parent / "fake-bin"
+            fake_root.mkdir()
+            fake = fake_root / "git"
+            fake.write_text(
+                f"#!{sys.executable}\nimport sys\nsys.stdout.write('x' * 1000000)\n",
+                encoding="utf-8",
+            )
+            fake.chmod(0o755)
+            thread_errors = []
+            original_excepthook = threading.excepthook
+            threading.excepthook = lambda arguments: thread_errors.append(arguments.exc_value)
+            try:
+                with mock.patch.dict(os.environ, {"PATH": str(fake_root)}, clear=False):
+                    with mock.patch.object(
+                        profile_git_module.os,
+                        "killpg",
+                        side_effect=PermissionError("injected group denial"),
+                    ):
+                        with self.assertRaisesRegex(profile_git_module.ProfileGitError, "bounded"):
+                            profile_git_module._git(profile, "status", read_only=True)
+            finally:
+                threading.excepthook = original_excepthook
+
+            self.assertEqual([], thread_errors)
+
     def test_git_deadline_covers_stdin_and_descendant_held_output_pipes(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             parent = Path(temporary_directory)
@@ -354,7 +429,7 @@ class ProfileGitTests(unittest.TestCase):
             self.assertEqual(1, int(git(profile, "rev-list", "--count", "HEAD").stdout))
             self.assertEqual(INITIALIZE_SUBJECT, subjects(profile)[0])
 
-    def test_capture_checkpoint_spy_observes_published_receipt(self) -> None:
+    def test_capture_publishes_receipt_without_invoking_checkpoint(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             profile = Path(temporary_directory) / "profile"
             init_profile(profile, "Work")
@@ -377,7 +452,12 @@ class ProfileGitTests(unittest.TestCase):
                 })
 
             self.assertTrue(result.success)
-            self.assertEqual([(CHECKPOINT_SUBJECT, 1, "published-first")], observed)
+            self.assertEqual([], observed)
+            self.assertTrue(result.receipt_path and result.receipt_path.is_file())
+            self.assertEqual(
+                "published-first",
+                json.loads(result.receipt_path.read_text(encoding="utf-8"))["payload"]["session_id"],
+            )
 
     def test_forbidden_file_matching_does_not_flag_backup_or_example_names(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

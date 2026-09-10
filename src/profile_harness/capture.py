@@ -344,13 +344,9 @@ def capture_event(payload: dict, cwd: Path | None = None) -> CaptureResult:
             publish_cursor(transcript, profile_root)
         except (OSError, ValueError):
             pass
-    result = CaptureResult(
+    return CaptureResult(
         True,
         "captured" if created else "duplicate",
         receipt_id,
         receipt_path,
     )
-    from .profile_git import CHECKPOINT_SUBJECT, checkpoint_profile
-
-    checkpoint_profile(profile_root, CHECKPOINT_SUBJECT)
-    return result

@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -166,6 +167,57 @@ class MaintenanceTests(unittest.TestCase):
             self.assertFalse(list((root / ".harness/improvements/proposed").iterdir()))
             self.assertFalse(list((root / ".harness/memory/journal").iterdir()))
 
+    def test_maintain_noop_checkpoints_pending_managed_documents(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = self.make_profile(Path(temporary_directory))
+            (root / "MEMORY.md").write_text("pending scheduled checkpoint\n", encoding="utf-8")
+
+            output = run_maintenance(root, now=NOW)
+
+            self.assertEqual("no_op", output["curation"]["status"])
+            self.assertEqual("empty", output["curation"]["reason"])
+            self.assertEqual(
+                "harness: checkpoint profile documents",
+                subprocess.run(
+                    ["git", "-C", str(root), "log", "-1", "--format=%s"],
+                    text=True, capture_output=True, check=True,
+                ).stdout.strip(),
+            )
+            self.assertEqual(
+                "pending scheduled checkpoint\n",
+                subprocess.run(
+                    ["git", "-C", str(root), "show", "HEAD:MEMORY.md"],
+                    text=True, capture_output=True, check=True,
+                ).stdout,
+            )
+
+    def test_maintain_failure_still_checkpoints_preexisting_managed_documents(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = self.make_profile(Path(temporary_directory))
+            (root / "MEMORY.md").write_text("pending before failure\n", encoding="utf-8")
+
+            with mock.patch(
+                "profile_harness.maintenance.maintenance_due",
+                side_effect=RuntimeError("injected maintenance failure"),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "injected maintenance failure"):
+                    run_maintenance(root, now=NOW)
+
+            self.assertEqual(
+                "harness: checkpoint profile documents",
+                subprocess.run(
+                    ["git", "-C", str(root), "log", "-1", "--format=%s"],
+                    text=True, capture_output=True, check=True,
+                ).stdout.strip(),
+            )
+            self.assertEqual(
+                "pending before failure\n",
+                subprocess.run(
+                    ["git", "-C", str(root), "show", "HEAD:MEMORY.md"],
+                    text=True, capture_output=True, check=True,
+                ).stdout,
+            )
+
     def test_maintain_due_curation_consumes_only_thirty_receipts(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             parent = Path(temporary_directory)
@@ -195,6 +247,12 @@ class MaintenanceTests(unittest.TestCase):
             self.assertEqual(30, output["curation"]["receipt_count"])
             self.assertEqual(1, len(list((root / ".harness/memory/inbox").glob("*.json"))))
             self.assertEqual(1, len((root / ".harness/memory/journal/curation.jsonl").read_text().splitlines()))
+            subjects = subprocess.run(
+                ["git", "-C", str(root), "log", "--format=%s"],
+                text=True, capture_output=True, check=True,
+            ).stdout.splitlines()
+            self.assertEqual("harness: curate profile memory", subjects[0])
+            self.assertEqual(2, len(subjects))
 
     def test_maintain_rechecks_improvement_after_committing_due_curation(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -245,6 +303,18 @@ class MaintenanceTests(unittest.TestCase):
             self.assertEqual(10, output["improvement"]["new_curations"])
             self.assertEqual(2, len(calls.read_text().splitlines()))
             self.assertEqual(1, len(list((root / ".harness/improvements/proposed").glob("*.md"))))
+            subjects = subprocess.run(
+                ["git", "-C", str(root), "log", "--format=%s"],
+                text=True, capture_output=True, check=True,
+            ).stdout.splitlines()
+            self.assertEqual(
+                [
+                    "harness: propose profile improvement",
+                    "harness: curate profile memory",
+                    "harness: initialize profile",
+                ],
+                subjects,
+            )
 
     def test_injected_clock_is_the_committed_curation_time_used_by_schedule(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

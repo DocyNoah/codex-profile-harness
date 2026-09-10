@@ -26,9 +26,10 @@ documents; protect `.harness/` and backups as confidential.
 
 Hooks execute local code with the user's permissions. Inspect the source and
 generated `hooks/hooks.json` before approval. The bundled hook invokes only the
-capture command and does not call a model. The installer never approves or
-bypasses hook trust. A malicious source checkout or local account can replace
-code before execution; use a reviewed release and normal filesystem protections.
+capture command, durably publishes receipt/cursor evidence, and calls neither a
+model nor Git. The installer never approves or bypasses hook trust. A malicious
+source checkout or local account can replace code before execution; use a
+reviewed release and normal filesystem protections.
 
 ## Installation and managed Git paths
 
@@ -43,6 +44,9 @@ state. Runtime receipts, processing/archive/state/log directories,
 `DASHBOARD.md`, and nested repositories are ignored. Harness checkpoint commands
 disable Git hooks and hostile repository environment variables at their own
 boundary; normal Git usage is unaffected. There is no automatic push.
+Scheduled maintenance performs the generic retry checkpoint after its protected
+work even when model work is empty, not due, or fails. Lifecycle hooks never run
+Git, so a slow or wedged Git executable cannot consume their completion window.
 
 Local history is auditability, not backup. Disk loss destroys it with the profile.
 Keep encrypted or otherwise protected independent backups, and remember that
@@ -55,7 +59,8 @@ Curation and improvement use durable transaction descriptors, snapshots,
 cryptographic digests, bounded hash-chained journals, and one profile lease.
 Recovery rolls back pre-commit work or completes post-commit publication without
 racing a live owner. Git checkpoint failure does not invalidate a completed
-capture/curation; the failure is recorded for `doctor` and a later checkpoint.
+harness transaction; the failure is recorded for `doctor` and a later scheduled
+checkpoint.
 
 Run `profile-harness doctor` after install, upgrade, restore, crashes, or suspected
 tampering. Do not edit receipts, journal entries, or transaction descriptors to
