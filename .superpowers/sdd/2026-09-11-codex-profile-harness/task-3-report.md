@@ -396,3 +396,74 @@ OK
 
 All commands exited 0. No new marketplace or user configuration files were
 created or changed.
+
+## Re-review fix: bounded streaming snapshot restoration
+
+Re-review fix commit SHA: `1ed297a80157cdcca10a7350e3e72cfb2b6b9601`
+
+Root cause: the first atomic-rollback fix passed `snapshot.read_bytes()` into
+`atomic_write_bytes`. Publication was atomic, but it still allocated the entire
+snapshot before writing the temporary file.
+
+The regression test blocks `Path.read_bytes()` for snapshot paths and wraps the
+snapshot input stream so a missing, non-positive, or greater-than-1-MiB read
+size fails immediately.
+
+RED command:
+
+```text
+PYTHONPYCACHEPREFIX=/private/tmp/task3-review-stream-red \
+  python3 -m unittest \
+  tests.test_curation.CurationTests.test_rollback_streams_snapshot_without_an_unbounded_read -v
+```
+
+Observed before the fix:
+
+```text
+RuntimeError: injected write failure
+During handling of the above exception, another exception occurred:
+AssertionError: rollback attempted an unbounded snapshot read
+Ran 1 test
+FAILED (failures=1)
+```
+
+Fix: added `atomic_copy_file`, which reads the snapshot only in fixed 1-MiB
+chunks, writes a same-directory temporary file, flushes and `fsync`s it, then
+publishes with `os.replace`. Rollback now streams snapshot restoration through
+this helper and retains the existing post-publication mode restoration.
+
+Focused GREEN command:
+
+```text
+PYTHONPYCACHEPREFIX=/private/tmp/task3-review-stream-green \
+  python3 -m unittest \
+  tests.test_curation.CurationTests.test_rollback_streams_snapshot_without_an_unbounded_read \
+  tests.test_curation.CurationTests.test_rollback_atomically_replaces_a_read_only_journal_head \
+  tests.test_curation.CurationTests.test_injected_failure_restores_files_journal_and_receipts -v
+```
+
+Result:
+
+```text
+Ran 3 tests in 0.046s
+OK
+```
+
+Full verification commands:
+
+```text
+git diff --check
+PYTHONPYCACHEPREFIX=/private/tmp/task3-review-stream-final-cache \
+  python3 -m py_compile src/profile_harness/*.py bin/profile-harness
+python3 -m json.tool schemas/curation-result.schema.json
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -v
+```
+
+Result:
+
+```text
+Ran 54 tests in 2.063s
+OK
+```
+
+All verification commands exited 0. No unrelated behavior was changed.
