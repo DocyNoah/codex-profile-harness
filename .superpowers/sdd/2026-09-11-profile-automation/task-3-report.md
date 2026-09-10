@@ -114,3 +114,52 @@ implemented.
 
 - No new concerns. Missing remotes remain intentionally warning-only, and Task
   4 public-release work remains untouched.
+
+## Fix round 2
+
+### Commit
+
+- `55b79d5b9be9197a181a8eebd0d2e97ad6d92e86` — `fix: bound profile git critical sections`
+
+### RED evidence
+
+- A fake Git process that did not consume a 1 MiB stdin payload and left a child
+  holding its output pipes exceeded the intended 100 ms limit, proving the old
+  timeout began only after the blocking stdin write and did not cover reader
+  completion or descendants.
+- A real subprocess holding `profile-git.guard` showed that checkpoint/capture
+  had no configurable guard acquisition deadline.
+- A coordinated real competitor process acquired the guard between `git init`
+  and the initial commit, committed the profile with the generic documents
+  subject, and caused initialization to return without its own commit.
+
+### Behavior
+
+- The Git deadline now begins before process creation and covers bounded stdin
+  delivery, process execution, stdout/stderr draining, and worker completion.
+  Git runs in a new session; timeout or output overflow kills the whole process
+  group so descendants cannot retain pipes beyond the deadline.
+- Profile Git guard acquisition uses nonblocking flock with a bounded retry
+  window. Contended checkpoints return a safe diagnostic result, and hook
+  capture still publishes its receipt within the bounded wait.
+- Repository creation and the first deterministic commit now execute under one
+  uninterrupted profile Git guard. A real competing CLI process observes the
+  completed initial commit and produces a no-op rather than changing its
+  subject.
+- Four concurrent CLI checkpoint processes serialize to exactly one commit.
+  A direct capture spy also verifies checkpoint invocation sees the complete,
+  parseable receipt already published in the inbox.
+
+### Verification
+
+- Focused profile Git suite: 27 tests passed in 5.814s with `ResourceWarning`
+  promoted to errors.
+- Full suite: 155 tests passed in 41.379s with `ResourceWarning` promoted to
+  errors.
+- `python3 -m compileall -q src tests` — exit 0.
+- `git diff --check` — exit 0.
+
+### Concerns
+
+- No new concerns. Git and guard waits are bounded; public-release work remains
+  deferred to Task 4.
