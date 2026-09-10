@@ -288,3 +288,95 @@ Result: exit 0; compile succeeded and `git diff --check` produced no output.
 ### Concerns
 
 None.
+
+## One-time safe cursor migration correction
+
+This section supersedes both prior legacy-upgrade approaches. Pre-release
+metadata-less cursors are migrated without reconstructing transcript history or
+reading, validating, trusting, or reusing any receipt at the legacy ID.
+
+### Root cause
+
+The direct-lookup correction still treated an unverifiable pre-release receipt
+as authoritative evidence. Its legacy ID bound only delivery input, not the
+transcript evidence, so even structurally valid evidence could not be proven to
+belong to the cursor's last delta.
+
+### RED evidence
+
+The regression contract was changed first so valid, cumulative-over-1-MiB, and
+tampered legacy receipts must all be ignored in favor of one explicit migration
+receipt. A metadata-less cursor with appended complete bytes remains a normal
+new-delta capture.
+
+Command:
+
+```text
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_transcript_capture.TranscriptCaptureTests.test_legacy_cursor_publishes_one_safe_migration_receipt tests.test_transcript_capture.TranscriptCaptureTests.test_legacy_cursor_migrates_after_multiple_megabyte_captures tests.test_transcript_capture.TranscriptCaptureTests.test_legacy_cursor_rejects_tampered_receipt_payload tests.test_transcript_capture.TranscriptCaptureTests.test_legacy_cursor_with_new_delta_captures_only_the_new_evidence -v
+```
+
+Pre-fix result: 4 tests ran with 3 failures in 0.677s. Valid and cumulative
+legacy receipts were returned as `duplicate` instead of creating migration
+receipts; the mismatch path created an empty receipt with `capture_quality` set
+to `complete` instead of the required `partial`. The new-complete-delta guard
+passed.
+
+### Implementation
+
+- Removed `_duplicate_published_legacy_delivery` and all legacy receipt lookup,
+  validation, and reuse branches.
+- When a matching metadata-less cursor has no new complete delta, capture now
+  replaces enrichment with empty user and assistant lists, the SHA-256 digest
+  of empty bytes, and `capture_quality = "partial"`. The transcript path is
+  omitted under the existing partial-capture contract.
+- The migration payload participates in the existing canonical evidence-bound
+  receipt ID, is durably published before cursor replacement, and records its
+  `receipt_id` plus the delivery digest in the promoted cursor. Exact retry
+  reuses that migration ID, so only one migration receipt is created.
+- A metadata-less cursor with a new complete delta bypasses migration and uses
+  the normal complete enriched receipt path. Previously consumed transcript
+  bytes are never reread or republished.
+- `CHANGELOG.md` documents the one-time safe migration of pre-release
+  transcript cursors.
+
+### Verification
+
+Migration regressions:
+
+```text
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_transcript_capture.TranscriptCaptureTests.test_legacy_cursor_publishes_one_safe_migration_receipt tests.test_transcript_capture.TranscriptCaptureTests.test_legacy_cursor_migrates_after_multiple_megabyte_captures tests.test_transcript_capture.TranscriptCaptureTests.test_legacy_cursor_rejects_tampered_receipt_payload tests.test_transcript_capture.TranscriptCaptureTests.test_legacy_cursor_with_new_delta_captures_only_the_new_evidence tests.test_transcript_capture.TranscriptCaptureTests.test_legacy_receipt_is_not_reused_without_a_matching_legacy_cursor -v
+```
+
+Result: 5 tests passed in 0.792s, 0 failures.
+
+Focused GREEN:
+
+```text
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_transcript_capture
+```
+
+Result: 22 tests passed in 3.576s, 0 failures.
+
+Complete suite:
+
+```text
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests
+```
+
+Result: 178 tests passed in 46.216s, 0 failures.
+
+Compile and whitespace verification:
+
+```text
+python3 -m compileall -q src tests && git diff --check
+```
+
+Result: exit 0; compile succeeded and `git diff --check` produced no output.
+
+### Implementation commit
+
+`71be4a1`
+
+### Concerns
+
+None.
