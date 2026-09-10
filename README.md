@@ -12,9 +12,12 @@ Profile identity and policy files are outside the curation write boundary.
 ## Requirements
 
 - Python 3.11 or newer on macOS or Linux
-- Codex CLI only when using `curate --run` or `doctor --check-codex`
+- Codex CLI for local marketplace/plugin installation and automatic curation
+  with `curate --run`; `doctor --check-codex` optionally verifies its presence
 
-The runtime uses only the Python standard library.
+The installed harness runtime uses only the Python standard library. Manual
+capture, prepare/apply, dashboard, and ordinary doctor commands do not invoke
+the Codex CLI after installation.
 
 ## Quick start
 

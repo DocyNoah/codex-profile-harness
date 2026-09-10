@@ -19,7 +19,14 @@ from .config import (
     PROFILE_DIRECTORIES,
     load_profile_config,
 )
-from .curation import CurationError, _valid_receipt
+from .curation import (
+    MAX_ACTIONS,
+    MAX_ARRAY_ITEMS,
+    MAX_CONTENT_CHARS,
+    MAX_IDENTIFIER_CHARS,
+    CurationError,
+    _valid_receipt,
+)
 from .journal import verify_journal
 
 
@@ -74,6 +81,36 @@ CURATION_ACTION_REFS = {
     "#/$defs/repoTasks",
     "#/$defs/repoDecision",
     "#/$defs/discard",
+}
+CURATION_ACTION_CONTRACTS = {
+    "profileMemory": (
+        "profile_memory",
+        {"type", "kind", "title", "content", "source_receipt_ids"},
+    ),
+    "profileProposal": (
+        "profile_proposal",
+        {"type", "title", "content", "source_receipt_ids"},
+    ),
+    "repoStatus": (
+        "repo_status",
+        {"type", "repository", "content", "source_receipt_ids"},
+    ),
+    "repoTasks": (
+        "repo_tasks",
+        {"type", "repository", "content", "source_receipt_ids"},
+    ),
+    "repoDecision": (
+        "repo_decision",
+        {
+            "type",
+            "repository",
+            "title",
+            "content",
+            "supersedes",
+            "source_receipt_ids",
+        },
+    ),
+    "discard": ("discard", {"type", "reason", "source_receipt_ids"}),
 }
 
 
@@ -199,37 +236,193 @@ def _validate_receipt_schema(value: object) -> None:
         raise ValueError("receipt schema must reject additional properties")
 
 
-def _validate_curation_schema(value: object) -> None:
+def _exact_integer(schema: dict, field: str, expected: int, label: str) -> None:
+    value = schema.get(field)
+    if isinstance(value, bool) or not isinstance(value, int) or value != expected:
+        raise ValueError(f"{label}.{field} must equal {expected}")
+
+
+def _object_contract(value: object, fields: set[str], label: str) -> dict:
     if not isinstance(value, dict) or value.get("type") != "object":
-        raise ValueError("curation schema root must be an object")
-    if set(value.get("required", [])) != {"actions"}:
-        raise ValueError("curation schema must require actions")
+        raise ValueError(f"{label} must be an object schema")
+    required = value.get("required")
+    if (
+        not isinstance(required, list)
+        or any(not isinstance(item, str) for item in required)
+        or len(required) != len(fields)
+        or set(required) != fields
+    ):
+        raise ValueError(f"{label}.required must match the runtime fields")
     properties = value.get("properties")
-    actions = properties.get("actions") if isinstance(properties, dict) else None
-    items = actions.get("items") if isinstance(actions, dict) else None
-    one_of = items.get("oneOf") if isinstance(items, dict) else None
-    refs = (
-        {item.get("$ref") for item in one_of if isinstance(item, dict)}
-        if isinstance(one_of, list)
-        else set()
-    )
-    if (
-        not isinstance(actions, dict)
-        or actions.get("type") != "array"
-        or not isinstance(actions.get("maxItems"), int)
-        or actions["maxItems"] < 1
-        or refs != CURATION_ACTION_REFS
-    ):
-        raise ValueError("curation actions schema does not allow the exact action set")
-    definitions = value.get("$defs")
-    required_definitions = {reference.rsplit("/", 1)[-1] for reference in refs}
-    if (
-        not isinstance(definitions, dict)
-        or not required_definitions <= definitions.keys()
-    ):
-        raise ValueError("curation schema is missing action definitions")
+    if not isinstance(properties, dict) or set(properties) != fields:
+        raise ValueError(f"{label}.properties must match the runtime fields")
     if value.get("additionalProperties") is not False:
-        raise ValueError("curation schema must reject additional properties")
+        raise ValueError(f"{label} must reject additional properties")
+    return properties
+
+
+def _string_contract(
+    value: object,
+    *,
+    minimum: int | None,
+    maximum: int,
+    label: str,
+    pattern: str | None = None,
+) -> None:
+    if not isinstance(value, dict) or value.get("type") != "string":
+        raise ValueError(f"{label} must be a string schema")
+    if minimum is not None:
+        _exact_integer(value, "minLength", minimum, label)
+    _exact_integer(value, "maxLength", maximum, label)
+    if pattern is not None and value.get("pattern") != pattern:
+        raise ValueError(f"{label}.pattern must preserve the runtime constraint")
+
+
+def _array_contract(
+    value: object,
+    *,
+    maximum: int,
+    unique: bool,
+    label: str,
+    minimum: int | None = None,
+) -> dict:
+    if not isinstance(value, dict) or value.get("type") != "array":
+        raise ValueError(f"{label} must be an array schema")
+    _exact_integer(value, "maxItems", maximum, label)
+    if minimum is not None:
+        _exact_integer(value, "minItems", minimum, label)
+    if unique and value.get("uniqueItems") is not True:
+        raise ValueError(f"{label}.uniqueItems must be true")
+    items = value.get("items")
+    if not isinstance(items, dict):
+        raise ValueError(f"{label}.items must be a schema")
+    return items
+
+
+def _reference_contract(value: object, reference: str, label: str) -> None:
+    if not isinstance(value, dict) or value.get("$ref") != reference:
+        raise ValueError(f"{label} must reference {reference}")
+
+
+def _validate_curation_schema(value: object) -> None:
+    top_properties = _object_contract(
+        value, {"actions"}, "curation actions result"
+    )
+    actions = top_properties["actions"]
+    if not isinstance(actions, dict) or actions.get("type") != "array":
+        raise ValueError("curation actions must be an array schema")
+    _exact_integer(actions, "maxItems", MAX_ACTIONS, "curation actions")
+    items = actions.get("items")
+    one_of = items.get("oneOf") if isinstance(items, dict) else None
+    if (
+        not isinstance(one_of, list)
+        or len(one_of) != len(CURATION_ACTION_REFS)
+        or any(
+            not isinstance(item, dict) or set(item) != {"$ref"}
+            for item in one_of
+        )
+        or {item["$ref"] for item in one_of} != CURATION_ACTION_REFS
+    ):
+        raise ValueError("curation actions must use the exact action oneOf")
+
+    definitions = value.get("$defs") if isinstance(value, dict) else None
+    if not isinstance(definitions, dict):
+        raise ValueError("curation schema must contain definitions")
+    required_definitions = {"sources", "content", *CURATION_ACTION_CONTRACTS}
+    if not required_definitions <= definitions.keys():
+        raise ValueError("curation schema is missing runtime definitions")
+
+    source_items = _array_contract(
+        definitions["sources"],
+        minimum=1,
+        maximum=MAX_ARRAY_ITEMS,
+        unique=True,
+        label="sources",
+    )
+    _string_contract(
+        source_items,
+        minimum=1,
+        maximum=MAX_IDENTIFIER_CHARS,
+        label="sources.items",
+    )
+    _string_contract(
+        definitions["content"],
+        minimum=1,
+        maximum=MAX_CONTENT_CHARS,
+        label="content",
+    )
+
+    for name, (action_type, fields) in CURATION_ACTION_CONTRACTS.items():
+        properties = _object_contract(definitions[name], fields, name)
+        type_property = properties["type"]
+        if (
+            not isinstance(type_property, dict)
+            or type_property.get("const") != action_type
+        ):
+            raise ValueError(f"{name}.type must select {action_type}")
+        if "content" in fields:
+            _reference_contract(
+                properties["content"], "#/$defs/content", f"{name}.content"
+            )
+        if "title" in fields:
+            _reference_contract(
+                properties["title"], "#/$defs/content", f"{name}.title"
+            )
+        if "reason" in fields:
+            _reference_contract(
+                properties["reason"], "#/$defs/content", f"{name}.reason"
+            )
+        if name != "discard":
+            _reference_contract(
+                properties["source_receipt_ids"],
+                "#/$defs/sources",
+                f"{name}.source_receipt_ids",
+            )
+
+    memory_kind = definitions["profileMemory"]["properties"]["kind"]
+    if (
+        not isinstance(memory_kind, dict)
+        or not isinstance(memory_kind.get("enum"), list)
+        or len(memory_kind["enum"]) != 2
+        or set(memory_kind["enum"]) != {"semantic", "procedural"}
+    ):
+        raise ValueError("profileMemory.kind must allow semantic or procedural")
+
+    for name in ("repoStatus", "repoTasks", "repoDecision"):
+        repository = definitions[name]["properties"]["repository"]
+        _string_contract(
+            repository,
+            minimum=1,
+            maximum=MAX_IDENTIFIER_CHARS,
+            label=f"{name}.repository",
+        )
+
+    supersedes = _array_contract(
+        definitions["repoDecision"]["properties"]["supersedes"],
+        maximum=MAX_ARRAY_ITEMS,
+        unique=True,
+        label="repoDecision.supersedes",
+    )
+    _string_contract(
+        supersedes,
+        minimum=None,
+        maximum=20,
+        pattern="^[0-9]+$",
+        label="repoDecision.supersedes.items",
+    )
+
+    discard_sources = _array_contract(
+        definitions["discard"]["properties"]["source_receipt_ids"],
+        maximum=MAX_ARRAY_ITEMS,
+        unique=True,
+        label="discard.source_receipt_ids",
+    )
+    _string_contract(
+        discard_sources,
+        minimum=1,
+        maximum=MAX_IDENTIFIER_CHARS,
+        label="discard.source_receipt_ids.items",
+    )
 
 
 JSON_VALIDATORS = {

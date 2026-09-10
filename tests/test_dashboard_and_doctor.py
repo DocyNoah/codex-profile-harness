@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import Callable
+import copy
 from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
@@ -298,6 +300,183 @@ class DoctorTests(unittest.TestCase):
 
                     self.assertFalse(report.ok)
                     self.assertIn(expected, report.format())
+
+    def test_doctor_rejects_weakened_curation_action_contracts(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            parent = Path(temporary_directory)
+            root = parent / "profile"
+            plugin = parent / "plugin"
+            init_profile(root, "Work")
+            shutil.copytree(
+                ROOT,
+                plugin,
+                ignore=shutil.ignore_patterns(
+                    ".git", ".superpowers", "__pycache__", "*.pyc"
+                ),
+            )
+            schema_path = plugin / "schemas/curation-result.schema.json"
+            original = json.loads(schema_path.read_text(encoding="utf-8"))
+
+            def set_value(
+                path: tuple[str, ...], value: object
+            ) -> Callable[[dict], None]:
+                def mutate(schema: dict) -> None:
+                    target = schema
+                    for key in path[:-1]:
+                        target = target[key]
+                    target[path[-1]] = value
+
+                return mutate
+
+            mutations = {
+                "top-level action limit": set_value(
+                    ("properties", "actions", "maxItems"), 101
+                ),
+                "top-level oneOf item": set_value(
+                    (
+                        "properties",
+                        "actions",
+                        "items",
+                        "oneOf",
+                    ),
+                    [{"$ref": "#/$defs/repoStatus"}] * 6,
+                ),
+                "shared source array type": set_value(
+                    ("$defs", "sources", "type"), "object"
+                ),
+                "shared source minimum": set_value(
+                    ("$defs", "sources", "minItems"), 0
+                ),
+                "shared source limit": set_value(
+                    ("$defs", "sources", "maxItems"), 101
+                ),
+                "shared source uniqueness": set_value(
+                    ("$defs", "sources", "uniqueItems"), False
+                ),
+                "shared source item type": set_value(
+                    ("$defs", "sources", "items", "type"), "number"
+                ),
+                "shared source item length": set_value(
+                    ("$defs", "sources", "items", "maxLength"), 129
+                ),
+                "shared content type": set_value(
+                    ("$defs", "content", "type"), "array"
+                ),
+                "shared content minimum": set_value(
+                    ("$defs", "content", "minLength"), 0
+                ),
+                "shared content limit": set_value(
+                    ("$defs", "content", "maxLength"), 64001
+                ),
+                "profile memory object": set_value(
+                    ("$defs", "profileMemory", "type"), "array"
+                ),
+                "profile memory kind": set_value(
+                    ("$defs", "profileMemory", "properties", "kind", "enum"),
+                    ["semantic", "procedural", "episodic"],
+                ),
+                "profile proposal required": set_value(
+                    ("$defs", "profileProposal", "required"),
+                    ["type", "title", "content"],
+                ),
+                "repository status additional fields": set_value(
+                    ("$defs", "repoStatus", "additionalProperties"), True
+                ),
+                "repository status name limit": set_value(
+                    (
+                        "$defs",
+                        "repoStatus",
+                        "properties",
+                        "repository",
+                        "maxLength",
+                    ),
+                    129,
+                ),
+                "repository tasks action kind": set_value(
+                    ("$defs", "repoTasks", "properties", "type", "const"),
+                    "repo_status",
+                ),
+                "repository tasks content ref": set_value(
+                    ("$defs", "repoTasks", "properties", "content", "$ref"),
+                    "#/$defs/sources",
+                ),
+                "repository decision required": set_value(
+                    ("$defs", "repoDecision", "required"),
+                    [
+                        "type",
+                        "repository",
+                        "title",
+                        "content",
+                        "source_receipt_ids",
+                    ],
+                ),
+                "supersedes item pattern": set_value(
+                    (
+                        "$defs",
+                        "repoDecision",
+                        "properties",
+                        "supersedes",
+                        "items",
+                        "pattern",
+                    ),
+                    ".*",
+                ),
+                "supersedes uniqueness": set_value(
+                    (
+                        "$defs",
+                        "repoDecision",
+                        "properties",
+                        "supersedes",
+                        "uniqueItems",
+                    ),
+                    False,
+                ),
+                "supersedes item length": set_value(
+                    (
+                        "$defs",
+                        "repoDecision",
+                        "properties",
+                        "supersedes",
+                        "items",
+                        "maxLength",
+                    ),
+                    21,
+                ),
+                "supersedes item limit": set_value(
+                    (
+                        "$defs",
+                        "repoDecision",
+                        "properties",
+                        "supersedes",
+                        "maxItems",
+                    ),
+                    101,
+                ),
+                "discard required": set_value(
+                    ("$defs", "discard", "required"), ["type", "reason"]
+                ),
+                "discard source limit": set_value(
+                    (
+                        "$defs",
+                        "discard",
+                        "properties",
+                        "source_receipt_ids",
+                        "maxItems",
+                    ),
+                    101,
+                ),
+            }
+            for name, mutate in mutations.items():
+                with self.subTest(contract=name):
+                    schema = copy.deepcopy(original)
+                    mutate(schema)
+                    schema_path.write_text(json.dumps(schema), encoding="utf-8")
+
+                    with mock.patch("profile_harness.doctor.PLUGIN_ROOT", plugin):
+                        report = diagnose(root)
+
+                    self.assertFalse(report.ok, name)
+                    self.assertIn("curation-result.schema.json", report.format())
 
     def test_doctor_cli_diagnoses_profile_with_missing_config(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
