@@ -175,3 +175,85 @@ Result: exit 0; compile succeeded and `git diff --check` produced no output.
 ### Concerns
 
 None.
+
+## Partial batch cleanup and collision archive correction
+
+### Root causes
+
+1. Version-2 recovery treated an existing batch directory as proof that its
+   `batch.json` must still exist. `shutil.rmtree()` may remove the manifest and
+   other entries before failing, leaving a legitimate retry state that could no
+   longer be validated.
+2. Receipt validation during WAL recovery reused `_receipt_record()`, whose
+   processing-file contract requires `path.stem == receipt.id`. A valid
+   collision archive named `<receipt>.<batch>.json` intentionally does not meet
+   that naming rule, so a crash after moving it made recovery fail.
+
+### RED evidence
+
+Four regression tests were added before implementation: precommit and committed
+partial-rmtree retry, unrecorded file/link rejection in a partially deleted
+batch, normal collision archive recovery through doctor, and tampered collision
+rejection. The initial focused run produced two errors for the partial-rmtree
+states because the missing `batch.json` was required, and one failure because
+doctor rejected the valid collision receipt with `receipt ID must match its
+filename`. The malicious extra-member and tampered-content cases were already
+fail closed and remained protected.
+
+### Implementation
+
+- Current curation WAL is version 3 and records the exact original direct batch
+  member allowlist with SHA-256 digests. Required entries are the immutable
+  manifest, prompt, and transaction receipts; the bounded result is recorded
+  when present.
+- Recovery derives receipt identity and canonical receipt digests from the WAL
+  archive evidence before consulting the directory. If the batch remains, each
+  remaining entry must be a recorded direct regular file with its original
+  digest. Missing recorded entries are allowed because `rmtree` may already
+  have deleted them. Any added file, directory, or symlink fails before
+  mutation.
+- When `batch.json` remains, its strict manifest is still parsed and must agree
+  with WAL receipt IDs and canonical digests. If it was already deleted, the
+  descriptor evidence plus exact receipt state and journal binding provide the
+  retry proof.
+- Transaction receipt validation now accepts an explicit expected internal ID
+  and computes its canonical digest independently of the storage filename.
+  Source, inbox, plain archive, and collision archive paths remain separately
+  restricted to their exact transaction-derived locations.
+- Existing v1/v2 compatibility, target/snapshot ownership checks, journal
+  binding, repeated-write recovery, and doctor fail-closed behavior are
+  unchanged.
+
+### Verification
+
+Focused recovery and curation suite:
+
+```text
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_curation tests.test_final_hardening -v
+```
+
+Result: 53 tests passed in 15.528s, 0 failures.
+
+Complete suite:
+
+```text
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests
+```
+
+Result: 189 tests passed in 52.074s, 0 failures.
+
+Compile and whitespace verification:
+
+```text
+python3 -m compileall -q src tests && git diff --check
+```
+
+Result: exit 0; compile succeeded and `git diff --check` produced no output.
+
+### Implementation commit
+
+`4e4da0c`
+
+### Concerns
+
+None.
