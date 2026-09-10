@@ -80,6 +80,21 @@ class TranscriptCaptureTests(unittest.TestCase):
             (self.root / ".harness/state/transcript-cursors").glob("*.json")
         )
 
+    def downgrade_capture_to_legacy_cursor(self, transcript: Path) -> tuple[Path, Path]:
+        captured = self.capture(transcript, "turn-1")
+        legacy_id = "3908883c113a968d0ada05bbe0737f8be7bd2547f69b017d7ecc9aea099e32dd"
+        legacy_path = captured.receipt_path.with_name(f"{legacy_id}.json")
+        receipt = self.receipt(captured)
+        receipt["id"] = legacy_id
+        captured.receipt_path.unlink()
+        legacy_path.write_text(json.dumps(receipt), encoding="utf-8")
+        cursor_path = self.cursors()[0]
+        cursor = json.loads(cursor_path.read_text(encoding="utf-8"))
+        cursor.pop("receipt_id")
+        cursor.pop("delivery_digest")
+        cursor_path.write_text(json.dumps(cursor), encoding="utf-8")
+        return legacy_path, cursor_path
+
     def test_captures_each_complete_delta_once(self) -> None:
         transcript = self.codex_home / "sessions/session.jsonl"
         transcript.parent.mkdir()
@@ -206,6 +221,42 @@ class TranscriptCaptureTests(unittest.TestCase):
                 )
                 self.assertEqual("duplicate", exact_redelivery.status)
                 self.assertEqual(second.receipt_id, exact_redelivery.receipt_id)
+
+    def test_legacy_cursor_reuses_valid_legacy_receipt_and_promotes_metadata(self) -> None:
+        transcript = self.codex_home / "legacy.jsonl"
+        transcript.write_bytes(jsonl(response_message("assistant", "legacy evidence")))
+        legacy_path, cursor_path = self.downgrade_capture_to_legacy_cursor(transcript)
+        original = legacy_path.read_bytes()
+
+        redelivery = self.capture(transcript, "turn-1")
+
+        self.assertEqual("duplicate", redelivery.status)
+        self.assertEqual(legacy_path, redelivery.receipt_path)
+        self.assertEqual(original, legacy_path.read_bytes())
+        self.assertEqual(1, len(list(legacy_path.parent.glob("*.json"))))
+        promoted = json.loads(cursor_path.read_text(encoding="utf-8"))
+        self.assertEqual(legacy_path.stem, promoted["receipt_id"])
+        self.assertEqual(legacy_path.stem, promoted["delivery_digest"])
+
+    def test_legacy_cursor_rejects_tampered_receipt_payload(self) -> None:
+        transcript = self.codex_home / "legacy-tampered.jsonl"
+        transcript.write_bytes(jsonl(response_message("assistant", "legacy evidence")))
+        legacy_path, cursor_path = self.downgrade_capture_to_legacy_cursor(transcript)
+        tampered = json.loads(legacy_path.read_text(encoding="utf-8"))
+        tampered["payload"]["assistant_messages"] = ["tampered but schema-valid"]
+        legacy_path.write_text(json.dumps(tampered), encoding="utf-8")
+
+        redelivery = self.capture(transcript, "turn-1")
+
+        self.assertEqual("captured", redelivery.status)
+        self.assertNotEqual(legacy_path, redelivery.receipt_path)
+        self.assertEqual(
+            ["legacy evidence"],
+            self.receipt(redelivery)["payload"]["assistant_messages"],
+        )
+        promoted = json.loads(cursor_path.read_text(encoding="utf-8"))
+        self.assertEqual(redelivery.receipt_id, promoted["receipt_id"])
+        self.assertEqual(legacy_path.stem, promoted["delivery_digest"])
 
     def test_redelivery_is_duplicate_and_does_not_move_cursor(self) -> None:
         transcript = self.codex_home / "session.jsonl"

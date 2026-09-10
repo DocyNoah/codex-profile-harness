@@ -25,6 +25,7 @@ class TranscriptDelta:
     cursor: dict[str, object] | None = None
     previous_receipt_id: str | None = None
     previous_delivery_digest: str | None = None
+    legacy_evidence: dict[str, object] | None = None
     has_complete_delta: bool = False
 
 
@@ -155,6 +156,44 @@ def _message(record: object) -> tuple[str, str] | None:
     return role, "\n".join(texts)
 
 
+def _evidence_payload(
+    complete: bytes,
+    normalize: Callable[[str], str],
+    quality: str = "complete",
+) -> dict[str, object]:
+    users: list[str] = []
+    assistants: list[str] = []
+    for raw_line in complete.splitlines():
+        if not raw_line:
+            raise TranscriptUnavailable("malformed transcript")
+        try:
+            record = json.loads(
+                raw_line.decode("utf-8"),
+                parse_constant=_reject_json_constant,
+            )
+        except (
+            UnicodeDecodeError,
+            json.JSONDecodeError,
+            ValueError,
+            RecursionError,
+        ) as error:
+            raise TranscriptUnavailable("malformed transcript") from error
+        parsed = _message(record)
+        if parsed is None:
+            continue
+        role, text = parsed
+        destination = users if role == "user" else assistants
+        destination.append(normalize(text))
+    if len(users) > MAX_MESSAGES_PER_ROLE or len(assistants) > MAX_MESSAGES_PER_ROLE:
+        quality = "partial"
+    return {
+        "user_messages": users[-MAX_MESSAGES_PER_ROLE:],
+        "assistant_messages": assistants[-MAX_MESSAGES_PER_ROLE:],
+        "transcript_digest": hashlib.sha256(complete).hexdigest(),
+        "capture_quality": quality,
+    }
+
+
 def prepare_transcript_delta(
     profile_root: Path,
     session_id: str,
@@ -180,6 +219,8 @@ def prepare_transcript_delta(
             quality = "complete"
             previous_receipt_id = None
             previous_delivery_digest = None
+            loaded_legacy_cursor = False
+            prefix = b""
             if cursor is not None:
                 prefix_length = int(cursor["prefix_length"])
                 os.lseek(descriptor, 0, os.SEEK_SET)
@@ -197,6 +238,7 @@ def prepare_transcript_delta(
                     prefix_digest = str(cursor["prefix_sha256"])
                     previous_receipt_id = cursor.get("receipt_id")
                     previous_delivery_digest = cursor.get("delivery_digest")
+                    loaded_legacy_cursor = previous_receipt_id is None
                 else:
                     prefix_length = 0
                     quality = "partial"
@@ -207,36 +249,7 @@ def prepare_transcript_delta(
             appended = _read_at_most(descriptor, budget)
             newline = appended.rfind(b"\n")
             complete = appended[: newline + 1] if newline >= 0 else b""
-            users: list[str] = []
-            assistants: list[str] = []
-            for raw_line in complete.splitlines():
-                if not raw_line:
-                    raise TranscriptUnavailable("malformed transcript")
-                try:
-                    record = json.loads(
-                        raw_line.decode("utf-8"),
-                        parse_constant=_reject_json_constant,
-                    )
-                except (
-                    UnicodeDecodeError,
-                    json.JSONDecodeError,
-                    ValueError,
-                    RecursionError,
-                ) as error:
-                    raise TranscriptUnavailable("malformed transcript") from error
-                parsed = _message(record)
-                if parsed is None:
-                    continue
-                role, text = parsed
-                destination = users if role == "user" else assistants
-                destination.append(normalize(text))
-            if (
-                len(users) > MAX_MESSAGES_PER_ROLE
-                or len(assistants) > MAX_MESSAGES_PER_ROLE
-            ):
-                quality = "partial"
-            users = users[-MAX_MESSAGES_PER_ROLE:]
-            assistants = assistants[-MAX_MESSAGES_PER_ROLE:]
+            evidence = _evidence_payload(complete, normalize, quality)
             new_offset = offset + len(complete)
             if prefix_length == 0 and new_offset:
                 prefix_length = min(new_offset, PREFIX_BYTES)
@@ -249,18 +262,26 @@ def prepare_transcript_delta(
                 "prefix_length": prefix_length,
                 "prefix_sha256": prefix_digest,
             }
+            legacy_evidence = None
+            if (
+                loaded_legacy_cursor
+                and not complete
+                and metadata.st_size <= MAX_TRANSCRIPT_BYTES
+            ):
+                os.lseek(descriptor, prefix_length, os.SEEK_SET)
+                prior = prefix + _read_at_most(
+                    descriptor, offset - prefix_length
+                )
+                if len(prior) == offset:
+                    legacy_evidence = _evidence_payload(prior, normalize)
             return TranscriptDelta(
-                {
-                    "user_messages": users,
-                    "assistant_messages": assistants,
-                    "transcript_digest": hashlib.sha256(complete).hexdigest(),
-                    "capture_quality": quality,
-                },
-                cursor_path,
-                next_cursor,
-                previous_receipt_id,
-                previous_delivery_digest,
-                bool(complete),
+                payload=evidence,
+                cursor_path=cursor_path,
+                cursor=next_cursor,
+                previous_receipt_id=previous_receipt_id,
+                previous_delivery_digest=previous_delivery_digest,
+                legacy_evidence=legacy_evidence,
+                has_complete_delta=bool(complete),
             )
         finally:
             os.close(descriptor)

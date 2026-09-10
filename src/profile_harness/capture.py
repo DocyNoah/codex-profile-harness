@@ -280,23 +280,57 @@ def capture_event(payload: dict, cwd: Path | None = None) -> CaptureResult:
         discriminator_value.strip(),
         normalized.get("last_assistant_message", ""),
     )
-    receipt_id = _receipt_id(
+    enriched_receipt_id = _receipt_id(
         event,
         session_id.strip(),
         discriminator_value.strip(),
         normalized.get("last_assistant_message", ""),
         normalized,
     )
+    receipt_id = enriched_receipt_id
     if (
         not transcript.has_complete_delta
         and transcript.previous_delivery_digest == delivery_digest
         and transcript.previous_receipt_id is not None
     ):
         receipt_id = transcript.previous_receipt_id
+    inbox = profile_root / ".harness/memory/inbox"
+    receipt_cwd = _normalize_text(str(Path(start).expanduser().resolve()), maximum)
+    captured_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    legacy_expected_receipt = None
+    if (
+        not transcript.has_complete_delta
+        and transcript.previous_receipt_id is None
+        and transcript.previous_delivery_digest is None
+        and transcript.legacy_evidence is not None
+    ):
+        legacy_payload = dict(normalized)
+        legacy_payload.update(transcript.legacy_evidence)
+        legacy_path = inbox / f"{delivery_digest}.json"
+        legacy_expected_receipt = {
+            "id": delivery_digest,
+            "event": event,
+            "captured_at": captured_at,
+            "cwd": receipt_cwd,
+            "payload": legacy_payload,
+        }
+        if _duplicate_published_same_transcript(
+            legacy_path, legacy_expected_receipt
+        ):
+            receipt_id = delivery_digest
+        else:
+            normalized = legacy_payload
+            receipt_id = _receipt_id(
+                event,
+                session_id.strip(),
+                discriminator_value.strip(),
+                normalized.get("last_assistant_message", ""),
+                normalized,
+            )
     if transcript.cursor is not None:
         transcript.cursor["receipt_id"] = receipt_id
         transcript.cursor["delivery_digest"] = delivery_digest
-    receipt_path = profile_root / ".harness/memory/inbox" / f"{receipt_id}.json"
+    receipt_path = inbox / f"{receipt_id}.json"
     try:
         require_safe_path(
             profile_root, profile_root / ".harness/memory/inbox", directory=True
@@ -307,16 +341,23 @@ def capture_event(payload: dict, cwd: Path | None = None) -> CaptureResult:
     receipt = {
         "id": receipt_id,
         "event": event,
-        "captured_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-        "cwd": _normalize_text(str(Path(start).expanduser().resolve()), maximum),
+        "captured_at": captured_at,
+        "cwd": receipt_cwd,
         "payload": normalized,
     }
     content = json.dumps(receipt, ensure_ascii=False, sort_keys=True, indent=2) + "\n"
     created = _publish_exclusively(receipt_path, content)
+    published_receipt_expectation = (
+        legacy_expected_receipt
+        if receipt_id == delivery_digest and legacy_expected_receipt is not None
+        else receipt
+    )
     cursor_evidence_published = created or (
         transcript.cursor_path is not None
         and transcript.cursor is not None
-        and _duplicate_published_same_transcript(receipt_path, receipt)
+        and _duplicate_published_same_transcript(
+            receipt_path, published_receipt_expectation
+        )
     )
     if cursor_evidence_published:
         try:
