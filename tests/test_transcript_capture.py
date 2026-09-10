@@ -288,6 +288,39 @@ class TranscriptCaptureTests(unittest.TestCase):
         self.assertEqual(["published"], next_payload["assistant_messages"])
         self.assertEqual(["not published yet"], next_payload["user_messages"])
 
+    def test_duplicate_repair_rejects_invalid_receipt_with_matching_evidence(self) -> None:
+        transcript = self.codex_home / "session.jsonl"
+        transcript.write_bytes(jsonl(response_message("assistant", "evidence")))
+        with mock.patch(
+            "profile_harness.transcript.atomic_write_text",
+            side_effect=OSError("cursor failure"),
+        ):
+            first = self.capture(transcript, "turn-1")
+        original = self.receipt(first)
+        mutations = (
+            ("structure", lambda value: value.update({"unexpected": "invalid"})),
+            ("id", lambda value: value.update({"id": "other"})),
+            ("event", lambda value: value.update({"event": "SessionEnd"})),
+            ("captured_at", lambda value: value.update({"captured_at": "invalid"})),
+            ("cwd", lambda value: value.update({"cwd": "/tampered"})),
+            (
+                "session",
+                lambda value: value["payload"].update({"session_id": "other"}),
+            ),
+        )
+        for label, mutate in mutations:
+            with self.subTest(label=label):
+                tampered = json.loads(json.dumps(original))
+                mutate(tampered)
+                first.receipt_path.write_text(json.dumps(tampered), encoding="utf-8")
+
+                duplicate = self.capture(transcript, "turn-1")
+
+                self.assertEqual("duplicate", duplicate.status)
+                self.assertEqual([], self.cursors())
+        next_payload = self.receipt(self.capture(transcript, "turn-2"))["payload"]
+        self.assertEqual(["evidence"], next_payload["assistant_messages"])
+
     def test_runtime_schema_and_doctor_enforce_optional_enrichment_contract(self) -> None:
         transcript = self.codex_home / "session.jsonl"
         transcript.write_bytes(jsonl(response_message("assistant", "valid")))

@@ -47,6 +47,7 @@ REQUIRED_PLUGIN_FILES = (
     "skills/profile-harness/SKILL.md",
     "scripts/build_local_marketplace.py",
     "src/profile_harness/packaging.py",
+    "src/profile_harness/receipt.py",
     "src/profile_harness/transcript.py",
     "templates/prompts/curate.md",
     "templates/profile/AGENTS.md",

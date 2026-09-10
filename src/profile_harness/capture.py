@@ -14,6 +14,7 @@ from typing import Any
 
 from .config import DEFAULT_MAX_TEXT_CHARS, find_profile_root, load_profile_config
 from .fs import require_safe_path
+from .receipt import ReceiptValidationError, validate_receipt
 from .transcript import prepare_transcript_delta, publish_cursor
 
 
@@ -177,10 +178,11 @@ def _publish_exclusively(path: Path, content: str) -> bool:
 
 
 def _duplicate_published_same_transcript(
-    receipt_path: Path, transcript_payload: dict[str, object]
+    receipt_path: Path, expected_receipt: dict[str, Any]
 ) -> bool:
     """Confirm a duplicate receipt already published this exact delta."""
-    if any(field not in transcript_payload for field in _TRANSCRIPT_EVIDENCE_FIELDS):
+    expected_payload = expected_receipt["payload"]
+    if any(field not in expected_payload for field in _TRANSCRIPT_EVIDENCE_FIELDS):
         return False
     try:
         if receipt_path.is_symlink() or not receipt_path.is_file():
@@ -194,12 +196,25 @@ def _duplicate_published_same_transcript(
             raise ValueError(f"non-standard JSON constant: {value}")
 
         receipt = json.loads(raw.decode("utf-8"), parse_constant=reject_constant)
-    except (OSError, UnicodeDecodeError, ValueError, json.JSONDecodeError):
+        receipt = validate_receipt(
+            receipt,
+            receipt_path,
+            expected_id=expected_receipt["id"],
+        )
+    except (
+        OSError,
+        UnicodeDecodeError,
+        ValueError,
+        json.JSONDecodeError,
+        ReceiptValidationError,
+    ):
         return False
-    existing = receipt.get("payload") if isinstance(receipt, dict) else None
-    return isinstance(existing, dict) and all(
-        existing.get(field) == transcript_payload[field]
-        for field in _TRANSCRIPT_EVIDENCE_FIELDS
+    return (
+        receipt_path.stem == expected_receipt["id"]
+        and receipt["id"] == expected_receipt["id"]
+        and receipt["event"] == expected_receipt["event"]
+        and receipt["cwd"] == expected_receipt["cwd"]
+        and receipt["payload"] == expected_payload
     )
 
 
@@ -267,7 +282,7 @@ def capture_event(payload: dict, cwd: Path | None = None) -> CaptureResult:
     cursor_evidence_published = created or (
         transcript.cursor_path is not None
         and transcript.cursor is not None
-        and _duplicate_published_same_transcript(receipt_path, transcript.payload)
+        and _duplicate_published_same_transcript(receipt_path, receipt)
     )
     if cursor_evidence_published:
         try:

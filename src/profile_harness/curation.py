@@ -22,15 +22,20 @@ from .fs import (
     require_safe_path,
 )
 from .journal import append_entry
+from .receipt import (
+    MAX_IDENTIFIER_CHARS,
+    MAX_RECEIPT_BYTES,
+    RECEIPT_ID as _RECEIPT_ID,
+    ReceiptValidationError,
+    validate_receipt,
+)
 
 
 MAX_ACTIONS = 100
 MAX_ARRAY_ITEMS = 100
 MAX_CONTENT_CHARS = 64_000
-MAX_IDENTIFIER_CHARS = 128
 MAX_PROMPT_CHARS = 500_000
 MAX_RESULT_BYTES = 1024 * 1024
-MAX_RECEIPT_BYTES = 1024 * 1024
 ACTION_TYPES = frozenset(
     {
         "profile_memory",
@@ -44,11 +49,6 @@ ACTION_TYPES = frozenset(
 _ADR = re.compile(r"ADR-(\d{4,})-[a-z0-9-]+\.md")
 _INDEX_LINK = re.compile(r"\[[^]]+\]\(docs/decisions/(ADR-(\d{4,})-[a-z0-9-]+\.md)\)")
 _BATCH_ID = re.compile(r"[0-9]{8}T[0-9]{12}Z-[a-f0-9]{12}")
-_RECEIPT_ID = re.compile(r"[A-Za-z0-9._-]+")
-_RFC3339_UTC = re.compile(
-    r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}"
-    r"(?:\.[0-9]{1,6})?Z"
-)
 
 
 class CurationError(ValueError):
@@ -149,58 +149,10 @@ def _valid_receipt(path: Path, *, expected_id: str | None = None) -> dict[str, A
         receipt = _strict_json(path)
     except (OSError, ValueError, json.JSONDecodeError) as error:
         raise CurationError(f"invalid JSON: {error}") from error
-    if not isinstance(receipt, dict) or set(receipt) - {
-        "id", "event", "captured_at", "cwd", "payload"
-    }:
-        raise CurationError("receipt must be an allowed JSON object")
-    receipt_id = receipt.get("id")
-    if (
-        not isinstance(receipt_id, str)
-        or _RECEIPT_ID.fullmatch(receipt_id) is None
-        or len(receipt_id) > MAX_IDENTIFIER_CHARS
-        or (expected_id is None and path.stem != receipt_id)
-        or (expected_id is not None and expected_id != receipt_id)
-    ):
-        raise CurationError("receipt ID must match its filename")
-    if receipt.get("event") not in {"Stop", "SessionEnd"}:
-        raise CurationError("receipt event is unsupported")
-    captured_at = receipt.get("captured_at")
-    if (
-        not isinstance(captured_at, str)
-        or len(captured_at) > 64
-        or _RFC3339_UTC.fullmatch(captured_at) is None
-    ):
-        raise CurationError("receipt captured_at must be strict RFC3339 UTC")
     try:
-        datetime.fromisoformat(captured_at[:-1] + "+00:00")
-    except ValueError as error:
-        raise CurationError("receipt captured_at must be strict RFC3339 UTC") from error
-    if (
-        not isinstance(receipt.get("cwd"), str)
-        or not receipt["cwd"].strip()
-        or len(receipt["cwd"]) > MAX_RECEIPT_BYTES
-    ):
-        raise CurationError("receipt cwd is required")
-    payload = receipt.get("payload")
-    allowed_payload = {"cwd", "last_assistant_message", "permission_mode", "reason", "session_id", "stop_hook_active", "transcript_path", "turn_id", "extra_keys", "user_messages", "assistant_messages", "transcript_digest", "capture_quality"}
-    text_payload = {"cwd", "last_assistant_message", "permission_mode", "reason", "session_id", "transcript_path", "turn_id"}
-    if (not isinstance(payload, dict) or set(payload) - allowed_payload
-            or not isinstance(receipt["payload"].get("session_id"), str)
-            or not receipt["payload"]["session_id"].strip()
-            or any(key in payload and (not isinstance(payload[key], str) or len(payload[key]) > MAX_RECEIPT_BYTES) for key in text_payload)
-            or ("stop_hook_active" in payload and not isinstance(payload["stop_hook_active"], bool))
-            or ("capture_quality" in payload and payload["capture_quality"] not in {"complete", "partial"})
-            or ("transcript_digest" in payload and (not isinstance(payload["transcript_digest"], str)
-                or re.fullmatch(r"[a-f0-9]{64}", payload["transcript_digest"]) is None))
-            or any(field in payload and (not isinstance(payload[field], list)
-                or len(payload[field]) > 8
-                or any(not isinstance(item, str) or len(item) > MAX_RECEIPT_BYTES for item in payload[field]))
-                for field in ("user_messages", "assistant_messages"))
-            or ("extra_keys" in payload and (not isinstance(payload["extra_keys"], list)
-                or len(payload["extra_keys"]) > 10_000
-                or any(not isinstance(item, str) or len(item) > MAX_RECEIPT_BYTES for item in payload["extra_keys"])) )):
-        raise CurationError("receipt payload must be an object")
-    return receipt
+        return validate_receipt(receipt, path, expected_id=expected_id)
+    except ReceiptValidationError as error:
+        raise CurationError(str(error)) from error
 
 
 def _dead_letter(root: Path, path: Path, reason: str) -> None:
