@@ -268,3 +268,56 @@ implemented.
   valid before configured stale-owner recovery can acquire the lease. No Git
   action occurs in that blocked state, which favors transaction safety over
   checkpointing invalid configuration concurrently.
+
+## Final fix C round 3: Recovery-first fail-closed preflight
+
+### Commit
+
+- `de5c12480e961da8f4fe0f608d9e1ad7f5765185` — `fix: recover before maintenance git preflight`
+
+### RED evidence
+
+- Seven focused tests produced ten expected failures before the fix. They showed
+  preflight ran before recovery, active lease contention still read config,
+  malformed diagnostics and failed retries were ignored, abandoned WAL remained
+  unrecovered when config was invalid, and a recovery checkpoint failure was not
+  retried during the same lease.
+- Real crash fixtures at `after_first_write` and `after_commit` proved the old
+  order could checkpoint partial precommit state under the generic subject or
+  miss the required recovery subject before returning a config error.
+
+### Behavior
+
+- Maintenance now uses the built-in safe stale timeout to acquire its one profile
+  lease before reading configuration. A live owner fails immediately without a
+  checkpoint or config read; an abandoned lease can be safely reclaimed even
+  when config is malformed.
+- Under that lease, curation and improvement WAL recovery completes before Git
+  preflight. Curation transaction validation now loads only the repository
+  registry during recovery, preserving all project path validation without
+  depending on the broken harness config.
+- Recovery-created pending Git failures are consumed immediately by the same
+  lease's subject-preserving preflight. Only a successful/no-op preflight permits
+  config/time validation, due checks, mutation, improvement, or model execution.
+- Malformed/unknown diagnostic metadata and failed exact-subject retries now
+  raise a clear `profile Git preflight failed` error. Their original diagnostic
+  and managed dirtiness remain untouched, and no later maintenance work runs.
+- Real abandoned precommit recovery rolls back partial managed state before a
+  generic config checkpoint. Real postcommit recovery commits durable state with
+  `harness: recover profile state`; both then return the original invalid-config
+  error as required.
+
+### Verification
+
+- Focused maintenance/Git/curation/improvement/recovery/integration suite: 168
+  tests passed in 43.288s with `ResourceWarning` promoted to errors.
+- Full suite: 203 tests passed in 49.804s with `ResourceWarning` promoted to
+  errors.
+- `python3 -m compileall -q src tests` — exit 0.
+- `git diff --check` — exit 0.
+
+### Concerns
+
+- `maintain` deliberately uses the built-in 300-second stale lease threshold
+  before config validation; a profile override cannot govern this recovery-first
+  entry step because the override may itself be unreadable.
