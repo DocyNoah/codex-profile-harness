@@ -32,13 +32,20 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _reject_nonstandard_json_constant(value: str) -> None:
+    raise CaptureError(f"non-standard JSON constant: {value}")
+
+
 def _capture_from_stdin() -> int:
     raw_input = sys.stdin.buffer.read(MAX_INPUT_BYTES + 1)
     try:
         if len(raw_input) > MAX_INPUT_BYTES:
             raise CaptureError("payload exceeds the 1 MiB limit")
         try:
-            payload = json.loads(raw_input.decode("utf-8"))
+            payload = json.loads(
+                raw_input.decode("utf-8"),
+                parse_constant=_reject_nonstandard_json_constant,
+            )
         except (UnicodeDecodeError, json.JSONDecodeError) as error:
             raise CaptureError("stdin must contain one JSON object") from error
         if not isinstance(payload, dict):

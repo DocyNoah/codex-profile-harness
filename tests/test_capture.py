@@ -284,6 +284,9 @@ class CaptureCliTests(unittest.TestCase):
                 "not json",
                 "[]",
                 json.dumps({"hook_event_name": [], "session_id": "s"}),
+                '{"hook_event_name":"Stop","session_id":"s","value":NaN}',
+                '{"hook_event_name":"Stop","session_id":"s","value":Infinity}',
+                '{"hook_event_name":"Stop","session_id":"s","value":-Infinity}',
                 "x" * (MAX_INPUT_BYTES + 1),
             )
             for malformed in malformed_inputs:
