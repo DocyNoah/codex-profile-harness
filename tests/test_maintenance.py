@@ -16,7 +16,17 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from profile_harness.config import init_profile, load_profile_config  # noqa: E402
 from profile_harness.journal import append_entry  # noqa: E402
+from profile_harness.locking import LeaseBusyError, ProfileLease  # noqa: E402
 from profile_harness.maintenance import maintenance_due, run_maintenance  # noqa: E402
+import profile_harness.maintenance as maintenance_module  # noqa: E402
+from profile_harness.profile_git import (  # noqa: E402
+    CURATION_SUBJECT,
+    IMPROVEMENT_SUBJECT,
+    RECOVERY_SUBJECT,
+    ProfileGitError,
+    checkpoint_profile,
+)
+import profile_harness.profile_git as profile_git_module  # noqa: E402
 from profile_harness.runner import run_codex  # noqa: E402
 
 
@@ -41,6 +51,32 @@ class MaintenanceTests(unittest.TestCase):
         (root / ".harness/memory/inbox" / f"{receipt_id}.json").write_text(
             json.dumps(value), encoding="utf-8"
         )
+
+    def fail_commit_subject(self, subject: str):
+        original_git = profile_git_module._git
+        failed = False
+
+        def injected(root: Path, *arguments: str, **kwargs):
+            nonlocal failed
+            if not failed and "commit" in arguments and subject in arguments:
+                failed = True
+                raise ProfileGitError(f"injected {subject} failure")
+            return original_git(root, *arguments, **kwargs)
+
+        return mock.patch.object(profile_git_module, "_git", side_effect=injected)
+
+    def assert_pending_subject_retried_next_run(self, root: Path, subject: str) -> None:
+        failure_path = root / ".harness/state/profile-git-failure.json"
+        self.assertEqual(subject, json.loads(failure_path.read_text())["subject"])
+
+        run_maintenance(root, now=NOW)
+
+        latest = subprocess.run(
+            ["git", "-C", str(root), "log", "-1", "--format=%s"],
+            text=True, capture_output=True, check=True,
+        ).stdout.strip()
+        self.assertEqual(subject, latest)
+        self.assertFalse(failure_path.exists())
 
     def test_existing_minimal_config_loads_exact_maintenance_defaults(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -218,6 +254,196 @@ class MaintenanceTests(unittest.TestCase):
                 ).stdout,
             )
 
+    def test_preflight_checkpoints_before_invalid_config_or_clock_validation(self) -> None:
+        for invalid in ("config", "clock"):
+            with self.subTest(invalid=invalid), tempfile.TemporaryDirectory() as temporary_directory:
+                root = self.make_profile(Path(temporary_directory))
+                (root / "MEMORY.md").write_text(f"pending before invalid {invalid}\n")
+                now = NOW
+                if invalid == "config":
+                    config = root / ".harness/config.toml"
+                    config.write_text(
+                        config.read_text() + "\n[curation]\nstale_timeout_seconds = -1\n"
+                    )
+                else:
+                    now = datetime(2026, 9, 11, 12, 0, 0)
+
+                with self.assertRaises(ValueError):
+                    run_maintenance(root, now=now)
+
+                self.assertEqual(
+                    "harness: checkpoint profile documents",
+                    subprocess.run(
+                        ["git", "-C", str(root), "log", "-1", "--format=%s"],
+                        text=True, capture_output=True, check=True,
+                    ).stdout.strip(),
+                )
+                self.assertEqual(
+                    f"pending before invalid {invalid}\n",
+                    subprocess.run(
+                        ["git", "-C", str(root), "show", "HEAD:MEMORY.md"],
+                        text=True, capture_output=True, check=True,
+                    ).stdout,
+                )
+
+    def test_tampered_pending_checkpoint_metadata_is_preserved_and_never_executed(self) -> None:
+        variants = (
+            b"not-json\n",
+            json.dumps({
+                "subject": "harness: attacker selected subject",
+                "error": "tampered",
+                "failed_at": "2026-09-11T12:00:00Z",
+            }, sort_keys=True, indent=2).encode() + b"\n",
+            json.dumps({
+                "subject": CURATION_SUBJECT,
+                "error": "tampered",
+                "failed_at": "2026-09-11T12:00:00Z",
+                "extra": "unexpected",
+            }, sort_keys=True, indent=2).encode() + b"\n",
+        )
+        for value in variants:
+            with self.subTest(value=value), tempfile.TemporaryDirectory() as temporary_directory:
+                root = self.make_profile(Path(temporary_directory))
+                (root / "MEMORY.md").write_text("must remain pending\n")
+                failure_path = root / ".harness/state/profile-git-failure.json"
+                failure_path.write_bytes(value)
+
+                output = run_maintenance(root, now=NOW)
+
+                self.assertEqual("no_op", output["curation"]["status"])
+                self.assertEqual(value, failure_path.read_bytes())
+                self.assertEqual(
+                    "harness: initialize profile",
+                    subprocess.run(
+                        ["git", "-C", str(root), "log", "-1", "--format=%s"],
+                        text=True, capture_output=True, check=True,
+                    ).stdout.strip(),
+                )
+
+    def test_dangling_pending_checkpoint_diagnostic_blocks_preflight_git(self) -> None:
+        if not hasattr(Path, "symlink_to"):
+            self.skipTest("symlinks unavailable")
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = self.make_profile(Path(temporary_directory))
+            (root / "MEMORY.md").write_text("must remain pending\n")
+            failure_path = root / ".harness/state/profile-git-failure.json"
+            failure_path.symlink_to(root / ".harness/state/missing-diagnostic")
+
+            run_maintenance(root, now=NOW)
+
+            self.assertTrue(failure_path.is_symlink())
+            self.assertEqual(
+                "harness: initialize profile",
+                subprocess.run(
+                    ["git", "-C", str(root), "log", "-1", "--format=%s"],
+                    text=True, capture_output=True, check=True,
+                ).stdout.strip(),
+            )
+
+    def test_preflight_does_not_checkpoint_while_another_profile_lease_is_active(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = self.make_profile(Path(temporary_directory))
+            (root / "MEMORY.md").write_text("partial transaction state\n")
+
+            with ProfileLease(root, stale_timeout=60):
+                with self.assertRaises(LeaseBusyError):
+                    run_maintenance(root, now=NOW)
+
+            self.assertEqual(
+                "harness: initialize profile",
+                subprocess.run(
+                    ["git", "-C", str(root), "log", "-1", "--format=%s"],
+                    text=True, capture_output=True, check=True,
+                ).stdout.strip(),
+            )
+
+    def test_failed_curation_checkpoint_retries_exact_subject_on_next_run(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            parent = Path(temporary_directory)
+            root = self.make_profile(parent)
+            for index in range(30):
+                self.add_receipt(root, index, NOW)
+            fake = parent / "fake-codex"
+            fake.write_text(
+                "#!/usr/bin/env python3\nimport pathlib,sys\n"
+                "pathlib.Path(sys.argv[sys.argv.index('-o')+1]).write_text('{\"actions\":[]}')\n",
+                encoding="utf-8",
+            )
+            fake.chmod(fake.stat().st_mode | stat.S_IXUSR)
+            config = root / ".harness/config.toml"
+            config.write_text(
+                config.read_text() + f'\n[curation]\ncodex_command = {json.dumps(str(fake))}\n'
+            )
+
+            with self.fail_commit_subject(CURATION_SUBJECT):
+                output = run_maintenance(root, now=NOW)
+
+            self.assertEqual("performed", output["curation"]["status"])
+            self.assert_pending_subject_retried_next_run(root, CURATION_SUBJECT)
+
+    def test_failed_pending_specific_retry_does_not_fall_through_to_generic(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = self.make_profile(Path(temporary_directory))
+            (root / "MEMORY.md").write_text("must keep the specific subject pending\n")
+            failure_path = root / ".harness/state/profile-git-failure.json"
+            failure_path.write_text(json.dumps({
+                "subject": CURATION_SUBJECT,
+                "error": "prior curation commit failure",
+                "failed_at": "2026-09-11T12:00:00Z",
+            }, sort_keys=True, indent=2) + "\n")
+
+            with self.fail_commit_subject(CURATION_SUBJECT):
+                output = run_maintenance(root, now=NOW)
+
+            self.assertEqual("no_op", output["curation"]["status"])
+            self.assertEqual(
+                CURATION_SUBJECT,
+                json.loads(failure_path.read_text())["subject"],
+            )
+            self.assertEqual(
+                "harness: initialize profile",
+                subprocess.run(
+                    ["git", "-C", str(root), "log", "-1", "--format=%s"],
+                    text=True, capture_output=True, check=True,
+                ).stdout.strip(),
+            )
+
+    def test_failed_improvement_checkpoint_retries_exact_subject_on_next_run(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = self.make_profile(Path(temporary_directory))
+
+            def improve(profile_root: Path, **_kwargs):
+                proposal = profile_root / ".harness/improvements/proposed/pending.md"
+                proposal.write_text("pending proposal\n")
+                checkpoint_profile(profile_root, IMPROVEMENT_SUBJECT)
+                return {"status": "performed"}
+
+            with self.fail_commit_subject(IMPROVEMENT_SUBJECT):
+                with mock.patch.object(
+                    maintenance_module, "_run_improvement_locked", side_effect=improve
+                ):
+                    run_maintenance(root, now=NOW)
+
+            self.assert_pending_subject_retried_next_run(root, IMPROVEMENT_SUBJECT)
+
+    def test_failed_recovery_checkpoint_retries_exact_subject_on_next_run(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = self.make_profile(Path(temporary_directory))
+
+            def recover(profile_root: Path):
+                recovered = profile_root / ".harness/memory/semantic/recovered.md"
+                recovered.write_text("recovered state\n")
+                checkpoint_profile(profile_root, RECOVERY_SUBJECT)
+                return ("recovered",)
+
+            with self.fail_commit_subject(RECOVERY_SUBJECT):
+                with mock.patch.object(
+                    maintenance_module, "recover_transactions", side_effect=recover
+                ):
+                    run_maintenance(root, now=NOW)
+
+            self.assert_pending_subject_retried_next_run(root, RECOVERY_SUBJECT)
+
     def test_maintain_due_curation_consumes_only_thirty_receipts(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             parent = Path(temporary_directory)
@@ -251,8 +477,14 @@ class MaintenanceTests(unittest.TestCase):
                 ["git", "-C", str(root), "log", "--format=%s"],
                 text=True, capture_output=True, check=True,
             ).stdout.splitlines()
-            self.assertEqual("harness: curate profile memory", subjects[0])
-            self.assertEqual(2, len(subjects))
+            self.assertEqual(
+                [
+                    "harness: curate profile memory",
+                    "harness: checkpoint profile documents",
+                    "harness: initialize profile",
+                ],
+                subjects,
+            )
 
     def test_maintain_rechecks_improvement_after_committing_due_curation(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -311,6 +543,7 @@ class MaintenanceTests(unittest.TestCase):
                 [
                     "harness: propose profile improvement",
                     "harness: curate profile memory",
+                    "harness: checkpoint profile documents",
                     "harness: initialize profile",
                 ],
                 subjects,

@@ -108,10 +108,13 @@ Initialization creates a Git repository for profile-owned documents. The harness
 stages only code-owned managed paths, uses deterministic commit messages, ignores
 runtime evidence and nested `projects/`, and records failures for `doctor`. There
 is **no automatic push** and repository Git histories remain independent.
-Each scheduled `maintain` run checkpoints any pending managed documents after its
-maintenance work, including empty, not-due, and failed runs. Curation or
-improvement commits keep their more specific subject, and the final generic
-checkpoint creates no duplicate commit when no managed diff remains.
+Each scheduled `maintain` run starts under the profile lease by retrying any
+validated pending checkpoint with its original deterministic subject. Only when
+that retry succeeds—or no retry is pending—does it checkpoint other pending
+managed documents with the generic subject, before config/time validation and
+due work. A curation, improvement, or recovery checkpoint that fails later in
+the run remains pending for the next scheduled preflight; it is never relabeled
+by a same-run generic commit.
 
 ```sh
 profile-harness maintain

@@ -28,5 +28,8 @@ wait for Git. Use `curate --prepare` for
 reviewable input, `curate --apply` for an approved result, `maintain` for one
 scheduled due check, `dashboard` to refresh the index, and `doctor` to inspect
 integrity. Use `git status` and `git log` subcommands to inspect automatic local
-profile checkpoints. Each scheduled `maintain` also checkpoints pending managed
-documents, even when model work is empty or not due; the harness never pushes.
+profile checkpoints. Each scheduled `maintain` starts under the profile lease by
+retrying a validated pending checkpoint with its original subject, then uses the
+generic subject for other pending managed documents before due checks. A
+specific checkpoint that fails during that run waits for the next scheduled
+preflight; the harness never pushes.

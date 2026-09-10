@@ -7,9 +7,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from .config import load_profile_config
+from .config import HarnessConfig, load_profile_config
 from .curation import _valid_receipt, apply_actions, load_result, prepare_curation, recover_transactions
-from .locking import ProfileLease
+from .locking import LeaseBusyError, ProfileLease
 from .runner import run_codex
 from .improvement import _run_locked as _run_improvement_locked, recover_improvement_transaction
 
@@ -59,58 +59,80 @@ def maintenance_due(root: Path, *, now: datetime | None = None) -> MaintenanceDu
     return MaintenanceDue(False, None, count, oldest, remaining)
 
 
-def run_maintenance(root: Path, *, now: datetime | None = None) -> dict[str, Any]:
-    """Run due curation under one profile lease and report deterministic status."""
-    profile_root = Path(root).resolve()
-    config = load_profile_config(profile_root)
-    current = _utc_now(now)
-    with ProfileLease(profile_root, stale_timeout=config.curation.stale_timeout_seconds):
-        try:
-            recover_transactions(profile_root)
-            recover_improvement_transaction(profile_root)
-            due = maintenance_due(profile_root, now=current)
-            if not due.curation_due:
-                curation = {
-                    "status": "no_op",
-                    "reason": "empty" if due.valid_receipt_count == 0 else "not_due",
-                    "valid_receipt_count": due.valid_receipt_count,
-                    "seconds_until_due": due.seconds_until_curation,
-                }
-            else:
-                batch = prepare_curation(profile_root, config.curation.maintenance_max_receipts)
-                if not batch.receipt_ids:
-                    curation = {"status": "no_op", "reason": "empty", "receipt_count": 0}
-                else:
-                    result_path = batch.path / "result.json"
+def _run_maintenance_locked(
+    profile_root: Path, config: HarnessConfig, current: datetime
+) -> dict[str, Any]:
+    recover_transactions(profile_root)
+    recover_improvement_transaction(profile_root)
+    due = maintenance_due(profile_root, now=current)
+    if not due.curation_due:
+        curation = {
+            "status": "no_op",
+            "reason": "empty" if due.valid_receipt_count == 0 else "not_due",
+            "valid_receipt_count": due.valid_receipt_count,
+            "seconds_until_due": due.seconds_until_curation,
+        }
+    else:
+        batch = prepare_curation(profile_root, config.curation.maintenance_max_receipts)
+        if not batch.receipt_ids:
+            curation = {"status": "no_op", "reason": "empty", "receipt_count": 0}
+        else:
+            result_path = batch.path / "result.json"
+            try:
+                run_codex(
+                    profile_root, batch.prompt_path, result_path,
+                    command=config.curation.codex_command,
+                    model=config.curation.model,
+                    reasoning_effort=config.curation.reasoning_effort,
+                    timeout=config.curation.codex_timeout_seconds,
+                )
+                applied = apply_actions(
+                    profile_root, batch.batch_id, load_result(result_path), now=current
+                )
+            except BaseException:
+                if batch.path.exists():
                     try:
-                        run_codex(
-                            profile_root, batch.prompt_path, result_path,
-                            command=config.curation.codex_command,
-                            model=config.curation.model,
-                            reasoning_effort=config.curation.reasoning_effort,
-                            timeout=config.curation.codex_timeout_seconds,
-                        )
-                        applied = apply_actions(
-                            profile_root, batch.batch_id, load_result(result_path), now=current
-                        )
+                        apply_actions(profile_root, batch.batch_id, {"invalid": True})
                     except BaseException:
-                        if batch.path.exists():
-                            try:
-                                apply_actions(profile_root, batch.batch_id, {"invalid": True})
-                            except BaseException:
-                                pass
-                        raise
-                    curation = {
-                        "status": "performed", "reason": due.curation_reason,
-                        "batch_id": applied.batch_id, "receipt_count": len(batch.receipt_ids),
-                        "changed_paths": [str(path) for path in applied.changed_paths],
-                    }
-            improvement = _run_improvement_locked(profile_root, now=current, force=False)
-            return {
-                "curation": curation,
-                "improvement": improvement,
+                        pass
+                raise
+            curation = {
+                "status": "performed", "reason": due.curation_reason,
+                "batch_id": applied.batch_id, "receipt_count": len(batch.receipt_ids),
+                "changed_paths": [str(path) for path in applied.changed_paths],
             }
-        finally:
-            from .profile_git import CHECKPOINT_SUBJECT, checkpoint_profile
+    improvement = _run_improvement_locked(profile_root, now=current, force=False)
+    return {
+        "curation": curation,
+        "improvement": improvement,
+    }
 
-            checkpoint_profile(profile_root, CHECKPOINT_SUBJECT)
+
+def _checkpoint_preflight(profile_root: Path) -> None:
+    from .profile_git import checkpoint_pending_or_generic
+
+    checkpoint_pending_or_generic(profile_root)
+
+
+def run_maintenance(root: Path, *, now: datetime | None = None) -> dict[str, Any]:
+    """Checkpoint pending documents, then run due work under one profile lease."""
+    profile_root = Path(root).resolve()
+    early_lease = ProfileLease(profile_root, stale_timeout=float("inf"))
+    try:
+        early_lease.acquire()
+    except LeaseBusyError:
+        config = load_profile_config(profile_root)
+        current = _utc_now(now)
+        with ProfileLease(
+            profile_root, stale_timeout=config.curation.stale_timeout_seconds
+        ):
+            _checkpoint_preflight(profile_root)
+            return _run_maintenance_locked(profile_root, config, current)
+    else:
+        try:
+            _checkpoint_preflight(profile_root)
+            config = load_profile_config(profile_root)
+            current = _utc_now(now)
+            return _run_maintenance_locked(profile_root, config, current)
+        finally:
+            early_lease.release()

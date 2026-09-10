@@ -30,8 +30,8 @@ remove a proven duplicate, or surface a conflict; routine rewriting is forbidden
 performs model-free due checks under the profile lease. Routine curation is due
 when the inbox contains at least 30 receipts or its oldest receipt is at least
 four hours old. It consumes at most 30 receipts per run. An empty or not-due
-run is a true semantic-maintenance no-op, though its final model-free Git step
-still checkpoints any managed document changes pending from normal profile work.
+run is a true semantic-maintenance no-op, though its initial model-free Git
+preflight may checkpoint managed document changes pending from normal work.
 
 Successful curation is counted from the hash-chained journal. Improvement is
 eligible only after a 24-hour cooldown and when either at least ten successful
@@ -66,11 +66,13 @@ resets, rebases, amends, pushes, or stages nested repositories.
 
 Stop and SessionEnd durably publish receipt and cursor evidence but never invoke
 Git inside the hook completion envelope. `maintain`, scheduled every 15 minutes,
-performs the generic pending-document checkpoint after its protected work on
-due, no-op, and failure paths. State-changing harness commands still checkpoint
-after their own durable commit; when curation or improvement already used its
-specific subject, the final generic checkpoint sees no diff and creates no
-duplicate commit. Dashboard and doctor display whether automatic Git is active,
+first acquires the profile lease and performs Git preflight before config/time
+validation and due work. A strictly validated pending failure is retried with
+its original allowlisted subject; only success or absence permits the generic
+pending-document checkpoint. Invalid metadata remains diagnostic-only. Commands
+still checkpoint after their own durable commit, but a specific failure later in
+the run is left for the next preflight rather than committed under a same-run
+generic subject. Dashboard and doctor display whether automatic Git is active,
 last commit, managed dirty paths, branch, and whether a remote exists; a missing
 remote is a warning because local Git does not protect against disk loss.
 

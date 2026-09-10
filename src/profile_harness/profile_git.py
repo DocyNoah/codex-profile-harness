@@ -456,6 +456,38 @@ def _record_failure(root: Path, subject: str, error: str) -> None:
         pass
 
 
+def _pending_checkpoint_subject(root: Path) -> str | None:
+    path = _failure_path(root)
+    if not path.exists():
+        return None
+    if path.is_symlink() or not path.is_file():
+        raise ProfileGitError("pending checkpoint diagnostic is unsafe")
+    with path.open("rb") as handle:
+        raw = handle.read(_MAX_OUTPUT + 1)
+    if len(raw) > _MAX_OUTPUT:
+        raise ProfileGitError("pending checkpoint diagnostic exceeds the size limit")
+    try:
+        value = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ProfileGitError("pending checkpoint diagnostic is malformed") from error
+    if not isinstance(value, dict) or set(value) != {"subject", "error", "failed_at"}:
+        raise ProfileGitError("pending checkpoint diagnostic has an invalid schema")
+    subject = value.get("subject")
+    error_text = value.get("error")
+    failed_at = value.get("failed_at")
+    if subject not in COMMIT_SUBJECTS or not isinstance(error_text, str) or not error_text:
+        raise ProfileGitError("pending checkpoint diagnostic has invalid fields")
+    if not isinstance(failed_at, str):
+        raise ProfileGitError("pending checkpoint diagnostic has invalid fields")
+    try:
+        timestamp = datetime.fromisoformat(failed_at.replace("Z", "+00:00"))
+    except ValueError as error:
+        raise ProfileGitError("pending checkpoint diagnostic has invalid fields") from error
+    if timestamp.tzinfo is None or timestamp.utcoffset() is None:
+        raise ProfileGitError("pending checkpoint diagnostic has invalid fields")
+    return subject
+
+
 def _configured_filter_names(root: Path) -> tuple[str, ...]:
     result = _git(
         root,
@@ -531,6 +563,29 @@ def checkpoint_profile(root: Path, subject: str = CHECKPOINT_SUBJECT) -> Checkpo
         with _GitGuard(profile_root):
             try:
                 return _checkpoint_locked(profile_root, subject)
+            except (OSError, ValueError, ProfileGitError) as error:
+                _record_failure(profile_root, subject, str(error))
+                return CheckpointResult(False, error=str(error))
+    except (OSError, ValueError, ProfileGitError) as error:
+        return CheckpointResult(False, error=str(error))
+
+
+def checkpoint_pending_or_generic(root: Path) -> CheckpointResult:
+    """Retry a validated pending subject before the scheduled generic checkpoint."""
+    profile_root = Path(root).expanduser().resolve()
+    try:
+        with _GitGuard(profile_root):
+            try:
+                pending_subject = _pending_checkpoint_subject(profile_root)
+            except (OSError, ValueError, ProfileGitError) as error:
+                return CheckpointResult(False, error=str(error))
+            subject = pending_subject or CHECKPOINT_SUBJECT
+            try:
+                retried = _checkpoint_locked(profile_root, subject)
+                if subject == CHECKPOINT_SUBJECT:
+                    return retried
+                generic = _checkpoint_locked(profile_root, CHECKPOINT_SUBJECT)
+                return retried if retried.committed else generic
             except (OSError, ValueError, ProfileGitError) as error:
                 _record_failure(profile_root, subject, str(error))
                 return CheckpointResult(False, error=str(error))
