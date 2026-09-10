@@ -304,11 +304,7 @@ def load_profile_config(root: Path) -> HarnessConfig:
     )
 
 
-def load_profile(root: Path) -> ProfileConfig:
-    """Load and validate profile identity and registered repositories."""
-    profile_root = Path(root).expanduser().resolve()
-    config = load_profile_config(profile_root)
-
+def _load_profile_registry(profile_root: Path, name: str) -> ProfileConfig:
     projects_path = require_safe_path(
         profile_root, profile_root / "PROJECTS.toml", directory=False
     )
@@ -330,7 +326,20 @@ def load_profile(root: Path) -> ProfileConfig:
         candidate = profile_root / relative_path
         require_safe_path(profile_root, candidate, directory=True)
         repositories.append(RepositoryConfig(repo_name, candidate.resolve()))
-    return ProfileConfig(profile_root, config.name, tuple(repositories))
+    return ProfileConfig(profile_root, name, tuple(repositories))
+
+
+def load_profile(root: Path) -> ProfileConfig:
+    """Load and validate profile identity and registered repositories."""
+    profile_root = Path(root).expanduser().resolve()
+    config = load_profile_config(profile_root)
+    return _load_profile_registry(profile_root, config.name)
+
+
+def load_profile_for_recovery(root: Path) -> ProfileConfig:
+    """Load only the repository registry needed to recover durable WAL state."""
+    profile_root = Path(root).expanduser().resolve()
+    return _load_profile_registry(profile_root, "")
 
 
 def _template_files(template_root: Path) -> tuple[Path, ...]:

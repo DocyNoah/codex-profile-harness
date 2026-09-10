@@ -14,7 +14,7 @@ import stat
 import uuid
 from typing import Any
 
-from .config import PLUGIN_ROOT, load_profile
+from .config import PLUGIN_ROOT, load_profile, load_profile_for_recovery
 from .fs import (
     atomic_copy_file,
     atomic_write_text,
@@ -816,7 +816,7 @@ def _validate_transaction(root: Path, transaction_path: Path, transaction: objec
         receipt_ids = tuple(derived_ids)
     else:
         raise CurationError("applying transaction batch is missing")
-    profile = load_profile(root)
+    profile = load_profile_for_recovery(root)
     snapshot_root = Path(f".harness/memory/archive/snapshots/{batch_id}")
 
     if not isinstance(archives, list) or len(archives) != len(receipt_ids):

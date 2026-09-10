@@ -7,9 +7,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from .config import HarnessConfig, load_profile_config
+from .config import DEFAULT_STALE_TIMEOUT_SECONDS, HarnessConfig, load_profile_config
 from .curation import _valid_receipt, apply_actions, load_result, prepare_curation, recover_transactions
-from .locking import LeaseBusyError, ProfileLease
+from .locking import ProfileLease
 from .runner import run_codex
 from .improvement import _run_locked as _run_improvement_locked, recover_improvement_transaction
 
@@ -62,8 +62,6 @@ def maintenance_due(root: Path, *, now: datetime | None = None) -> MaintenanceDu
 def _run_maintenance_locked(
     profile_root: Path, config: HarnessConfig, current: datetime
 ) -> dict[str, Any]:
-    recover_transactions(profile_root)
-    recover_improvement_transaction(profile_root)
     due = maintenance_due(profile_root, now=current)
     if not due.curation_due:
         curation = {
@@ -109,30 +107,20 @@ def _run_maintenance_locked(
 
 
 def _checkpoint_preflight(profile_root: Path) -> None:
-    from .profile_git import checkpoint_pending_or_generic
+    from .profile_git import ProfileGitError, checkpoint_pending_or_generic
 
-    checkpoint_pending_or_generic(profile_root)
+    result = checkpoint_pending_or_generic(profile_root)
+    if result.error is not None:
+        raise ProfileGitError(f"profile Git preflight failed: {result.error}")
 
 
 def run_maintenance(root: Path, *, now: datetime | None = None) -> dict[str, Any]:
-    """Checkpoint pending documents, then run due work under one profile lease."""
+    """Recover, checkpoint pending documents, then run due work under one lease."""
     profile_root = Path(root).resolve()
-    early_lease = ProfileLease(profile_root, stale_timeout=float("inf"))
-    try:
-        early_lease.acquire()
-    except LeaseBusyError:
+    with ProfileLease(profile_root, stale_timeout=DEFAULT_STALE_TIMEOUT_SECONDS):
+        recover_transactions(profile_root)
+        recover_improvement_transaction(profile_root)
+        _checkpoint_preflight(profile_root)
         config = load_profile_config(profile_root)
         current = _utc_now(now)
-        with ProfileLease(
-            profile_root, stale_timeout=config.curation.stale_timeout_seconds
-        ):
-            _checkpoint_preflight(profile_root)
-            return _run_maintenance_locked(profile_root, config, current)
-    else:
-        try:
-            _checkpoint_preflight(profile_root)
-            config = load_profile_config(profile_root)
-            current = _utc_now(now)
-            return _run_maintenance_locked(profile_root, config, current)
-        finally:
-            early_lease.release()
+        return _run_maintenance_locked(profile_root, config, current)

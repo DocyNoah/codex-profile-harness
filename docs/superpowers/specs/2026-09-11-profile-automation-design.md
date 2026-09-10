@@ -30,8 +30,8 @@ remove a proven duplicate, or surface a conflict; routine rewriting is forbidden
 performs model-free due checks under the profile lease. Routine curation is due
 when the inbox contains at least 30 receipts or its oldest receipt is at least
 four hours old. It consumes at most 30 receipts per run. An empty or not-due
-run is a true semantic-maintenance no-op, though its initial model-free Git
-preflight may checkpoint managed document changes pending from normal work.
+run is a true semantic-maintenance no-op, though the preceding recovery and
+model-free Git preflight may checkpoint managed document changes.
 
 Successful curation is counted from the hash-chained journal. Improvement is
 eligible only after a 24-hour cooldown and when either at least ten successful
@@ -66,15 +66,18 @@ resets, rebases, amends, pushes, or stages nested repositories.
 
 Stop and SessionEnd durably publish receipt and cursor evidence but never invoke
 Git inside the hook completion envelope. `maintain`, scheduled every 15 minutes,
-first acquires the profile lease and performs Git preflight before config/time
-validation and due work. A strictly validated pending failure is retried with
-its original allowlisted subject; only success or absence permits the generic
-pending-document checkpoint. Invalid metadata remains diagnostic-only. Commands
-still checkpoint after their own durable commit, but a specific failure later in
-the run is left for the next preflight rather than committed under a same-run
-generic subject. Dashboard and doctor display whether automatic Git is active,
-last commit, managed dirty paths, branch, and whether a remote exists; a missing
-remote is a warning because local Git does not protect against disk loss.
+acquires the profile lease using the built-in safe stale timeout, completes
+curation and improvement WAL recovery, and then performs Git preflight before
+config/time validation and due work. This permits recovery and checkpointing even
+when configuration is malformed. A strictly validated pending failure is retried
+with its original allowlisted subject; only success or absence permits a generic
+pending-document checkpoint. Any preflight error stops later maintenance and
+model work while preserving the diagnostic. Commands still checkpoint after
+their own durable commit, but a specific failure later in the run is left for
+the next preflight rather than committed under a same-run generic subject.
+Dashboard and doctor display whether automatic Git is active, last commit,
+managed dirty paths, branch, and whether a remote exists; a missing remote is a
+warning because local Git does not protect against disk loss.
 
 ## Public package
 
