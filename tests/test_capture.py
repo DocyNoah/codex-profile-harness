@@ -162,6 +162,52 @@ class CaptureEventTests(unittest.TestCase):
             self.assertNotIn("ghp_abcdefghijklmnopqrstuvwxyz123456", persisted)
             self.assertIn("[REDACTED]", persisted)
 
+    def test_top_level_cwd_is_redacted_and_bounded_before_persistence(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            parent = Path(temporary_directory)
+            maximum = len(str(parent / "profile")) + 30
+            root = self.make_profile(parent, max_text_chars=maximum)
+            cwd = root / "token=top-secret-value;" / ("x" * 80)
+            cwd.mkdir(parents=True)
+
+            result = capture_event(
+                {
+                    "hook_event_name": "Stop",
+                    "session_id": "session-1",
+                    "cwd": str(cwd),
+                }
+            )
+
+            persisted_cwd = self.read_receipt(result)["cwd"]
+            self.assertNotIn("top-secret-value", persisted_cwd)
+            self.assertIn("token=[REDACTED]", persisted_cwd)
+            self.assertLessEqual(len(persisted_cwd), maximum)
+            self.assertTrue(persisted_cwd.endswith("…"))
+
+    def test_extra_key_names_are_redacted_and_bounded_before_persistence(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = self.make_profile(Path(temporary_directory), max_text_chars=20)
+            secret_key = "api_key=top-secret-value"
+            long_key = "extension_" + ("x" * 80)
+
+            result = capture_event(
+                {
+                    "hook_event_name": "Stop",
+                    "session_id": "session-1",
+                    "cwd": str(root),
+                    secret_key: "discarded secret field value",
+                    long_key: "discarded long field value",
+                }
+            )
+
+            extra_keys = self.read_receipt(result)["payload"]["extra_keys"]
+            persisted = result.receipt_path.read_text(encoding="utf-8")
+            self.assertNotIn("top-secret-value", persisted)
+            self.assertNotIn(secret_key, extra_keys)
+            self.assertTrue(all(len(key) <= 20 for key in extra_keys))
+            self.assertTrue(any("[REDACTED]" in key for key in extra_keys))
+            self.assertTrue(any(key.endswith("…") for key in extra_keys))
+
     def test_truncates_normalized_text_to_configured_maximum(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = self.make_profile(Path(temporary_directory), max_text_chars=12)

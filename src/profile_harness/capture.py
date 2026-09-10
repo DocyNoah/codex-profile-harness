@@ -130,7 +130,11 @@ def _normalized_payload(payload: dict[str, Any], maximum: int) -> dict[str, Any]
             if not isinstance(value, bool):
                 raise CaptureError("stop_hook_active must be a boolean")
             normalized[field] = value
-    extra_keys = sorted(str(key) for key in payload if key not in KNOWN_FIELDS)
+    extra_keys = sorted(
+        _normalize_text(str(key), maximum)
+        for key in payload
+        if key not in KNOWN_FIELDS
+    )
     if extra_keys:
         normalized["extra_keys"] = extra_keys
     return normalized
@@ -209,7 +213,7 @@ def capture_event(payload: dict, cwd: Path | None = None) -> CaptureResult:
         "id": receipt_id,
         "event": event,
         "captured_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-        "cwd": str(Path(start).expanduser().resolve()),
+        "cwd": _normalize_text(str(Path(start).expanduser().resolve()), maximum),
         "payload": normalized,
     }
     content = json.dumps(receipt, ensure_ascii=False, sort_keys=True, indent=2) + "\n"
