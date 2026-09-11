@@ -14,7 +14,7 @@ import stat
 import uuid
 from typing import Any
 
-from .config import PLUGIN_ROOT, load_profile, load_profile_for_recovery
+from .config import HarnessConfig, PLUGIN_ROOT, load_profile, load_profile_for_recovery
 from .fs import (
     atomic_copy_file,
     atomic_write_text,
@@ -39,6 +39,7 @@ MAX_SIGNALS = 20
 MAX_SIGNAL_SUMMARY_CHARS = 240
 MAX_PROMPT_CHARS = 500_000
 MAX_RESULT_BYTES = 1024 * 1024
+MAX_INBOX_RECEIPTS = 2_000
 ACTION_TYPES = frozenset(
     {
         "profile_memory",
@@ -308,6 +309,22 @@ def _dead_letter(root: Path, path: Path, reason: str) -> None:
     require_safe_path(root, destination, directory=False)
     _durable_replace(path, destination)
     atomic_write_text(destination.with_suffix(".reason"), reason.strip() + "\n")
+
+
+def validate_inbox_receipts(root: Path) -> tuple[dict[str, Any], ...]:
+    """Quarantine malformed receipts with bounded, model-free validation."""
+    profile_root = Path(root).resolve()
+    inbox = _safe_dir(profile_root, ".harness/memory/inbox")
+    paths = sorted(inbox.glob("*.json"))
+    if len(paths) > MAX_INBOX_RECEIPTS:
+        raise CurationError("inbox receipt inventory exceeds the bounded limit")
+    valid: list[dict[str, Any]] = []
+    for path in paths:
+        try:
+            valid.append(_valid_receipt(path))
+        except CurationError as error:
+            _dead_letter(profile_root, path, str(error))
+    return tuple(valid)
 
 
 def _batch_id() -> str:
@@ -1351,6 +1368,7 @@ def apply_actions(
     fail_after_writes: int | None = None,
     crash_after_stage: str | None = None,
     now: datetime | None = None,
+    config: HarnessConfig | None = None,
 ) -> ApplyResult:
     """Apply one validated batch transactionally, restoring it on any failure."""
     profile = load_profile(root)
@@ -1566,7 +1584,7 @@ def apply_actions(
         _durable_unlink(transaction_path)
         from .profile_git import CURATION_SUBJECT, checkpoint_profile
 
-        checkpoint = checkpoint_profile(profile.root, CURATION_SUBJECT)
+        checkpoint = checkpoint_profile(profile.root, CURATION_SUBJECT, config=config)
         applied = ApplyResult(
             batch_id, tuple(dict.fromkeys(changed)), journal_entry,
             checkpoint.commit_sha if checkpoint.committed else None,

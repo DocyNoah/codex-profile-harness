@@ -18,6 +18,7 @@ import time
 from typing import Any, BinaryIO
 from urllib.parse import urlsplit
 
+from .config import HarnessConfig, load_profile_config
 from .fs import atomic_write_text, ensure_safe_directory, require_safe_path
 
 
@@ -181,7 +182,6 @@ def _git(
         "GIT_CONFIG_NOSYSTEM": "1",
         "GIT_CONFIG_GLOBAL": os.devnull,
         "GIT_CONFIG_SYSTEM": os.devnull,
-        "GIT_CONFIG_LOCAL": os.devnull,
         "GIT_ATTR_NOSYSTEM": "1",
         "GIT_OPTIONAL_LOCKS": "0" if read_only else "1",
         "LC_ALL": "C",
@@ -202,6 +202,7 @@ def _git(
         command.extend([
             "-c", f"core.hooksPath={hooks}",
             "-c", "core.fsmonitor=false",
+            "-c", f"core.attributesFile={os.devnull}",
             "-c", "commit.gpgSign=false",
             "-c", "tag.gpgSign=false",
         ])
@@ -325,6 +326,54 @@ def _safe_git_directory(root: Path) -> Path:
     if resolved.parent != root:
         raise ProfileGitError("profile .git directory escapes the profile root")
     return resolved
+
+
+def _direct_repository_config_keys(root: Path) -> tuple[str, ...]:
+    """Read repository-owned config files without following includes."""
+    git_dir = _safe_git_directory(root)
+    paths = [git_dir / "config"]
+    worktree = git_dir / "config.worktree"
+    if worktree.exists() or worktree.is_symlink():
+        paths.append(worktree)
+    keys: list[str] = []
+    for path in paths:
+        if path.is_symlink() or not path.is_file() or path.stat().st_size > _MAX_OUTPUT:
+            raise ProfileGitError("repository Git config is unsafe or unbounded")
+        result = _git(
+            root, "config", "--file", str(path), "--no-includes", "--name-only",
+            "--get-regexp", r"^(include\.|includeif\.|core\.attributesfile$)",
+            check=False, read_only=True,
+        )
+        if result.returncode not in {0, 1}:
+            raise ProfileGitError("cannot inspect direct repository configuration")
+        keys.extend(line for line in result.stdout.splitlines() if line)
+    return tuple(keys)
+
+
+def _reject_repository_includes_and_attributes_file(root: Path) -> None:
+    keys = _direct_repository_config_keys(root)
+    if keys:
+        raise ProfileGitError(
+            "repository Git helpers (includes or attributesFile) are not allowed: "
+            + ", ".join(keys[:20])
+        )
+
+
+def _reject_effective_filters(root: Path, paths: tuple[str, ...]) -> None:
+    if not paths:
+        return
+    result = _git(
+        root, "check-attr", "-z", "--stdin", "filter",
+        input_text="\0".join(paths) + "\0", literal_pathspecs=False, read_only=True,
+    )
+    fields = result.stdout.split("\0")
+    if fields and fields[-1] == "":
+        fields.pop()
+    if len(fields) % 3:
+        raise ProfileGitError("Git attribute response is malformed")
+    active = [fields[index] for index in range(0, len(fields), 3) if fields[index + 2] not in {"unspecified", "unset"}]
+    if active:
+        raise ProfileGitError("managed Git paths have an effective filter attribute: " + ", ".join(active[:20]))
 
 
 def _is_managed(relative: str) -> bool:
@@ -581,18 +630,22 @@ def initialize_profile_git(root: Path) -> CheckpointResult:
         return CheckpointResult(False, error=str(error))
 
 
-def _checkpoint_locked(profile_root: Path, subject: str) -> CheckpointResult:
+def _checkpoint_locked(
+    profile_root: Path, subject: str, config: HarnessConfig | None = None
+) -> CheckpointResult:
     """Checkpoint with the validated profile Git guard already held."""
     _safe_hooks_directory(profile_root)
     _safe_git_directory(profile_root)
+    _reject_repository_includes_and_attributes_file(profile_root)
     candidates = _managed_candidates(profile_root)
+    _reject_effective_filters(profile_root, candidates)
     dirty = _dirty_paths(profile_root, candidates)
     if not dirty:
         _failure_path(profile_root).unlink(missing_ok=True)
         return CheckpointResult(False)
     filters = _configured_filter_names(profile_root)
     _git(profile_root, "add", "--", *candidates, filter_names=filters)
-    prepared = _prepare_push_intent(profile_root, subject)
+    prepared = _prepare_push_intent(profile_root, subject, config=config)
     _git(
         profile_root,
         "-c", "user.name=Codex Profile Harness",
@@ -687,19 +740,20 @@ def _recover_push_intent_locked(root: Path) -> dict[str, Any] | None:
     return intent
 
 
-def _prepare_push_intent(root: Path, subject: str) -> dict[str, Any] | None:
-    from .config import load_profile_config
-
+def _prepare_push_intent(
+    root: Path, subject: str, *, config: HarnessConfig | None = None
+) -> dict[str, Any] | None:
     try:
-        config = load_profile_config(root).git
+        run_config = config or load_profile_config(root)
+        git_config = run_config.git
     except (OSError, ValueError):
         # Local recovery checkpoints must remain available for repairing a
         # malformed managed config. Unsafe/invalid config can never enable push.
         return None
-    if not config.auto_push:
+    if not git_config.auto_push:
         return None
     previous = _recover_push_intent_locked(root)
-    snapshot = validate_push_configuration(root)
+    snapshot = validate_push_configuration(root, config=run_config)
     pre_commit = current_profile_commit(root)
     prepared: dict[str, Any] = {
         "version": 1,
@@ -731,7 +785,9 @@ def _finish_push_intent(root: Path, prepared: dict[str, Any], commit_sha: str) -
     _write_push_intent(root, ready)
 
 
-def checkpoint_profile(root: Path, subject: str = CHECKPOINT_SUBJECT) -> CheckpointResult:
+def checkpoint_profile(
+    root: Path, subject: str = CHECKPOINT_SUBJECT, *, config: HarnessConfig | None = None
+) -> CheckpointResult:
     """Commit only changed managed paths, retaining failures for later retry."""
     profile_root = Path(root).expanduser().resolve()
     if subject not in COMMIT_SUBJECTS:
@@ -741,7 +797,7 @@ def checkpoint_profile(root: Path, subject: str = CHECKPOINT_SUBJECT) -> Checkpo
         from .locking import LeaseBusyError, ProfileLease, profile_lease_held
 
         try:
-            stale_timeout = load_profile_config(profile_root).curation.stale_timeout_seconds
+            stale_timeout = (config or load_profile_config(profile_root)).curation.stale_timeout_seconds
         except (OSError, ValueError):
             stale_timeout = 300.0
         lease = None
@@ -760,7 +816,7 @@ def checkpoint_profile(root: Path, subject: str = CHECKPOINT_SUBJECT) -> Checkpo
             guard = _GitGuard(profile_root)
             guard.__enter__()
             try:
-                return _checkpoint_locked(profile_root, subject)
+                return _checkpoint_locked(profile_root, subject, config=config)
             except (OSError, ValueError, ProfileGitError) as error:
                 try:
                     _recover_push_intent_locked(profile_root)
@@ -803,9 +859,10 @@ def _one_local_config(root: Path, key: str) -> str | None:
 
 
 def _validate_push_repository_config(root: Path) -> None:
+    _reject_repository_includes_and_attributes_file(root)
     result = _git(
         root, "config", "--local", "--name-only", "--get-regexp",
-        r"^(core\.(hookspath|sshcommand|gitproxy)|filter\.|credential\.|include\.|includeif\.|http\..*\.(extraheader|proxy)|url\.|push\.|remote\..*\.(push|receivepack|uploadpack|vcs|proxy)|protocol\.)",
+        r"^(core\.(hookspath|sshcommand|gitproxy|attributesfile)|filter\.|credential\.|include\.|includeif\.|http\..*\.(extraheader|proxy)|url\.|push\.|remote\..*\.(push|receivepack|uploadpack|vcs|proxy)|protocol\.)",
         check=False, read_only=True,
     )
     if result.returncode not in {0, 1}:
@@ -831,13 +888,15 @@ def _validate_remote_url(url: str) -> str:
     raise ProfileGitError("remote URL scheme is unsupported or ambiguous")
 
 
-def validate_push_configuration(root: Path) -> PushSnapshot:
+def validate_push_configuration(
+    root: Path, *, config: HarnessConfig | None = None
+) -> PushSnapshot:
     """Validate configured automatic-push policy without contacting a remote."""
     from .config import load_profile_config
 
     profile_root = Path(root).resolve()
-    config = load_profile_config(profile_root).git
-    if not config.auto_push or not config.private_data_acknowledged or config.upstream is None:
+    git_config = (config or load_profile_config(profile_root)).git
+    if not git_config.auto_push or not git_config.private_data_acknowledged or git_config.upstream is None:
         raise ProfileGitError("automatic push is not fully enabled")
     _safe_git_directory(profile_root)
     _validate_push_repository_config(profile_root)
@@ -848,7 +907,7 @@ def validate_push_configuration(root: Path) -> PushSnapshot:
     branch = branch_result.stdout.strip()
     if branch_result.returncode != 0 or not branch or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]*", branch) is None:
         raise ProfileGitError("automatic push requires an attached safe branch")
-    remote, configured_branch = config.upstream.split("/", 1)
+    remote, configured_branch = git_config.upstream.split("/", 1)
     if configured_branch != branch:
         raise ProfileGitError("configured upstream branch does not match the attached branch")
     if _one_local_config(profile_root, f"branch.{branch}.remote") != remote or _one_local_config(
@@ -862,7 +921,7 @@ def validate_push_configuration(root: Path) -> PushSnapshot:
     if len(urls) != 1:
         raise ProfileGitError("configured remote URL is missing or ambiguous")
     url = _validate_remote_url(urls[0])
-    return PushSnapshot(branch, remote, config.upstream, url)
+    return PushSnapshot(branch, remote, git_config.upstream, url)
 
 
 class _NetworkGitSession:
@@ -926,20 +985,22 @@ def push_profile(
     commit_sha: str | None,
     *,
     expected_snapshot: PushSnapshot | None = None,
+    config: HarnessConfig | None = None,
 ) -> PushResult:
     """Push one exact attached HEAD to its explicitly configured upstream."""
     profile_root = Path(root).expanduser().resolve()
     try:
         from .config import load_profile_config
 
-        config = load_profile_config(profile_root).git
-        if not config.auto_push:
+        run_config = config or load_profile_config(profile_root)
+        git_config = run_config.git
+        if not git_config.auto_push:
             raise ProfileGitError("automatic push is disabled")
-        if not config.private_data_acknowledged:
+        if not git_config.private_data_acknowledged:
             raise ProfileGitError("private profile data acknowledgement is required")
-        if config.upstream is None:
+        if git_config.upstream is None:
             raise ProfileGitError("automatic push upstream is missing")
-        snapshot = validate_push_configuration(profile_root)
+        snapshot = validate_push_configuration(profile_root, config=run_config)
         if expected_snapshot is not None and snapshot != expected_snapshot:
             raise ProfileGitError("automatic push intent no longer matches configuration")
         if _dirty_paths(profile_root):
@@ -972,7 +1033,7 @@ def push_profile(
                 )
                 if fast_forward.returncode != 0:
                     raise ProfileGitError("remote update is not a fast-forward")
-            if validate_push_configuration(profile_root) != snapshot:
+            if validate_push_configuration(profile_root, config=run_config) != snapshot:
                 raise ProfileGitError("push configuration changed during validation")
             pushed = network.git(
                 "push", "--porcelain", "--no-verify", "--no-follow-tags",
@@ -986,21 +1047,23 @@ def push_profile(
             expected[remote_ref] = commit_sha
             if after != expected:
                 raise ProfileGitError("remote reference inventory changed unexpectedly")
-        if validate_push_configuration(profile_root) != snapshot:
+        if validate_push_configuration(profile_root, config=run_config) != snapshot:
             raise ProfileGitError("push configuration changed before success confirmation")
         return PushResult(True, commit_sha, snapshot.upstream)
     except (OSError, ValueError, ProfileGitError) as error:
         return PushResult(False, commit_sha, error=str(error))
 
 
-def _push_checkpoint_unlocked(root: Path, checkpoint: CheckpointResult) -> PushResult:
+def _push_checkpoint_unlocked(
+    root: Path, checkpoint: CheckpointResult, *, config: HarnessConfig | None = None
+) -> PushResult:
     """Push one proven checkpoint while the caller holds the profile lease."""
     from .config import load_profile_config
     from .control import ControlOutbox
 
     profile_root = Path(root).resolve()
-    config = load_profile_config(profile_root)
-    if not config.git.auto_push:
+    run_config = config or load_profile_config(profile_root)
+    if not run_config.git.auto_push:
         return PushResult(False)
     if checkpoint.error is not None or not checkpoint.committed or checkpoint.commit_sha is None:
         return PushResult(False, error="a successful exact checkpoint is required for push")
@@ -1011,13 +1074,13 @@ def _push_checkpoint_unlocked(root: Path, checkpoint: CheckpointResult) -> PushR
     if commit_sha != checkpoint.commit_sha:
         return PushResult(False, checkpoint.commit_sha, error="checkpoint does not match durable automatic push intent")
     snapshot = _intent_snapshot(intent)
-    if snapshot.upstream != config.git.upstream:
+    if snapshot.upstream != run_config.git.upstream:
         return PushResult(False, commit_sha, error="automatic push intent upstream changed")
-    result = push_profile(profile_root, commit_sha, expected_snapshot=snapshot)
+    result = push_profile(profile_root, commit_sha, expected_snapshot=snapshot, config=run_config)
     diagnostic = require_safe_path(
         profile_root, profile_root / _PUSH_FAILURE_PATH, directory=False
     )
-    upstream_key = config.git.upstream or "missing"
+    upstream_key = run_config.git.upstream or "missing"
     dedupe_key = f"git-push-failure:{upstream_key}"
     outbox = ControlOutbox(profile_root)
     if result.pushed:
@@ -1033,7 +1096,7 @@ def _push_checkpoint_unlocked(root: Path, checkpoint: CheckpointResult) -> PushR
     detail = {
         "version": 1,
         "commit_sha": commit_sha,
-        "upstream": config.git.upstream,
+        "upstream": run_config.git.upstream,
         "error": (result.error or "automatic push failed")[:4000],
         "retry": "next successful checkpoint or explicit durable retry",
         "failed_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
@@ -1049,25 +1112,27 @@ def _push_checkpoint_unlocked(root: Path, checkpoint: CheckpointResult) -> PushR
     return result
 
 
-def auto_push_checkpoint(root: Path, checkpoint: CheckpointResult) -> PushResult:
+def auto_push_checkpoint(
+    root: Path, checkpoint: CheckpointResult, *, config: HarnessConfig | None = None
+) -> PushResult:
     """Push only a successful exact checkpoint under the profile lease."""
     from .config import load_profile_config
     from .locking import ProfileLease
 
     profile_root = Path(root).resolve()
     try:
-        config = load_profile_config(profile_root)
-        if not config.git.auto_push:
+        run_config = config or load_profile_config(profile_root)
+        if not run_config.git.auto_push:
             return PushResult(False)
         if checkpoint.error is not None:
             return PushResult(False, checkpoint.commit_sha, error="checkpoint failed; automatic push intent was retained")
         with ProfileLease(
-            profile_root, stale_timeout=config.curation.stale_timeout_seconds
+            profile_root, stale_timeout=run_config.curation.stale_timeout_seconds
         ):
             intent = _recover_push_intent_locked(profile_root)
             if not checkpoint.committed and intent is not None:
                 checkpoint = CheckpointResult(True, intent.get("commit_sha"))
-            return _push_checkpoint_unlocked(profile_root, checkpoint)
+            return _push_checkpoint_unlocked(profile_root, checkpoint, config=run_config)
     except (OSError, ValueError, RuntimeError, ProfileGitError) as error:
         return PushResult(False, error=str(error))
 
@@ -1126,7 +1191,7 @@ def validate_application_baseline(
     if ancestor.returncode != 0:
         raise ProfileGitError("proposal base commit is stale or unrelated")
     changed = _git(
-        profile_root, "diff", "--name-only", "-z", f"{base_commit}..HEAD",
+        profile_root, "diff", "--no-ext-diff", "--no-textconv", "--name-only", "-z", f"{base_commit}..HEAD",
         read_only=True,
     ).stdout.split("\0")
     allowed_prefixes = (
@@ -1165,7 +1230,7 @@ def identify_application_checkpoint(
         raise ProfileGitError("HEAD changed to an unexpected commit during application")
     changed = {
         path for path in _git(
-            profile_root, "diff", "--name-only", "-z", pre_commit, current,
+            profile_root, "diff", "--no-ext-diff", "--no-textconv", "--name-only", "-z", pre_commit, current,
             read_only=True,
         ).stdout.split("\0") if path
     }

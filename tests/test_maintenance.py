@@ -74,6 +74,57 @@ class MaintenanceTests(unittest.TestCase):
             self.assertEqual("no_op", output["curation"]["status"])
             self.assertEqual("curation_count", output["improvement"]["reason"])
 
+    def test_malformed_only_inbox_is_quarantined_before_due_without_model(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = self.make_profile(Path(temporary_directory))
+            invalid = root / ".harness/memory/inbox/broken.json"
+            invalid.write_text("{not json", encoding="utf-8")
+
+            with mock.patch.object(
+                maintenance_module, "run_codex", side_effect=AssertionError("model invoked")
+            ):
+                output = run_maintenance(root, now=NOW)
+
+            self.assertEqual("empty", output["curation"]["reason"])
+            self.assertFalse(invalid.exists())
+            self.assertEqual(1, len(list((root / ".harness/memory/archive/dead-letter").glob("broken*.json"))))
+
+    def test_mid_run_config_change_does_not_change_auto_safe_or_push_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = self.make_profile(Path(temporary_directory))
+            for index in range(30):
+                self.add_receipt(root, index, NOW)
+            model_calls = []
+            push_configs = []
+
+            def mutate_during_model(_root, _prompt, result_path, **kwargs):
+                model_calls.append((kwargs["model"], kwargs["reasoning_effort"]))
+                config_path = root / ".harness/config.toml"
+                config_path.write_text(
+                    config_path.read_text(encoding="utf-8")
+                    + '\n[improvement]\nmode = "auto_safe"\nmodel = "changed-model"\n'
+                    + '\n[git]\nauto_push = true\nupstream = "origin/main"\nprivate_data_acknowledged = true\n',
+                    encoding="utf-8",
+                )
+                Path(result_path).write_text('{"actions":[],"signals":[]}', encoding="utf-8")
+
+            def observe_push(_root, _checkpoint, *, config=None):
+                push_configs.append(config)
+                return PushResult(False)
+
+            with mock.patch.object(
+                maintenance_module, "run_codex", side_effect=mutate_during_model
+            ), mock.patch.object(
+                profile_git_module, "auto_push_checkpoint", side_effect=observe_push
+            ):
+                output = run_maintenance(root, now=NOW)
+
+            self.assertEqual([("gpt-5.6-sol", "medium")], model_calls)
+            self.assertEqual("performed", output["curation"]["status"])
+            self.assertEqual(1, len(push_configs))
+            self.assertFalse(push_configs[0].git.auto_push)
+            self.assertEqual("approval_required", push_configs[0].improvement.mode)
+
     def test_maintenance_push_failure_preserves_commit_and_later_run_retries(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             parent = Path(temporary_directory)
@@ -655,7 +706,7 @@ class MaintenanceTests(unittest.TestCase):
                 events.append("validate-pending")
                 return None
 
-            def checkpoint(profile_root: Path, subject: str):
+            def checkpoint(profile_root: Path, subject: str, **_kwargs):
                 events.append("checkpoint")
                 return CheckpointResult(False)
 
@@ -694,8 +745,8 @@ class MaintenanceTests(unittest.TestCase):
                     "validate-pending",
                     "curation-recovery",
                     "improvement-recovery",
-                    "checkpoint",
                     "config",
+                    "checkpoint",
                     "clock",
                     "due",
                     "improvement",

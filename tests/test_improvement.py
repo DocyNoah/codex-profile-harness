@@ -352,7 +352,7 @@ class ImprovementTests(unittest.TestCase):
             self.configure_fake(root, fake)
             observed = []
 
-            def checkpoint(profile_root: Path, subject: str) -> CheckpointResult:
+            def checkpoint(profile_root: Path, subject: str, **_kwargs) -> CheckpointResult:
                 observed.append((
                     subject,
                     not (profile_root / ".harness/state/improvement-transaction.json").exists(),

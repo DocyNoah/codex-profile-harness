@@ -229,7 +229,8 @@ class ProfileGitTests(unittest.TestCase):
             self.assertEqual("", observed["env"]["GIT_ASKPASS"])
             self.assertEqual("", observed["env"]["SSH_ASKPASS"])
             self.assertEqual("ssh -oBatchMode=yes -oPasswordAuthentication=no", observed["env"]["GIT_SSH_COMMAND"])
-            self.assertEqual(os.devnull, observed["env"]["GIT_CONFIG_LOCAL"])
+            self.assertIsNone(observed["env"]["GIT_CONFIG_LOCAL"])
+            self.assertIn(f"core.attributesFile={os.devnull}", observed["argv"])
             self.assertEqual(os.devnull, observed["env"]["GIT_CONFIG_GLOBAL"])
             self.assertEqual(os.devnull, observed["env"]["GIT_CONFIG_SYSTEM"])
             self.assertEqual("1", observed["env"]["GIT_CONFIG_NOSYSTEM"])
@@ -697,9 +698,6 @@ class ProfileGitTests(unittest.TestCase):
                 path.chmod(0o755)
             git(profile, "config", "commit.gpgSign", "true")
             git(profile, "config", "core.fsmonitor", str(profile / "fsmonitor-command"))
-            git(profile, "config", "filter.evil.clean", str(profile / "filter-command"))
-            git(profile, "config", "filter.evil.required", "true")
-            (profile / ".gitattributes").write_text("MEMORY.md filter=evil\n", encoding="utf-8")
             (profile / "MEMORY.md").write_text("safe bytes\n", encoding="utf-8")
 
             result = checkpoint_profile(profile, CHECKPOINT_SUBJECT)
@@ -707,6 +705,52 @@ class ProfileGitTests(unittest.TestCase):
             self.assertTrue(result.committed, result.error)
             self.assertFalse([path for path in markers if path.exists()])
             self.assertEqual("safe bytes\n", git(profile, "show", "HEAD:MEMORY.md").stdout)
+
+    def test_include_defined_effective_filter_is_rejected_without_execution(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            profile = Path(temporary_directory) / "profile"
+            init_profile(profile, "Work")
+            marker = profile / "included-filter-ran"
+            command = profile / "included-filter"
+            command.write_text(f"#!/bin/sh\ntouch {marker}\ncat\n", encoding="utf-8")
+            command.chmod(0o755)
+            included = profile / "included.config"
+            included.write_text(
+                f"[filter \"evil\"]\n\tclean = {command}\n\trequired = true\n",
+                encoding="utf-8",
+            )
+            git(profile, "config", "include.path", str(included))
+            info_attributes = profile / ".git/info/attributes"
+            info_attributes.write_text("MEMORY.md filter=evil\n", encoding="utf-8")
+            (profile / "MEMORY.md").write_text("must remain unstaged\n", encoding="utf-8")
+
+            result = checkpoint_profile(profile, CHECKPOINT_SUBJECT)
+
+            self.assertFalse(result.committed)
+            self.assertIn("include", (result.error or "").lower())
+            self.assertFalse(marker.exists())
+            self.assertEqual("", git(profile, "diff", "--cached", "--name-only", "--", "MEMORY.md").stdout)
+
+    def test_effective_filter_macro_is_rejected_before_add(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            profile = Path(temporary_directory) / "profile"
+            init_profile(profile, "Work")
+            marker = profile / "macro-filter-ran"
+            command = profile / "macro-filter"
+            command.write_text(f"#!/bin/sh\ntouch {marker}\ncat\n", encoding="utf-8")
+            command.chmod(0o755)
+            git(profile, "config", "filter.evil.clean", str(command))
+            (profile / ".git/info/attributes").write_text(
+                "[attr]danger filter=evil\nMEMORY.md danger\n", encoding="utf-8"
+            )
+            (profile / "MEMORY.md").write_text("not staged\n", encoding="utf-8")
+
+            result = checkpoint_profile(profile, CHECKPOINT_SUBJECT)
+
+            self.assertFalse(result.committed)
+            self.assertIn("filter", (result.error or "").lower())
+            self.assertFalse(marker.exists())
+            self.assertEqual("", git(profile, "diff", "--cached", "--name-only", "--", "MEMORY.md").stdout)
 
     def test_disabled_hooks_directory_must_remain_empty(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

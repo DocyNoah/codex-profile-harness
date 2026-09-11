@@ -20,6 +20,7 @@ from .curation import (
     prepare_curation,
     recover_preparations,
     recover_transactions,
+    validate_inbox_receipts,
 )
 from .locking import ProfileLease
 from .runner import run_codex
@@ -81,6 +82,9 @@ def maintenance_due(
 def _run_maintenance_locked(
     profile_root: Path, config: HarnessConfig, current: datetime
 ) -> dict[str, Any]:
+    # Validation and quarantine happen under the caller's ProfileLease before
+    # eligibility is calculated, so malformed receipts cannot linger forever.
+    validate_inbox_receipts(profile_root)
     due = maintenance_due(profile_root, now=current, config=config.curation)
     if not due.curation_due:
         curation = {
@@ -104,7 +108,8 @@ def _run_maintenance_locked(
                     timeout=config.curation.codex_timeout_seconds,
                 )
                 applied = apply_actions(
-                    profile_root, batch.batch_id, load_result(result_path), now=current
+                    profile_root, batch.batch_id, load_result(result_path), now=current,
+                    config=config,
                 )
             except BaseException:
                 if batch.path.exists():
@@ -129,10 +134,12 @@ def _run_maintenance_locked(
     }
 
 
-def _checkpoint_preflight(profile_root: Path, subject: str):
+def _checkpoint_preflight(
+    profile_root: Path, subject: str, config: HarnessConfig | None = None
+):
     from .profile_git import ProfileGitError, checkpoint_profile
 
-    result = checkpoint_profile(profile_root, subject)
+    result = checkpoint_profile(profile_root, subject, config=config)
     if result.error is not None:
         raise ProfileGitError(f"profile Git preflight failed: {result.error}")
     return result
@@ -146,6 +153,7 @@ def run_maintenance(root: Path, *, now: datetime | None = None) -> dict[str, Any
         from .profile_git import CheckpointResult, PushResult, auto_push_checkpoint
 
         prior_push = result.pop("_push_result", None)
+        config = result.pop("_config_snapshot")
         raw_checkpoint = result.pop("_push_checkpoint")
         checkpoint = CheckpointResult(
             bool(raw_checkpoint.get("committed")),
@@ -156,7 +164,7 @@ def run_maintenance(root: Path, *, now: datetime | None = None) -> dict[str, Any
         pushed = (
             PushResult(**prior_push)
             if prior_push is not None
-            else auto_push_checkpoint(profile_root, checkpoint)
+            else auto_push_checkpoint(profile_root, checkpoint, config=config)
         )
         if pushed.commit_sha is not None or pushed.error is not None:
             result["push"] = pushed.as_json_object()
@@ -202,15 +210,21 @@ def _run_maintenance(root: Path, *, now: datetime | None = None) -> dict[str, An
             )
             or CHECKPOINT_SUBJECT
         )
-        preflight_checkpoint = _checkpoint_preflight(profile_root, subject)
-        config = load_profile_config(profile_root)
+        try:
+            config = load_profile_config(profile_root)
+        except BaseException:
+            # Recovery checkpoints remain available to repair invalid config;
+            # no maintenance policy is evaluated without a valid snapshot.
+            _checkpoint_preflight(profile_root, subject)
+            raise
+        preflight_checkpoint = _checkpoint_preflight(profile_root, subject, config)
         current = _utc_now(now)
         result = _run_maintenance_locked(profile_root, config, current)
     result["control"] = _route_new_proposals(profile_root, result.get("improvement", {}), config)
     from .profile_git import CHECKPOINT_SUBJECT, CheckpointResult, checkpoint_profile
 
     route_checkpoint = (
-        checkpoint_profile(profile_root, CHECKPOINT_SUBJECT)
+        checkpoint_profile(profile_root, CHECKPOINT_SUBJECT, config=config)
         if result["control"] else CheckpointResult(False)
     )
     routed_pushes = [item["push"] for item in result["control"] if "push" in item]
@@ -236,6 +250,7 @@ def _run_maintenance(root: Path, *, now: datetime | None = None) -> dict[str, An
     if routed_pushes and not route_checkpoint.committed:
         result["_push_result"] = routed_pushes[-1]
     result["_push_checkpoint"] = selected.as_json_object()
+    result["_config_snapshot"] = config
     return result
 
 
@@ -264,12 +279,17 @@ def _route_new_proposals(
         allowed, _reason = automatic_policy_allows(profile_root, manifest, config.improvement)
         if config.improvement.mode == "auto_safe" and allowed:
             try:
-                applied = apply_proposal(profile_root, candidate.stem, automatic=True)
-            except ApplicationError as error:
-                event = outbox.emit(
-                    "failure", candidate.stem, {"error": str(error)[:4000]},
-                    dedupe_key=f"application-failure:{candidate.stem}",
+                applied = apply_proposal(
+                    profile_root, candidate.stem, automatic=True, config=config
                 )
+            except ApplicationError as error:
+                with ProfileLease(
+                    profile_root, stale_timeout=config.curation.stale_timeout_seconds
+                ):
+                    event = outbox._emit_unlocked(
+                        "failure", candidate.stem, {"error": str(error)[:4000]},
+                        dedupe_key=f"application-failure:{candidate.stem}",
+                    )
                 results.append({"proposal_id": candidate.stem, "status": "failed", "event_id": event["event_id"]})
             else:
                 routed = {"proposal_id": candidate.stem, "status": applied["status"]}
@@ -278,14 +298,31 @@ def _route_new_proposals(
                 results.append(routed)
             continue
         if manifest["status"] == "proposed":
-            manifest = store.transition(candidate.stem, "proposed", "notified", "queued for Harness Control")
-        event = outbox.emit(
-            "proposal", candidate.stem,
-            {
-                "proposal_id": candidate.stem, "title": manifest["title"],
-                "risk_level": manifest["risk_level"],
-                "targets": [item["path"] for item in manifest["replacements"]],
-            }, dedupe_key=f"proposal:{candidate.stem}",
-        )
+            with ProfileLease(
+                profile_root, stale_timeout=config.curation.stale_timeout_seconds
+            ):
+                manifest = store._transition_unlocked(
+                    candidate.stem, "proposed", "notified", "queued for Harness Control"
+                )
+                event = outbox._emit_unlocked(
+                    "proposal", candidate.stem,
+                    {
+                        "proposal_id": candidate.stem, "title": manifest["title"],
+                        "risk_level": manifest["risk_level"],
+                        "targets": [item["path"] for item in manifest["replacements"]],
+                    }, dedupe_key=f"proposal:{candidate.stem}",
+                )
+        else:
+            with ProfileLease(
+                profile_root, stale_timeout=config.curation.stale_timeout_seconds
+            ):
+                event = outbox._emit_unlocked(
+                    "proposal", candidate.stem,
+                    {
+                        "proposal_id": candidate.stem, "title": manifest["title"],
+                        "risk_level": manifest["risk_level"],
+                        "targets": [item["path"] for item in manifest["replacements"]],
+                    }, dedupe_key=f"proposal:{candidate.stem}",
+                )
         results.append({"proposal_id": candidate.stem, "status": "queued", "event_id": event["event_id"]})
     return results

@@ -11,7 +11,7 @@ import stat
 import tempfile
 from typing import Any, Callable
 
-from .config import ImprovementConfig, load_profile_config
+from .config import HarnessConfig, ImprovementConfig, load_profile_config
 from .fs import atomic_copy_file, atomic_write_text, ensure_safe_directory, fsync_directory, require_safe_path
 from .locking import ProfileLease
 from .proposals import ProposalStore, _safe_target
@@ -457,11 +457,17 @@ def _apply_proposal_local(
     checkpoint_fn: Callable[[Path, str], CheckpointResult] | None = None,
     fail_after_writes: int | None = None,
     crash_after_checkpoint: bool = False,
+    config: HarnessConfig | None = None,
 ) -> dict[str, Any]:
     """Apply exact UTF-8 content with CAS, snapshots, validation, and rollback."""
     profile_root = Path(root).resolve()
-    config = load_profile_config(profile_root)
-    with ProfileLease(profile_root, stale_timeout=config.curation.stale_timeout_seconds):
+    run_config = config or load_profile_config(profile_root)
+    effective_checkpoint_fn = checkpoint_fn or (
+        lambda checkpoint_root, subject: checkpoint_profile(
+            checkpoint_root, subject, config=run_config
+        )
+    )
+    with ProfileLease(profile_root, stale_timeout=run_config.curation.stale_timeout_seconds):
         _recover_unlocked(profile_root)
         store = ProposalStore(profile_root)
         manifest = store.load(proposal_id)
@@ -474,7 +480,7 @@ def _apply_proposal_local(
         if manifest["status"] == "failed":
             raise ApplicationError("failed proposals cannot be retried without a new manifest")
         if automatic:
-            allowed, reason = automatic_policy_allows(profile_root, manifest, config.improvement)
+            allowed, reason = automatic_policy_allows(profile_root, manifest, run_config.improvement)
             if not allowed:
                 raise ApplicationError(reason)
         elif approve and manifest["status"] not in {"proposed", "notified", "approved"}:
@@ -585,7 +591,7 @@ def _apply_proposal_local(
             checkpoint = None
             checkpoint_error: BaseException | None = None
             try:
-                checkpoint = (checkpoint_fn or checkpoint_profile)(profile_root, APPLICATION_SUBJECT)
+                checkpoint = effective_checkpoint_fn(profile_root, APPLICATION_SUBJECT)
             except BaseException as error:
                 checkpoint_error = error
             if crash_after_checkpoint:
@@ -671,6 +677,7 @@ def apply_proposal(
     checkpoint_fn=None,
     fail_after_writes: int | None = None,
     crash_after_checkpoint: bool = False,
+    config: HarnessConfig | None = None,
 ) -> dict[str, Any]:
     """Apply locally first, then attempt optional push outside the apply lease."""
     result = _apply_proposal_local(
@@ -682,13 +689,15 @@ def apply_proposal(
         checkpoint_fn=checkpoint_fn,
         fail_after_writes=fail_after_writes,
         crash_after_checkpoint=crash_after_checkpoint,
+        config=config,
     )
     from .profile_git import auto_push_checkpoint, checkpoint_profile
 
     profile_root = Path(root).resolve()
-    if load_profile_config(profile_root).git.auto_push:
-        checkpoint = checkpoint_profile(profile_root, APPLICATION_SUBJECT)
-        pushed = auto_push_checkpoint(profile_root, checkpoint)
+    run_config = config or load_profile_config(profile_root)
+    if run_config.git.auto_push:
+        checkpoint = checkpoint_profile(profile_root, APPLICATION_SUBJECT, config=run_config)
+        pushed = auto_push_checkpoint(profile_root, checkpoint, config=run_config)
         result["push_checkpoint_sha"] = checkpoint.commit_sha
         if pushed.commit_sha is not None or pushed.error is not None:
             result["push"] = pushed.as_json_object()

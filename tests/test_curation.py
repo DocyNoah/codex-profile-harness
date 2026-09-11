@@ -101,7 +101,7 @@ class CurationTests(unittest.TestCase):
             batch = prepare_curation(root)
             observed = []
 
-            def checkpoint(profile_root: Path, subject: str) -> CheckpointResult:
+            def checkpoint(profile_root: Path, subject: str, **_kwargs) -> CheckpointResult:
                 observed.append((
                     subject,
                     (profile_root / ".harness/memory/journal/curation.jsonl").is_file(),

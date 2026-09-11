@@ -11,13 +11,15 @@ from typing import Any
 import uuid
 
 from .config import DEFAULT_STALE_TIMEOUT_SECONDS, load_profile_config
-from .fs import atomic_write_text, ensure_safe_directory, exclusive_write_text, require_safe_path
+from .fs import atomic_write_text, ensure_safe_directory, exclusive_write_text, fsync_directory, require_safe_path
 from .locking import ProfileLease
 
 
 MAX_EVENT_BYTES = 16_384
 MAX_POLL_BYTES = 64_000
 MAX_EVENTS = 1_000
+MAX_EVENT_SCAN = 2_000
+MAX_RETAINED_ACKNOWLEDGED = 200
 MAX_POLL_EVENTS = 20
 _ID = re.compile(r"[a-f0-9]{32}")
 _KINDS = frozenset({"proposal", "failure", "application"})
@@ -92,6 +94,32 @@ class ControlOutbox:
         values = [self._read_event(path) for path in paths]
         return sorted(values, key=lambda item: (item["created_at"], item["event_id"]))
 
+    def _compact_unlocked(self, *, reserve: int = 0) -> None:
+        """Bound storage by deleting only fully validated acknowledged events."""
+        events_dir, claims_dir = self._dirs()
+        paths = sorted(events_dir.glob("*.json"))
+        if len(paths) > MAX_EVENT_SCAN:
+            raise ValueError("control outbox exceeds the bounded scan limit")
+        acknowledged: list[tuple[dict[str, Any], Path, Path]] = []
+        for path in paths:
+            event = self._read_event(path)
+            claim = self._claim(event["event_id"])
+            if claim is not None and claim["acknowledged_at"] is not None:
+                acknowledged.append((event, path, claims_dir / f"{event['event_id']}.json"))
+        acknowledged.sort(key=lambda item: (item[0]["created_at"], item[0]["event_id"]))
+        required = max(0, len(paths) + reserve - MAX_EVENTS)
+        removable = max(required, len(acknowledged) - MAX_RETAINED_ACKNOWLEDGED)
+        if removable > len(acknowledged):
+            raise ValueError("control outbox has too many pending events")
+        for _event, event_path, claim_path in acknowledged[:removable]:
+            # Event unlink is the atomic visibility boundary. A later claim
+            # cleanup failure leaves only an unreachable acknowledgement.
+            event_path.unlink(missing_ok=True)
+            claim_path.unlink(missing_ok=True)
+        if removable:
+            fsync_directory(claims_dir)
+            fsync_directory(events_dir)
+
     def _emit_unlocked(
         self, kind: str, subject_id: str, payload: dict[str, Any], *, dedupe_key: str,
         now: datetime | None = None,
@@ -112,8 +140,12 @@ class ControlOutbox:
             raise ValueError("control payload must be strict JSON") from error
         if len(payload_bytes) > MAX_EVENT_BYTES // 2:
             raise ValueError("control payload exceeds the bounded size limit")
+        self._compact_unlocked(reserve=1)
         for event in self._events_unlocked():
-            if event["dedupe_key"] == dedupe_key:
+            claim = self._claim(event["event_id"])
+            if event["dedupe_key"] == dedupe_key and not (
+                claim is not None and claim["acknowledged_at"] is not None
+            ):
                 return event
         identifier = uuid.uuid4().hex
         event = {
@@ -136,6 +168,7 @@ class ControlOutbox:
     ) -> dict[str, Any]:
         config = load_profile_config(self.root)
         with ProfileLease(self.root, stale_timeout=config.curation.stale_timeout_seconds):
+            self._compact_unlocked()
             return self._emit_unlocked(kind, subject_id, payload, dedupe_key=dedupe_key, now=now)
 
     def _claim(self, event_id: str) -> dict[str, Any] | None:
@@ -165,6 +198,7 @@ class ControlOutbox:
         current = _time(now)
         config = load_profile_config(self.root)
         with ProfileLease(self.root, stale_timeout=config.curation.stale_timeout_seconds):
+            self._compact_unlocked()
             if config.improvement.mode != "proposal_only":
                 from .proposals import ProposalStore
 

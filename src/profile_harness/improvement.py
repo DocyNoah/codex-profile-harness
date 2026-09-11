@@ -735,7 +735,7 @@ def _run_locked(
             from .profile_git import IMPROVEMENT_SUBJECT, checkpoint_profile
 
             cleanup_runtime_files()
-            checkpoint = checkpoint_profile(root, IMPROVEMENT_SUBJECT)
+            checkpoint = checkpoint_profile(root, IMPROVEMENT_SUBJECT, config=run_config)
             output["checkpoint_sha"] = checkpoint.commit_sha if checkpoint.committed else None
             output["checkpoint_error"] = checkpoint.error
             return output
@@ -768,7 +768,7 @@ def run_improvement(
         result.get("checkpoint_sha"),
         error=result.get("checkpoint_error"),
     )
-    pushed = auto_push_checkpoint(profile_root, checkpoint)
+    pushed = auto_push_checkpoint(profile_root, checkpoint, config=config)
     if pushed.commit_sha is not None or pushed.error is not None:
         result["push"] = pushed.as_json_object()
     return result
