@@ -274,7 +274,7 @@ class ProfileGitTests(unittest.TestCase):
             first = initial.commit_sha
             self.assertTrue(auto_push_checkpoint(profile, initial).pushed)
             git(parent, "clone", remote.resolve().as_uri(), str(other))
-            git(other, "checkout", "-b", branch, f"origin/{branch}")
+            git(other, "checkout", "-B", branch, f"origin/{branch}")
             (other / "foreign").write_text("remote\n", encoding="utf-8")
             git(other, "add", "foreign")
             git(other, "-c", "user.name=X", "-c", "user.email=x@x", "commit", "-m", "remote")
