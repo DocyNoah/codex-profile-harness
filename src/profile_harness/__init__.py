@@ -1,6 +1,7 @@
 """Codex Profile Harness public API."""
 
 from .capture import CaptureError, CaptureResult, capture_event
+from .application import ApplicationError, apply_proposal, automatic_policy_allows
 from .config import (
     CaptureConfig,
     CurationConfig,
@@ -23,6 +24,7 @@ from .curation import (
     prepare_curation,
     validate_actions,
 )
+from .control import ControlOutbox
 from .dashboard import generate_dashboard
 from .doctor import DoctorReport, Finding, diagnose
 from .journal import append_entry, verify_journal
@@ -42,6 +44,8 @@ __all__ = [
     "ApplyResult",
     "CurationBatch",
     "CurationError",
+    "ApplicationError",
+    "ControlOutbox",
     "DoctorReport",
     "Finding",
     "LeaseBusyError",
@@ -49,6 +53,8 @@ __all__ = [
     "ProposalError",
     "ProposalStore",
     "append_entry",
+    "apply_proposal",
+    "automatic_policy_allows",
     "apply_actions",
     "build_local_marketplace",
     "claim_receipts",

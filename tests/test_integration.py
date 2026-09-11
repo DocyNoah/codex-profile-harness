@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import hashlib
+from datetime import datetime, timezone
 from pathlib import Path
 import subprocess
 import sys
@@ -13,6 +15,62 @@ CLI = [sys.executable, str(ROOT / "bin/profile-harness")]
 
 
 class EndToEndTests(unittest.TestCase):
+    def test_proposal_cli_lists_shows_approves_applies_and_retries(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            parent = Path(temporary_directory)
+            profile = parent / "profile"
+            self.assertEqual(0, self.run_cli(parent, "init", str(profile), "--name", "Approval").returncode)
+            sys.path.insert(0, str(ROOT / "src"))
+            from profile_harness.proposals import ProposalStore
+            target = profile / "CONTEXT.md"
+            head = subprocess.run(
+                ["git", "-C", str(profile), "rev-parse", "HEAD"],
+                text=True, capture_output=True, check=True,
+            ).stdout.strip()
+            proposal = ProposalStore(profile).create(
+                title="CLI approval", rationale="Exact bytes", risk_level="medium",
+                source_journal_hashes=["c" * 64],
+                replacements=[{
+                    "path": "CONTEXT.md",
+                    "expected_old_sha256": hashlib.sha256(target.read_bytes()).hexdigest(),
+                    "content": "# Context\n\nCLI applied.\n",
+                }],
+                base_commit=head,
+                policy={"mode": "approval_required", "automatic_eligible": False, "reason": "review"},
+                created_at=datetime(2026, 9, 11, tzinfo=timezone.utc),
+            )
+
+            listed = self.run_cli(profile, "proposal", "list", "--json")
+            shown = self.run_cli(profile, "proposal", "show", proposal["proposal_id"], "--json")
+            applied = self.run_cli(profile, "proposal", "approve", proposal["proposal_id"])
+            retried = self.run_cli(profile, "proposal", "approve", proposal["proposal_id"])
+
+            self.assertEqual(proposal["proposal_id"], json.loads(listed.stdout)[0]["proposal_id"])
+            self.assertEqual("CLI approval", json.loads(shown.stdout)["title"])
+            self.assertEqual("applied", json.loads(applied.stdout)["status"])
+            self.assertEqual("already_applied", json.loads(retried.stdout)["status"])
+            self.assertEqual("# Context\n\nCLI applied.\n", target.read_text())
+
+    def test_proposal_and_control_cli_are_bounded_local_workflows(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            parent = Path(temporary_directory)
+            profile = parent / "profile"
+            self.assertEqual(0, self.run_cli(parent, "init", str(profile), "--name", "Control").returncode)
+            sys.path.insert(0, str(ROOT / "src"))
+            from profile_harness.control import ControlOutbox
+            event = ControlOutbox(profile).emit(
+                "failure", "maintenance", {"error": "review"}, dedupe_key="integration:failure"
+            )
+
+            status = self.run_cli(profile, "control", "status", "--json")
+            polled = self.run_cli(profile, "control", "poll", "--json")
+            self.assertEqual(0, status.returncode, status.stderr)
+            self.assertEqual(1, json.loads(status.stdout)["pending"])
+            claim = json.loads(polled.stdout)[0]
+            self.assertEqual(event["event_id"], claim["event_id"])
+            acked = self.run_cli(profile, "control", "ack", event["event_id"], claim["claim_token"], "--json")
+            self.assertEqual({"acknowledged": True}, json.loads(acked.stdout))
+
     def run_cli(
         self,
         cwd: Path,

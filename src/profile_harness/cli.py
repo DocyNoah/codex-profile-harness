@@ -29,8 +29,17 @@ from .doctor import diagnose
 from .locking import ProfileLease
 from .maintenance import run_maintenance
 from .improvement import run_improvement
+from .application import apply_proposal
+from .control import ControlOutbox, MAX_POLL_BYTES
+from .proposals import MAX_MANIFEST_BYTES, ProposalStore
 from .runner import run_codex
-from .profile_git import CHECKPOINT_SUBJECT, checkpoint_profile, inspect_profile_git, profile_git_log
+from .profile_git import (
+    APPLICATION_SUBJECT,
+    CHECKPOINT_SUBJECT,
+    checkpoint_profile,
+    inspect_profile_git,
+    profile_git_log,
+)
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -88,11 +97,42 @@ def _parser() -> argparse.ArgumentParser:
     git_log = git_commands.add_parser("log", help="show the local profile checkpoint log")
     git_log.add_argument("--json", action="store_true")
     git_log.add_argument("--limit", type=int, default=20)
+    proposal = commands.add_parser("proposal", help="inspect or decide improvement proposals")
+    proposal_commands = proposal.add_subparsers(dest="proposal_command", required=True)
+    proposal_list = proposal_commands.add_parser("list", help="list proposals")
+    proposal_list.add_argument("--json", action="store_true")
+    proposal_show = proposal_commands.add_parser("show", help="show one proposal")
+    proposal_show.add_argument("proposal_id")
+    proposal_show.add_argument("--json", action="store_true")
+    proposal_approve = proposal_commands.add_parser("approve", help="approve and apply exact proposal bytes")
+    proposal_approve.add_argument("proposal_id")
+    proposal_reject = proposal_commands.add_parser("reject", help="reject a proposal")
+    proposal_reject.add_argument("proposal_id")
+    proposal_reject.add_argument("--reason", default="rejected by user")
+    control = commands.add_parser("control", help="poll the local Harness Control outbox")
+    control_commands = control.add_subparsers(dest="control_command", required=True)
+    control_poll = control_commands.add_parser("poll", help="claim due events")
+    control_poll.add_argument("--json", action="store_true")
+    control_status = control_commands.add_parser("status", help="show outbox state")
+    control_status.add_argument("--json", action="store_true")
+    control_ack = control_commands.add_parser("ack", help="acknowledge a claimed event")
+    control_ack.add_argument("event_id")
+    control_ack.add_argument("claim_token")
+    control_ack.add_argument("--json", action="store_true")
     return parser
 
 
 def _reject_nonstandard_json_constant(value: str) -> None:
     raise CaptureError(f"non-standard JSON constant: {value}")
+
+
+def _print_bounded_json(value: object, *, limit: int) -> None:
+    encoded = json.dumps(
+        value, ensure_ascii=False, sort_keys=True, allow_nan=False
+    ).encode("utf-8")
+    if len(encoded) > limit:
+        raise ValueError("JSON output exceeds the bounded size limit")
+    sys.stdout.buffer.write(encoded + b"\n")
 
 
 def _capture_from_stdin() -> int:
@@ -258,6 +298,63 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 for entry in entries:
                     print(f"{entry['sha'][:12]} {entry['time']} {entry['subject']}")
+            return 0
+        elif arguments.command == "proposal":
+            root = find_profile_root(Path.cwd())
+            store = ProposalStore(root)
+            if arguments.proposal_command == "list":
+                values = store.list()
+                summary = [{
+                    key: value.get(key) for key in
+                    ("proposal_id", "status", "title", "risk_level", "created_at")
+                    if key in value
+                } for value in values]
+                _print_bounded_json(summary, limit=MAX_MANIFEST_BYTES)
+                return 0
+            if arguments.proposal_command == "show":
+                value = store.load(arguments.proposal_id)
+                if arguments.json or value.get("legacy"):
+                    _print_bounded_json(value, limit=MAX_MANIFEST_BYTES)
+                else:
+                    path = root / ".harness/improvements/proposed" / f"{arguments.proposal_id}.md"
+                    print(path.read_text(encoding="utf-8"), end="")
+                return 0
+            if arguments.proposal_command == "reject":
+                value = store.load(arguments.proposal_id)
+                if value["status"] == "proposed":
+                    store.transition(arguments.proposal_id, "proposed", "notified", "opened for user decision")
+                result = store.transition(arguments.proposal_id, "notified", "rejected", arguments.reason)
+                checkpoint = checkpoint_profile(root, APPLICATION_SUBJECT)
+                if checkpoint.error is not None:
+                    raise RuntimeError(checkpoint.error)
+                _print_bounded_json({"proposal_id": arguments.proposal_id, "status": result["status"]}, limit=MAX_MANIFEST_BYTES)
+                return 0
+            value = store.load(arguments.proposal_id)
+            if value["status"] == "applied":
+                _print_bounded_json(apply_proposal(root, arguments.proposal_id), limit=MAX_MANIFEST_BYTES)
+                return 0
+            if value["status"] == "proposed":
+                store.transition(arguments.proposal_id, "proposed", "notified", "opened for user decision")
+                value = store.load(arguments.proposal_id)
+            if value["status"] == "notified":
+                store.transition(arguments.proposal_id, "notified", "approved", "approved by user")
+                value = store.load(arguments.proposal_id)
+            if value["status"] == "approved":
+                approval_checkpoint = checkpoint_profile(root, APPLICATION_SUBJECT)
+                if approval_checkpoint.error is not None:
+                    raise RuntimeError(approval_checkpoint.error)
+            _print_bounded_json(apply_proposal(root, arguments.proposal_id), limit=MAX_MANIFEST_BYTES)
+            return 0
+        elif arguments.command == "control":
+            root = find_profile_root(Path.cwd())
+            outbox = ControlOutbox(root)
+            if arguments.control_command == "poll":
+                value = list(outbox.poll())
+            elif arguments.control_command == "status":
+                value = outbox.status()
+            else:
+                value = {"acknowledged": outbox.ack(arguments.event_id, arguments.claim_token)}
+            _print_bounded_json(value, limit=MAX_POLL_BYTES)
             return 0
     except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
         parser.error(str(error))

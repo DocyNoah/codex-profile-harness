@@ -8,6 +8,8 @@ from urllib.parse import quote
 from .config import load_profile
 from .fs import atomic_write_text, require_safe_path
 from .profile_git import inspect_profile_git
+from .proposals import ProposalStore
+from .control import ControlOutbox
 
 
 INDEXES = (
@@ -73,6 +75,14 @@ def generate_dashboard(root: Path) -> Path:
         ))
     else:
         lines.extend(("", "## Git checkpoint", "", f"Unavailable: {git.error or 'not initialized'}"))
+    proposals = ProposalStore(profile.root).list()
+    control = ControlOutbox(profile.root).status()
+    lines.extend((
+        "", "## Harness Control outbox", "",
+        f"- Proposals: {len(proposals)}",
+        f"- Pending events: {control['pending']}",
+        f"- Acknowledged events: {control['acknowledged']}",
+    ))
     if not profile.repositories:
         lines.extend(("", "No repositories are registered yet."))
     for registered in profile.repositories:

@@ -530,30 +530,42 @@ class ProposalStore:
         config = load_profile_config(self.root)
         with ProfileLease(self.root, stale_timeout=config.curation.stale_timeout_seconds):
             self._recover_pending_unlocked()
-            manifest = self.load(proposal_id)
-            if manifest.get("legacy"):
-                raise ProposalError("legacy Markdown proposals are read-only and never applicable")
-            current = manifest["status"]
-            if current == target:
-                return manifest
-            if current != expected:
-                raise ProposalError(f"proposal status is {current}, expected {expected}")
-            if target not in _TRANSITIONS[current]:
-                raise ProposalError(f"invalid proposal transition: {current} -> {target}")
-            if reason is not None and (
-                not isinstance(reason, str) or not reason.strip() or len(reason) > MAX_REASON_CHARS
-            ):
-                raise ProposalError("proposal transition reason must be bounded non-empty text")
-            try:
-                append_entry(self._journal(), {
-                    "event": "proposal_transition",
-                    "proposal_id": proposal_id,
-                    "from_status": current,
-                    "target_status": target,
-                    "reason": reason.strip() if isinstance(reason, str) else None,
-                    "changed_at": _timestamp(),
-                })
-            except (OSError, ValueError) as error:
-                raise ProposalError(f"cannot record proposal transition: {error}") from error
-            manifest["status"] = target
+            return self._transition_unlocked(proposal_id, expected, target, reason)
+
+    def _transition_unlocked(
+        self,
+        proposal_id: str,
+        expected: str,
+        target: str,
+        reason: str | None = None,
+    ) -> dict[str, Any]:
+        """Transition while the caller already holds the profile lease."""
+        if expected not in _STATUSES or target not in _STATUSES:
+            raise ProposalError("proposal lifecycle status is invalid")
+        if target not in _TRANSITIONS[expected]:
+            raise ProposalError(f"invalid proposal transition: {expected} -> {target}")
+        manifest = self.load(proposal_id)
+        if manifest.get("legacy"):
+            raise ProposalError("legacy Markdown proposals are read-only and never applicable")
+        current = manifest["status"]
+        if current == target:
             return manifest
+        if current != expected:
+            raise ProposalError(f"proposal status is {current}, expected {expected}")
+        if reason is not None and (
+            not isinstance(reason, str) or not reason.strip() or len(reason) > MAX_REASON_CHARS
+        ):
+            raise ProposalError("proposal transition reason must be bounded non-empty text")
+        try:
+            append_entry(self._journal(), {
+                "event": "proposal_transition",
+                "proposal_id": proposal_id,
+                "from_status": current,
+                "target_status": target,
+                "reason": reason.strip() if isinstance(reason, str) else None,
+                "changed_at": _timestamp(),
+            })
+        except (OSError, ValueError) as error:
+            raise ProposalError(f"cannot record proposal transition: {error}") from error
+        manifest["status"] = target
+        return manifest

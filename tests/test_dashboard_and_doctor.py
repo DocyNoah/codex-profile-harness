@@ -20,9 +20,24 @@ from profile_harness.config import init_profile, register_repo  # noqa: E402
 from profile_harness.dashboard import generate_dashboard  # noqa: E402
 from profile_harness.doctor import diagnose  # noqa: E402
 from profile_harness.locking import ProfileLease  # noqa: E402
+from profile_harness.control import ControlOutbox  # noqa: E402
 
 
 class DashboardTests(unittest.TestCase):
+    def test_dashboard_exposes_proposal_and_control_counts(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory) / "profile"
+            init_profile(root, "Work")
+            ControlOutbox(root).emit(
+                "failure", "maintenance", {"error": "failed"}, dedupe_key="failure:dashboard"
+            )
+
+            content = generate_dashboard(root).read_text(encoding="utf-8")
+
+            self.assertIn("Control outbox", content)
+            self.assertIn("Pending events: 1", content)
+            self.assertIn("Proposals: 0", content)
+
     def test_dashboard_summarizes_only_registered_repository_indexes(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory) / "profile"
@@ -99,6 +114,20 @@ class DashboardTests(unittest.TestCase):
 
 
 class DoctorTests(unittest.TestCase):
+    def test_doctor_validates_control_outbox_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory) / "profile"
+            init_profile(root, "Work")
+            event = ControlOutbox(root).emit(
+                "failure", "maintenance", {"error": "failed"}, dedupe_key="failure:doctor"
+            )
+            path = root / ".harness/control/outbox" / f"{event['event_id']}.json"
+            path.write_text("{}\n", encoding="utf-8")
+
+            report = diagnose(root)
+
+            self.assertFalse(report.ok)
+            self.assertIn("control", report.format().lower())
     def test_healthy_profile_has_no_errors_without_optional_codex_check(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory) / "profile"

@@ -803,6 +803,7 @@ def diagnose(
     stale_timeout: float | None = None,
     check_codex: bool = False,
     codex_command: str | None = None,
+    recover_application_state: bool = True,
 ) -> DoctorReport:
     """Inspect integrity, recovering durable interrupted transactions when idle."""
     profile_root = Path(root).expanduser().resolve()
@@ -968,6 +969,21 @@ def diagnose(
         else:
             findings.append(Finding("OK", "transaction", "recovered interrupted improvement while holding the profile lease"))
 
+    application_transaction = profile_root / ".harness/state/application-transaction.json"
+    if application_transaction.is_symlink():
+        findings.append(Finding("ERROR", "transaction", "application transaction descriptor is a symlink"))
+    elif application_transaction.exists() and recover_application_state:
+        try:
+            from .application import _recover_unlocked as recover_application_unlocked
+            with ProfileLease(profile_root, stale_timeout=effective_stale_timeout):
+                recover_application_unlocked(profile_root)
+        except LeaseBusyError:
+            findings.append(Finding("ERROR", "transaction", "interrupted application is actively locked; recovery was not attempted"))
+        except (OSError, ValueError, RuntimeError) as error:
+            findings.append(Finding("ERROR", "transaction", f"application recovery failed: {error}"))
+        else:
+            findings.append(Finding("OK", "transaction", "recovered interrupted application while holding the profile lease"))
+
     try:
         proposal_items = ProposalStore(profile_root).list()
     except (OSError, UnicodeError, ProposalError) as error:
@@ -981,6 +997,20 @@ def diagnose(
             ))
         findings.append(Finding(
             "OK", "proposal", f"validated {len(proposal_items) - legacy_count} versioned proposal(s)",
+        ))
+
+    try:
+        from .control import ControlOutbox
+
+        control_status = ControlOutbox(profile_root).status()
+    except LeaseBusyError:
+        findings.append(Finding("WARN", "control", "control state is actively locked"))
+    except (OSError, UnicodeError, ValueError) as error:
+        findings.append(Finding("ERROR", "control", str(error)))
+    else:
+        findings.append(Finding(
+            "OK", "control",
+            f"validated {control_status['total']} event(s); {control_status['pending']} pending",
         ))
 
     for relative in RUNTIME_DIRECTORIES:

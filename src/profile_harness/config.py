@@ -34,6 +34,8 @@ PROFILE_DIRECTORIES = (
     ".harness/improvements/proposed",
     ".harness/improvements/accepted",
     ".harness/improvements/rejected",
+    ".harness/control/outbox",
+    ".harness/control/claims",
     "projects",
 )
 OPTIONAL_RUNTIME_DIRECTORIES = (

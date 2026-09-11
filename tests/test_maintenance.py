@@ -22,6 +22,7 @@ from profile_harness.locking import LeaseBusyError, ProfileLease  # noqa: E402
 from profile_harness.maintenance import maintenance_due, run_maintenance  # noqa: E402
 import profile_harness.maintenance as maintenance_module  # noqa: E402
 from profile_harness.profile_git import (  # noqa: E402
+    CHECKPOINT_SUBJECT,
     CURATION_SUBJECT,
     IMPROVEMENT_SUBJECT,
     RECOVERY_SUBJECT,
@@ -31,6 +32,8 @@ from profile_harness.profile_git import (  # noqa: E402
 )
 import profile_harness.profile_git as profile_git_module  # noqa: E402
 from profile_harness.runner import run_codex  # noqa: E402
+from profile_harness.proposals import ProposalStore  # noqa: E402
+from profile_harness.control import ControlOutbox  # noqa: E402
 
 
 NOW = datetime(2026, 9, 11, 12, 0, 0, tzinfo=timezone.utc)
@@ -257,6 +260,73 @@ class MaintenanceTests(unittest.TestCase):
             self.assertFalse(list((root / ".harness/memory/processing").iterdir()))
             self.assertFalse(list((root / ".harness/improvements/proposed").iterdir()))
             self.assertFalse(list((root / ".harness/memory/journal").iterdir()))
+
+    def test_new_proposal_is_notified_and_queued_after_durable_creation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = self.make_profile(Path(temporary_directory))
+            target = root / "CONTEXT.md"
+            proposal = ProposalStore(root).create(
+                title="Review", rationale="Evidence", risk_level="low",
+                source_journal_hashes=["a" * 64],
+                replacements=[{
+                    "path": "CONTEXT.md",
+                    "expected_old_sha256": hashlib.sha256(target.read_bytes()).hexdigest(),
+                    "content": "# Context\n\nReview.\n",
+                }],
+                base_commit=subprocess.run(
+                    ["git", "-C", str(root), "rev-parse", "HEAD"],
+                    text=True, capture_output=True, check=True,
+                ).stdout.strip(),
+                policy={"mode": "approval_required", "automatic_eligible": False, "reason": "review"},
+                created_at=NOW,
+            )
+            result_path = root / ".harness/improvements/proposed" / f"{proposal['proposal_id']}.json"
+            result = {"curation": {"status": "no_op"}, "improvement": {
+                "status": "performed", "proposals": [str(result_path)],
+            }}
+            with mock.patch.object(maintenance_module, "_run_maintenance_locked", return_value=result):
+                output = run_maintenance(root, now=NOW)
+
+            self.assertEqual("notified", ProposalStore(root).load(proposal["proposal_id"])["status"])
+            self.assertEqual(proposal["proposal_id"], ControlOutbox(root).poll(now=NOW)[0]["subject_id"])
+            self.assertEqual("queued", output["control"][0]["status"])
+
+    def test_auto_safe_recomputes_local_policy_and_applies_allowlisted_proposal(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = self.make_profile(Path(temporary_directory))
+            config_path = root / ".harness/config.toml"
+            config_path.write_text(
+                config_path.read_text() +
+                '\n[improvement]\nmode = "auto_safe"\nautomatic_paths = ["CONTEXT.md"]\n'
+            )
+            self.assertIsNone(checkpoint_profile(root, CHECKPOINT_SUBJECT).error)
+            target = root / "CONTEXT.md"
+            proposal = ProposalStore(root).create(
+                title="Automatic", rationale="Bounded", risk_level="high",
+                source_journal_hashes=["b" * 64],
+                replacements=[{
+                    "path": "CONTEXT.md",
+                    "expected_old_sha256": hashlib.sha256(target.read_bytes()).hexdigest(),
+                    "content": "# Context\n\nAutomatic exact bytes.\n",
+                }],
+                base_commit=subprocess.run(
+                    ["git", "-C", str(root), "rev-parse", "HEAD"],
+                    text=True, capture_output=True, check=True,
+                ).stdout.strip(),
+                policy={"mode": "auto_safe", "automatic_eligible": False, "reason": "model label ignored"},
+                created_at=NOW,
+            )
+            result_path = root / ".harness/improvements/proposed" / f"{proposal['proposal_id']}.json"
+            result = {"curation": {"status": "no_op"}, "improvement": {
+                "status": "performed", "proposals": [str(result_path)],
+            }}
+
+            with mock.patch.object(maintenance_module, "_run_maintenance_locked", return_value=result):
+                output = run_maintenance(root, now=NOW)
+
+            self.assertEqual("applied", output["control"][0]["status"])
+            self.assertEqual("applied", ProposalStore(root).load(proposal["proposal_id"])["status"])
+            self.assertEqual("# Context\n\nAutomatic exact bytes.\n", target.read_text())
 
     def test_maintain_noop_checkpoints_pending_managed_documents(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

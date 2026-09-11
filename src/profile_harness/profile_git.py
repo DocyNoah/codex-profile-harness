@@ -22,6 +22,7 @@ INITIALIZE_SUBJECT = "harness: initialize profile"
 REGISTRY_SUBJECT = "harness: update repository registry"
 CURATION_SUBJECT = "harness: curate profile memory"
 IMPROVEMENT_SUBJECT = "harness: propose profile improvement"
+APPLICATION_SUBJECT = "harness: apply approved profile improvement"
 RECOVERY_SUBJECT = "harness: recover profile state"
 CHECKPOINT_SUBJECT = "harness: checkpoint profile documents"
 COMMIT_SUBJECTS = frozenset({
@@ -29,6 +30,7 @@ COMMIT_SUBJECTS = frozenset({
     REGISTRY_SUBJECT,
     CURATION_SUBJECT,
     IMPROVEMENT_SUBJECT,
+    APPLICATION_SUBJECT,
     RECOVERY_SUBJECT,
     CHECKPOINT_SUBJECT,
 })
@@ -62,6 +64,7 @@ FORBIDDEN_TRACKED_DIRECTORIES = (
     ".harness/memory/archive/",
     ".harness/memory/episodes/",
     ".harness/state/",
+    ".harness/control/",
     ".harness/logs/",
 )
 FORBIDDEN_TRACKED_FILES = (
@@ -76,6 +79,7 @@ REQUIRED_IGNORE_RULES = (
     ".harness/memory/archive/",
     ".harness/memory/episodes/",
     ".harness/state/",
+    ".harness/control/",
     ".harness/logs/",
     ".harness/config.local.toml",
     ".DS_Store",
@@ -582,6 +586,39 @@ def current_profile_commit(root: Path) -> str:
     if not re.fullmatch(r"[a-f0-9]{40,64}", result):
         raise ProfileGitError("profile HEAD is invalid")
     return result
+
+
+def validate_application_baseline(
+    root: Path, base_commit: str, target_paths: tuple[str, ...]
+) -> None:
+    """Require a clean managed tree and only proposal metadata since *base_commit*."""
+    profile_root = Path(root).expanduser().resolve()
+    _safe_git_directory(profile_root)
+    if not re.fullmatch(r"[a-f0-9]{40,64}", base_commit):
+        raise ProfileGitError("proposal base commit is invalid")
+    if _dirty_paths(profile_root):
+        raise ProfileGitError("managed profile baseline is dirty")
+    ancestor = _git(
+        profile_root, "merge-base", "--is-ancestor", base_commit, "HEAD",
+        check=False, read_only=True,
+    )
+    if ancestor.returncode != 0:
+        raise ProfileGitError("proposal base commit is stale or unrelated")
+    changed = _git(
+        profile_root, "diff", "--name-only", "-z", f"{base_commit}..HEAD",
+        read_only=True,
+    ).stdout.split("\0")
+    allowed_prefixes = (
+        ".harness/improvements/proposed/",
+        ".harness/improvements/lifecycle.jsonl",
+        ".harness/memory/journal/improvement.jsonl",
+    )
+    disallowed = sorted(
+        path for path in changed if path
+        and not any(path == prefix.rstrip("/") or path.startswith(prefix) for prefix in allowed_prefixes)
+    )
+    if disallowed:
+        raise ProfileGitError("proposal base changed outside proposal metadata: " + ", ".join(disallowed))
 
 
 def validate_pending_checkpoint(root: Path) -> str | None:

@@ -141,11 +141,13 @@ def run_maintenance(root: Path, *, now: datetime | None = None) -> dict[str, Any
         improvement_recovered = recover_improvement_transaction(
             profile_root, checkpoint=False
         )
+        from .application import _recover_unlocked as recover_application_unlocked
+        application_recovered = recover_application_unlocked(profile_root)
         subject = (
             pending_subject
             or (
                 RECOVERY_SUBJECT
-                if curation_recovered or preparation_recovered or improvement_recovered
+                if curation_recovered or preparation_recovered or improvement_recovered or application_recovered
                 else None
             )
             or CHECKPOINT_SUBJECT
@@ -153,4 +155,55 @@ def run_maintenance(root: Path, *, now: datetime | None = None) -> dict[str, Any
         _checkpoint_preflight(profile_root, subject)
         config = load_profile_config(profile_root)
         current = _utc_now(now)
-        return _run_maintenance_locked(profile_root, config, current)
+        result = _run_maintenance_locked(profile_root, config, current)
+    result["control"] = _route_new_proposals(profile_root, result.get("improvement", {}), config)
+    return result
+
+
+def _route_new_proposals(
+    profile_root: Path, improvement: dict[str, Any], config: HarnessConfig
+) -> list[dict[str, Any]]:
+    """Route only manifests returned by the completed improvement transaction."""
+    from .application import ApplicationError, apply_proposal, automatic_policy_allows
+    from .control import ControlOutbox
+    from .proposals import ProposalStore
+
+    if config.improvement.mode == "proposal_only" or improvement.get("status") != "performed":
+        return []
+    store = ProposalStore(profile_root)
+    outbox = ControlOutbox(profile_root)
+    results: list[dict[str, Any]] = []
+    for raw_path in improvement.get("proposals", []):
+        candidate = Path(raw_path)
+        try:
+            relative = candidate.resolve().relative_to(profile_root)
+        except (OSError, ValueError):
+            raise ValueError("improvement returned a proposal outside the profile") from None
+        if relative.parent.as_posix() != ".harness/improvements/proposed" or candidate.suffix != ".json":
+            raise ValueError("improvement returned an invalid proposal path")
+        manifest = store.load(candidate.stem)
+        allowed, _reason = automatic_policy_allows(profile_root, manifest, config.improvement)
+        if config.improvement.mode == "auto_safe" and allowed:
+            try:
+                applied = apply_proposal(profile_root, candidate.stem, automatic=True)
+            except ApplicationError as error:
+                event = outbox.emit(
+                    "failure", candidate.stem, {"error": str(error)[:4000]},
+                    dedupe_key=f"application-failure:{candidate.stem}",
+                )
+                results.append({"proposal_id": candidate.stem, "status": "failed", "event_id": event["event_id"]})
+            else:
+                results.append({"proposal_id": candidate.stem, "status": applied["status"]})
+            continue
+        if manifest["status"] == "proposed":
+            manifest = store.transition(candidate.stem, "proposed", "notified", "queued for Harness Control")
+        event = outbox.emit(
+            "proposal", candidate.stem,
+            {
+                "proposal_id": candidate.stem, "title": manifest["title"],
+                "risk_level": manifest["risk_level"],
+                "targets": [item["path"] for item in manifest["replacements"]],
+            }, dedupe_key=f"proposal:{candidate.stem}",
+        )
+        results.append({"proposal_id": candidate.stem, "status": "queued", "event_id": event["event_id"]})
+    return results

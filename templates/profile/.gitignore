@@ -5,6 +5,7 @@ DASHBOARD.md
 .harness/memory/archive/
 .harness/memory/episodes/
 .harness/state/
+.harness/control/
 .harness/logs/
 .harness/config.local.toml
 .DS_Store
