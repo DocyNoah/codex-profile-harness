@@ -123,7 +123,18 @@ exact target allowlist. Runtime policy also requires a clean managed baseline,
 matching base commit and file digests, bounded changed bytes, and no changes to
 scripts, executables, permissions, Git configuration, remotes, hooks, scheduler
 configuration, `AGENTS.md`, `IDENTITY.md`, or `USER.md`. These targets always
-require approval.
+require explicit approval.
+
+Application uses a versioned, durable WAL and bounded before-images. WAL v3
+moves through `prepared`, `applying`, and `committed`. Immediately after the
+audited `applying` transition—and before target bytes or Git are changed—the WAL
+binds the exact lifecycle bytes by SHA-256 and the expected `applying` state.
+Post-commit recovery accepts only a commit whose parent, subject, changed paths,
+target bytes, and lifecycle blob match those bindings. The worktree lifecycle
+must be either those exact `applying` bytes or that byte sequence followed by one
+valid `applying -> applied` transition. Older WAL v2 records may roll back only
+when HEAD is still the recorded pre-commit; a v2 post-commit state is preserved
+for manual inspection and fails closed.
 
 Application writes exactly the approved manifest content. It never asks a model
 to reinterpret an approved proposal. Before mutation it validates the manifest,

@@ -62,3 +62,20 @@ Fresh verification after round 2:
 - `python3 scripts/validate_release.py .` — `release validation: ok`.
 - `python3 -m compileall -q src tests scripts` — exit 0.
 - `git diff --check 9574225` — exit 0.
+
+## Fix round 3
+
+Addressed the remaining Important recovery finding:
+
+- Application WAL v3 now records a `prepared` phase, then durably binds the exact SHA-256 of the fully validated lifecycle journal and the expected `applying` state immediately after that transition and before target writes or Git checkpointing.
+- Exact application commit classification verifies the lifecycle blob stored in HEAD against the WAL digest in addition to the existing parent, subject, changed-path, and target-byte constraints.
+- Post-commit recovery accepts the worktree lifecycle only when it is the exact bound `applying` journal or that exact byte prefix plus one valid `applying -> applied` transition for the same proposal. A valid older `approved` journal, a valid rehashed alternative `applying` journal, and a replacement lifecycle blob in HEAD all fail closed without deleting WAL/snapshots or emitting a false applied event.
+- Legacy WAL v2 is handled explicitly: a verified pre-commit state may safely roll back, while any post-commit state is preserved and rejected because v2 has no lifecycle-byte binding.
+
+Fresh verification after round 3:
+
+- Focused application/control/integration/Git suite — 88 tests, OK (30.075s).
+- `python3 -m unittest discover -s tests` — 278 tests, OK (93.845s).
+- `python3 scripts/validate_release.py .` — `release validation: ok`.
+- `python3 -m compileall -q src tests scripts` — exit 0.
+- `git diff --check b2a6428` — exit 0.

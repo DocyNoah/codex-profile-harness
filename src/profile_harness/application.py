@@ -21,6 +21,7 @@ from .profile_git import (
     checkpoint_profile,
     current_profile_commit,
     identify_application_checkpoint,
+    read_application_lifecycle_blob,
     validate_application_baseline,
 )
 
@@ -191,14 +192,24 @@ def _load_transaction(root: Path) -> dict[str, Any] | None:
         value = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError) as error:
         raise ApplicationError("application transaction descriptor is malformed") from error
-    if not isinstance(value, dict) or set(value) != {
+    common_fields = {
         "version", "state", "proposal_id", "base_commit", "manifest_sha256",
         "pre_commit", "post_commit", "checkpoint_subject",
         "allowed_commit_paths", "targets",
-    }:
+    }
+    if not isinstance(value, dict) or value.get("version") not in {2, 3}:
         raise ApplicationError("application transaction descriptor has invalid fields")
+    version = value["version"]
+    expected_fields = common_fields if version == 2 else common_fields | {
+        "expected_lifecycle_sha256", "expected_lifecycle_status",
+    }
+    if set(value) != expected_fields:
+        raise ApplicationError("application transaction descriptor has invalid fields")
+    states = {"applying", "committed"} if version == 2 else {
+        "prepared", "applying", "committed"
+    }
     if (
-        value["version"] != 2 or value["state"] not in {"applying", "committed"}
+        value["state"] not in states
         or not isinstance(value.get("proposal_id"), str) or _ID.fullmatch(value["proposal_id"]) is None
         or not isinstance(value.get("base_commit"), str) or re.fullmatch(r"[a-f0-9]{40,64}", value["base_commit"]) is None
         or not isinstance(value.get("manifest_sha256"), str) or _HEX64.fullmatch(value["manifest_sha256"]) is None
@@ -215,6 +226,20 @@ def _load_transaction(root: Path) -> dict[str, Any] | None:
         or not isinstance(value["targets"], list) or not 1 <= len(value["targets"]) <= 20
     ):
         raise ApplicationError("application transaction descriptor is invalid")
+    if version == 3:
+        lifecycle_digest = value["expected_lifecycle_sha256"]
+        lifecycle_status = value["expected_lifecycle_status"]
+        if value["state"] == "prepared":
+            if lifecycle_digest is not None or lifecycle_status is not None or value["post_commit"] is not None:
+                raise ApplicationError("prepared application lifecycle binding is invalid")
+        elif (
+            not isinstance(lifecycle_digest, str)
+            or _HEX64.fullmatch(lifecycle_digest) is None
+            or lifecycle_status != "applying"
+            or (value["state"] == "applying" and value["post_commit"] is not None)
+            or (value["state"] == "committed" and value["post_commit"] is None)
+        ):
+            raise ApplicationError("application lifecycle binding is invalid")
     seen: set[str] = set()
     for index, item in enumerate(value["targets"]):
         if not isinstance(item, dict) or set(item) != {"path", "expected_old_sha256", "new_sha256", "snapshot", "snapshot_sha256", "old_mode"}:
@@ -244,9 +269,6 @@ def _recover_unlocked(root: Path) -> bool:
         return False
     store = ProposalStore(root)
     manifest = store.load(transaction["proposal_id"])
-    validated_lifecycle_sha256 = _validated_lifecycle_digest(
-        root, store, transaction["proposal_id"]
-    )
     if (
         manifest.get("legacy")
         or transaction["base_commit"] != manifest["base_commit"]
@@ -263,11 +285,34 @@ def _recover_unlocked(root: Path) -> bool:
         ):
             raise ApplicationError("application transaction target does not match its manifest")
     target_digests = {item["path"]: item["new_sha256"] for item in transaction["targets"]}
+    current = current_profile_commit(root)
+    if transaction["version"] == 2:
+        if current != transaction["pre_commit"]:
+            raise ApplicationError(
+                "legacy application WAL cannot safely recover a post-commit state"
+            )
+        if transaction["state"] == "committed" or transaction["post_commit"] is not None:
+            raise ApplicationError("legacy committed application identity is unavailable")
+        _restore_unlocked(root, transaction)
+        _emit_application_unlocked(
+            root, transaction["proposal_id"], "failed",
+            {"error": "legacy interrupted application was rolled back"},
+        )
+        return True
+    if transaction["state"] == "prepared":
+        if current != transaction["pre_commit"]:
+            raise ApplicationError("prepared application WAL has an unexpected HEAD")
+        _restore_unlocked(root, transaction)
+        return True
+    validated_lifecycle_sha256 = _validated_lifecycle_digest(
+        root, store, transaction["proposal_id"]
+    )
     try:
         observed = identify_application_checkpoint(
             root,
             transaction["pre_commit"],
             target_digests,
+            expected_lifecycle_sha256=transaction["expected_lifecycle_sha256"],
             validated_lifecycle_sha256=validated_lifecycle_sha256,
         )
     except Exception as error:
@@ -283,19 +328,14 @@ def _recover_unlocked(root: Path) -> bool:
     else:
         if transaction["post_commit"] not in {None, observed}:
             raise ApplicationError("application post-commit identity does not match HEAD")
+        committed_lifecycle = read_application_lifecycle_blob(root, observed)
+        _validate_recovery_lifecycle(
+            root, store, transaction, committed_lifecycle
+        )
         transaction["state"] = "committed"
         transaction["post_commit"] = observed
         atomic_write_text(_wal_path(root), json.dumps(transaction, sort_keys=True, indent=2) + "\n")
-        if store.load(transaction["proposal_id"])["status"] == "applying":
-            store._transition_unlocked(
-                transaction["proposal_id"], "applying", "applied",
-                "recovered exact application commit",
-            )
-        _emit_application_unlocked(
-            root, transaction["proposal_id"], "applied",
-            {"status": "applied", "changed_paths": list(target_digests)},
-        )
-        _cleanup_unlocked(root, transaction)
+        _finish_committed_unlocked(root, store, transaction, tuple(target_digests))
     return True
 
 
@@ -314,9 +354,9 @@ def _manifest_digest(root: Path, proposal_id: str) -> str:
     return _digest(path.read_bytes())
 
 
-def _validated_lifecycle_digest(
+def _validated_lifecycle_snapshot(
     root: Path, store: ProposalStore, proposal_id: str
-) -> str:
+) -> tuple[bytes, dict[str, Any]]:
     """Validate the complete journal/provenance view, then bind its exact bytes."""
     lifecycle = require_safe_path(
         root, root / ".harness/improvements/lifecycle.jsonl", directory=False
@@ -325,12 +365,56 @@ def _validated_lifecycle_digest(
         raise ApplicationError("proposal lifecycle journal is missing")
     before = lifecycle.read_bytes()
     proposals = store.list()
-    if not any(item.get("proposal_id") == proposal_id for item in proposals):
+    matches = [item for item in proposals if item.get("proposal_id") == proposal_id]
+    if len(matches) != 1:
         raise ApplicationError("proposal lifecycle does not contain the requested proposal")
     after = lifecycle.read_bytes()
     if before != after:
         raise ApplicationError("proposal lifecycle changed during validation")
-    return _digest(after)
+    return after, matches[0]
+
+
+def _validated_lifecycle_digest(
+    root: Path, store: ProposalStore, proposal_id: str
+) -> str:
+    content, _ = _validated_lifecycle_snapshot(root, store, proposal_id)
+    return _digest(content)
+
+
+def _validate_recovery_lifecycle(
+    root: Path,
+    store: ProposalStore,
+    transaction: dict[str, Any],
+    committed: bytes,
+) -> None:
+    """Accept only the bound applying journal or its one exact applied append."""
+    expected = transaction["expected_lifecycle_sha256"]
+    if transaction["expected_lifecycle_status"] != "applying" or _digest(committed) != expected:
+        raise ApplicationError("committed proposal lifecycle does not match its WAL binding")
+    current, proposal = _validated_lifecycle_snapshot(
+        root, store, transaction["proposal_id"]
+    )
+    current_digest = _digest(current)
+    status = proposal["status"]
+    if status == "applying" and current_digest == expected and current == committed:
+        return
+    if status != "applied" or not current.startswith(committed):
+        raise ApplicationError("proposal lifecycle state is not bound to the committed application")
+    suffix = current[len(committed):]
+    if not suffix.endswith(b"\n") or len(suffix.splitlines()) != 1:
+        raise ApplicationError("proposal applied lifecycle suffix is not exact")
+    try:
+        entry = json.loads(suffix.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as error:
+        raise ApplicationError("proposal applied lifecycle suffix is invalid") from error
+    if (
+        not isinstance(entry, dict)
+        or entry.get("event") != "proposal_transition"
+        or entry.get("proposal_id") != transaction["proposal_id"]
+        or entry.get("from_status") != "applying"
+        or entry.get("target_status") != "applied"
+    ):
+        raise ApplicationError("proposal applied lifecycle suffix is not the expected transition")
 
 
 def _finish_committed_unlocked(
@@ -422,11 +506,13 @@ def apply_proposal(
             profile_root, profile_root / _SNAPSHOTS / proposal_id
         )
         transaction = {
-            "version": 2, "state": "applying", "proposal_id": proposal_id,
+            "version": 3, "state": "prepared", "proposal_id": proposal_id,
             "base_commit": manifest["base_commit"],
             "manifest_sha256": _manifest_digest(profile_root, proposal_id),
             "pre_commit": current_profile_commit(profile_root),
             "post_commit": None,
+            "expected_lifecycle_sha256": None,
+            "expected_lifecycle_status": None,
             "checkpoint_subject": APPLICATION_SUBJECT,
             "allowed_commit_paths": sorted(
                 set(targets) | {".harness/improvements/lifecycle.jsonl"}
@@ -461,16 +547,25 @@ def apply_proposal(
         except BaseException:
             _cleanup_unlocked(profile_root, transaction)
             raise
-        if automatic or approve:
-            if manifest["status"] == "proposed":
-                reason = "automatic policy selected proposal" if automatic else "opened for user approval"
-                manifest = store._transition_unlocked(proposal_id, "proposed", "notified", reason)
-            if manifest["status"] == "notified":
-                reason = "automatic policy approved exact bytes" if automatic else "approved by user"
-                manifest = store._transition_unlocked(proposal_id, "notified", "approved", reason)
-        store._transition_unlocked(proposal_id, "approved", "applying")
         commit_observed = False
         try:
+            if automatic or approve:
+                if manifest["status"] == "proposed":
+                    reason = "automatic policy selected proposal" if automatic else "opened for user approval"
+                    manifest = store._transition_unlocked(proposal_id, "proposed", "notified", reason)
+                if manifest["status"] == "notified":
+                    reason = "automatic policy approved exact bytes" if automatic else "approved by user"
+                    manifest = store._transition_unlocked(proposal_id, "notified", "approved", reason)
+            manifest = store._transition_unlocked(proposal_id, "approved", "applying")
+            transaction["state"] = "applying"
+            transaction["expected_lifecycle_status"] = "applying"
+            transaction["expected_lifecycle_sha256"] = _validated_lifecycle_digest(
+                profile_root, store, proposal_id
+            )
+            atomic_write_text(
+                _wal_path(profile_root),
+                json.dumps(transaction, sort_keys=True, indent=2) + "\n",
+            )
             for index, replacement in enumerate(manifest["replacements"], start=1):
                 _replace_preserving_mode(
                     _safe_target(profile_root, replacement["path"]), replacement["content"]
@@ -500,6 +595,7 @@ def apply_proposal(
                     profile_root,
                     transaction["pre_commit"],
                     {item["path"]: item["new_sha256"] for item in transaction["targets"]},
+                    expected_lifecycle_sha256=transaction["expected_lifecycle_sha256"],
                 )
             except Exception as error:
                 raise _AmbiguousCheckpointState(str(error)) from error

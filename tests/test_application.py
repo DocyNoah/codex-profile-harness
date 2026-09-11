@@ -149,6 +149,17 @@ class ApplicationTests(unittest.TestCase):
             descriptor = root / ".harness/state/application-transaction.json"
             self.assertTrue(descriptor.exists())
             transaction = json.loads(descriptor.read_text())
+            self.assertEqual(3, transaction["version"])
+            self.assertEqual("applying", transaction["expected_lifecycle_status"])
+            self.assertRegex(transaction["expected_lifecycle_sha256"], r"^[a-f0-9]{64}$")
+            committed_lifecycle = subprocess.run(
+                ["git", "-C", str(root), "show", "HEAD:.harness/improvements/lifecycle.jsonl"],
+                capture_output=True, check=True,
+            ).stdout
+            self.assertEqual(
+                transaction["expected_lifecycle_sha256"],
+                hashlib.sha256(committed_lifecycle).hexdigest(),
+            )
             self.assertRegex(transaction["pre_commit"], r"^[a-f0-9]{40,64}$")
             self.assertIsNone(transaction["post_commit"])
             self.assertEqual(
@@ -176,17 +187,20 @@ class ApplicationTests(unittest.TestCase):
                 self.notify_and_approve(root, manifest["proposal_id"])
                 if variant == "second_wal":
                     original = application_module.atomic_write_text
-                    wal_writes = 0
 
-                    def fail_second_wal(path: Path, content: str):
-                        nonlocal wal_writes
-                        if path.name == "application-transaction.json":
-                            wal_writes += 1
-                            if wal_writes == 2:
-                                raise OSError("injected second WAL failure")
+                    def fail_post_commit_wal(path: Path, content: str):
+                        if (
+                            path.name == "application-transaction.json"
+                            and json.loads(content)["state"] == "committed"
+                        ):
+                            raise OSError("injected post-commit WAL failure")
                         return original(path, content)
 
-                    patcher = mock.patch.object(application_module, "atomic_write_text", side_effect=fail_second_wal)
+                    patcher = mock.patch.object(
+                        application_module,
+                        "atomic_write_text",
+                        side_effect=fail_post_commit_wal,
+                    )
                 elif variant == "lifecycle":
                     original_transition = ProposalStore._transition_unlocked
 
@@ -217,6 +231,135 @@ class ApplicationTests(unittest.TestCase):
 
                 self.assertTrue(recover_application(root))
                 self.assertEqual("applied", ProposalStore(root).load(manifest["proposal_id"])["status"])
+
+    def test_post_commit_recovery_rejects_unbound_valid_lifecycle_histories(self) -> None:
+        variants = ("older_approved", "rehashed_applying", "head_replaced")
+        for variant in variants:
+            with self.subTest(variant=variant), tempfile.TemporaryDirectory() as temporary_directory:
+                root, manifest = self.make_profile(Path(temporary_directory))
+                self.notify_and_approve(root, manifest["proposal_id"])
+                lifecycle = root / ".harness/improvements/lifecycle.jsonl"
+                approved_bytes = lifecycle.read_bytes()
+                original_transition = ProposalStore._transition_unlocked
+
+                def fail_final_transition(store, proposal_id, expected, target, reason=None):
+                    if target == "applied":
+                        raise OSError("leave exact post-commit WAL pending")
+                    return original_transition(store, proposal_id, expected, target, reason)
+
+                with mock.patch.object(
+                    ProposalStore, "_transition_unlocked", new=fail_final_transition
+                ), self.assertRaises(ApplicationError):
+                    apply_proposal(root, manifest["proposal_id"])
+
+                descriptor = root / ".harness/state/application-transaction.json"
+                wal_before = descriptor.read_bytes()
+                snapshot_paths = tuple(
+                    (root / ".harness/state/application-snapshots").rglob("*.before")
+                )
+                self.assertTrue(snapshot_paths)
+                if variant in {"older_approved", "head_replaced"}:
+                    lifecycle.write_bytes(approved_bytes)
+                    self.assertEqual(
+                        "approved", ProposalStore(root).load(manifest["proposal_id"])["status"]
+                    )
+                    if variant == "head_replaced":
+                        subprocess.run(
+                            [
+                                "git", "-C", str(root), "-c", "user.name=Test",
+                                "-c", "user.email=test@example.invalid", "add",
+                                ".harness/improvements/lifecycle.jsonl",
+                            ],
+                            check=True,
+                        )
+                        subprocess.run(
+                            [
+                                "git", "-C", str(root), "-c", "user.name=Test",
+                                "-c", "user.email=test@example.invalid", "commit",
+                                "--amend", "--no-edit",
+                            ],
+                            capture_output=True, check=True,
+                        )
+                        transaction = json.loads(descriptor.read_text())
+                        transaction["state"] = "applying"
+                        transaction["post_commit"] = None
+                        descriptor.write_text(
+                            json.dumps(transaction, sort_keys=True, indent=2) + "\n"
+                        )
+                        wal_before = descriptor.read_bytes()
+                else:
+                    committed = subprocess.run(
+                        ["git", "-C", str(root), "show", "HEAD:.harness/improvements/lifecycle.jsonl"],
+                        text=True, capture_output=True, check=True,
+                    ).stdout
+                    entries = [json.loads(line) for line in committed.splitlines()]
+                    entries[-1]["reason"] = "valid but unbound applying history"
+                    unsigned = {
+                        key: value for key, value in entries[-1].items()
+                        if key != "entry_hash"
+                    }
+                    entries[-1]["entry_hash"] = hashlib.sha256(
+                        json.dumps(
+                            unsigned, ensure_ascii=False, sort_keys=True,
+                            separators=(",", ":"),
+                        ).encode("utf-8")
+                    ).hexdigest()
+                    lifecycle.write_text("".join(
+                        json.dumps(
+                            entry, ensure_ascii=False, sort_keys=True,
+                            separators=(",", ":"),
+                        ) + "\n"
+                        for entry in entries
+                    ))
+                    self.assertEqual(
+                        "applying", ProposalStore(root).load(manifest["proposal_id"])["status"]
+                    )
+
+                with self.assertRaises(ApplicationError):
+                    recover_application(root)
+
+                self.assertEqual(wal_before, descriptor.read_bytes())
+                self.assertTrue(all(path.exists() for path in snapshot_paths))
+                event_root = root / ".harness/control/outbox"
+                events = [] if not event_root.exists() else [
+                    json.loads(path.read_text()) for path in event_root.glob("*.json")
+                ]
+                self.assertFalse(any(
+                    event["kind"] == "application"
+                    and event["subject_id"] == manifest["proposal_id"]
+                    for event in events
+                ))
+
+    def test_legacy_v2_post_commit_wal_is_preserved_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root, manifest = self.make_profile(Path(temporary_directory))
+            self.notify_and_approve(root, manifest["proposal_id"])
+            original_transition = ProposalStore._transition_unlocked
+
+            def fail_final_transition(store, proposal_id, expected, target, reason=None):
+                if target == "applied":
+                    raise OSError("leave post-commit WAL pending")
+                return original_transition(store, proposal_id, expected, target, reason)
+
+            with mock.patch.object(
+                ProposalStore, "_transition_unlocked", new=fail_final_transition
+            ), self.assertRaises(ApplicationError):
+                apply_proposal(root, manifest["proposal_id"])
+            descriptor = root / ".harness/state/application-transaction.json"
+            legacy = json.loads(descriptor.read_text())
+            legacy["version"] = 2
+            legacy.pop("expected_lifecycle_sha256", None)
+            legacy.pop("expected_lifecycle_status", None)
+            descriptor.write_text(json.dumps(legacy, sort_keys=True, indent=2) + "\n")
+            snapshot_paths = tuple(
+                (root / ".harness/state/application-snapshots").rglob("*.before")
+            )
+
+            with self.assertRaisesRegex(ApplicationError, "legacy.*post-commit"):
+                recover_application(root)
+
+            self.assertTrue(descriptor.exists())
+            self.assertTrue(all(path.exists() for path in snapshot_paths))
 
     def test_cli_approval_does_not_checkpoint_unrelated_dirty_managed_content(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

@@ -90,6 +90,7 @@ REQUIRED_IGNORE_RULES = (
 )
 _FAILURE_PATH = ".harness/state/profile-git-failure.json"
 _MAX_OUTPUT = 16_384
+_MAX_APPLICATION_LIFECYCLE_BYTES = 2 * 1024 * 1024
 _TIMEOUT = 10
 _GUARD_TIMEOUT = 0.5
 _MAX_MANAGED_FILES = 2_000
@@ -136,6 +137,7 @@ def _git(
     literal_pathspecs: bool = True,
     read_only: bool = False,
     filter_names: tuple[str, ...] = (),
+    max_output: int = _MAX_OUTPUT,
 ) -> subprocess.CompletedProcess[str]:
     started = time.monotonic()
     deadline = started + _TIMEOUT
@@ -210,7 +212,7 @@ def _git(
             if not chunk:
                 break
             with output_lock:
-                remaining = _MAX_OUTPUT - output_size
+                remaining = max_output - output_size
                 if remaining > 0:
                     kept = chunk[:remaining]
                     chunks[destination].append(kept)
@@ -644,6 +646,7 @@ def identify_application_checkpoint(
     pre_commit: str,
     target_digests: dict[str, str],
     *,
+    expected_lifecycle_sha256: str | None = None,
     validated_lifecycle_sha256: str | None = None,
 ) -> str | None:
     """Identify one exact harness application commit after an ambiguous result."""
@@ -668,6 +671,14 @@ def identify_application_checkpoint(
     allowed = set(target_digests) | {".harness/improvements/lifecycle.jsonl"}
     if ".harness/improvements/lifecycle.jsonl" not in changed or not changed <= allowed:
         raise ProfileGitError("application commit changed unexpected paths")
+    if (
+        expected_lifecycle_sha256 is None
+        or re.fullmatch(r"[a-f0-9]{64}", expected_lifecycle_sha256) is None
+    ):
+        raise ProfileGitError("application lifecycle digest binding is missing")
+    committed_lifecycle = read_application_lifecycle_blob(profile_root, current)
+    if hashlib.sha256(committed_lifecycle).hexdigest() != expected_lifecycle_sha256:
+        raise ProfileGitError("application commit lifecycle blob is unexpected")
     dirty = _dirty_paths(profile_root)
     if dirty:
         lifecycle_path = ".harness/improvements/lifecycle.jsonl"
@@ -690,6 +701,23 @@ def identify_application_checkpoint(
         if digest != expected:
             raise ProfileGitError("application commit target digest is unexpected")
     return current
+
+
+def read_application_lifecycle_blob(root: Path, commit: str) -> bytes:
+    """Read the bounded lifecycle blob from one validated application commit."""
+    profile_root = Path(root).expanduser().resolve()
+    _safe_git_directory(profile_root)
+    if not isinstance(commit, str) or re.fullmatch(r"[a-f0-9]{40,64}", commit) is None:
+        raise ProfileGitError("application commit identity is invalid")
+    result = _git(
+        profile_root,
+        "show",
+        f"{commit}:.harness/improvements/lifecycle.jsonl",
+        literal_pathspecs=False,
+        read_only=True,
+        max_output=_MAX_APPLICATION_LIFECYCLE_BYTES,
+    )
+    return result.stdout.encode("utf-8", "surrogateescape")
 
 
 def validate_pending_checkpoint(root: Path) -> str | None:
