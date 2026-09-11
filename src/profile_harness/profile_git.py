@@ -43,6 +43,7 @@ MANAGED_PATHS = (
     "MEMORY.md",
     "PROJECTS.toml",
     ".harness/config.toml",
+    ".harness/improvements/lifecycle.jsonl",
     ".harness/memory/semantic",
     ".harness/memory/procedural",
     ".harness/memory/journal",

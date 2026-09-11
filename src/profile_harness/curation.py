@@ -42,10 +42,6 @@ MAX_RESULT_BYTES = 1024 * 1024
 ACTION_TYPES = frozenset(
     {
         "profile_memory",
-        # Compatibility for already-prepared pre-v2 batches only. The curation
-        # output schema no longer exposes this action, so no new model run can
-        # choose the legacy Markdown-only persistence path.
-        "profile_proposal",
         "repo_status",
         "repo_tasks",
         "repo_decision",
@@ -660,7 +656,6 @@ def validate_actions(
         raise CurationError("actions must be a bounded array")
     allowed_fields = {
         "profile_memory": {"type", "kind", "title", "content", "source_receipt_ids"},
-        "profile_proposal": {"type", "title", "content", "source_receipt_ids"},
         "repo_status": {"type", "repository", "content", "source_receipt_ids"},
         "repo_tasks": {"type", "repository", "content", "source_receipt_ids"},
         "repo_decision": {
@@ -690,7 +685,7 @@ def validate_actions(
             raise CurationError("non-discard actions require source receipt IDs")
         if len(sources) != len(set(sources)) or not set(sources) <= batch_receipt_ids:
             raise CurationError("source receipt IDs must belong to the batch")
-        if action_type in {"profile_memory", "profile_proposal", "repo_decision"}:
+        if action_type in {"profile_memory", "repo_decision"}:
             _nonempty_text(action, "title")
         if action_type != "discard":
             _nonempty_text(action, "content")
@@ -1501,19 +1496,6 @@ def apply_actions(
                 target = (
                     profile.root / ".harness/memory" / action["kind"] /
                     f"{_slug(action['title'])}.md"
-                )
-                write(
-                    target,
-                    f"# {action['title'].strip()}\n\n{action['content'].strip()}\n",
-                    target.parent,
-                )
-            elif action_type == "profile_proposal":
-                # Recovery-only compatibility for transactions prepared before
-                # profileProposal was removed from the curation schema. These
-                # files are intentionally legacy/read-only in ProposalStore.
-                target = (
-                    profile.root / ".harness/improvements/proposed" /
-                    f"{_slug(action['title'], 'proposal')}.md"
                 )
                 write(
                     target,

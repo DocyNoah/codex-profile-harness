@@ -169,7 +169,7 @@ class CurationTests(unittest.TestCase):
                 load_result(oversized)
 
         sources = [f"receipt-{index}" for index in range(101)]
-        with self.assertRaisesRegex(CurationError, "bounded"):
+        with self.assertRaisesRegex(CurationError, "unknown action"):
             validate_actions(
                 {
                     "actions": [
@@ -181,6 +181,16 @@ class CurationTests(unittest.TestCase):
                         }
                     ]
                 },
+                set(sources),
+                set(),
+            )
+        with self.assertRaisesRegex(CurationError, "bounded"):
+            validate_actions(
+                {"actions": [{
+                    "type": "profile_memory", "kind": "semantic",
+                    "title": "Bounded", "content": "Content",
+                    "source_receipt_ids": sources,
+                }]},
                 set(sources),
                 set(),
             )
@@ -334,9 +344,10 @@ class CurationTests(unittest.TestCase):
                         "source_receipt_ids": ["one"],
                     },
                     {
-                        "type": "profile_proposal",
+                        "type": "profile_memory",
+                        "kind": "procedural",
                         "title": "Consider API timeout",
-                        "content": "Review this proposal.",
+                        "content": "Review timeout guidance.",
                         "source_receipt_ids": ["one"],
                     },
                     {
@@ -356,9 +367,7 @@ class CurationTests(unittest.TestCase):
             memories = list((root / ".harness/memory/semantic").glob("*.md"))
             self.assertEqual(1, len(memories))
             self.assertEqual(memories[0].parent, root / ".harness/memory/semantic")
-            self.assertEqual(
-                1, len(list((root / ".harness/improvements/proposed").glob("*.md")))
-            )
+            self.assertEqual(1, len(list((root / ".harness/memory/procedural").glob("*.md"))))
             for relative, original in protected.items():
                 self.assertEqual(original, (root / relative).read_bytes())
 

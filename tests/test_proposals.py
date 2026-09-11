@@ -17,6 +17,7 @@ from profile_harness.config import init_profile  # noqa: E402
 from profile_harness.doctor import diagnose  # noqa: E402
 from profile_harness.journal import verify_journal  # noqa: E402
 from profile_harness.proposals import ProposalError, ProposalStore  # noqa: E402
+from profile_harness.profile_git import checkpoint_profile  # noqa: E402
 
 
 NOW = datetime(2026, 9, 11, 12, 0, tzinfo=timezone.utc)
@@ -68,6 +69,10 @@ class ProposalStoreTests(unittest.TestCase):
             self.assertIn(f"# {first['title']}", rendered)
             self.assertIn("`CONTEXT.md`", rendered)
             self.assertIn("# Context", rendered)
+            creation = verify_journal(root / ".harness/improvements/lifecycle.jsonl")[0]
+            self.assertEqual("proposal_created", creation["event"])
+            self.assertEqual(hashlib.sha256(manifest_path.read_bytes()).hexdigest(), creation["json_digest"])
+            self.assertEqual(hashlib.sha256(rendered_path.read_bytes()).hexdigest(), creation["markdown_digest"])
 
     def test_create_rejects_nonexact_paths_bad_digests_and_wrong_old_content(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -114,6 +119,22 @@ class ProposalStoreTests(unittest.TestCase):
                 with self.assertRaises(ProposalError):
                     ProposalStore(root).list()
 
+    def test_load_rejects_coordinated_json_and_markdown_tampering(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = self.make_profile(Path(temporary_directory))
+            store = ProposalStore(root)
+            manifest = self.create(store, root)
+            json_path = root / ".harness/improvements/proposed" / f"{manifest['proposal_id']}.json"
+            markdown_path = json_path.with_suffix(".md")
+            value = json.loads(json_path.read_text(encoding="utf-8"))
+            value["rationale"] = "Tampered but internally consistent."
+            json_path.write_text(json.dumps(value, ensure_ascii=False, sort_keys=True, indent=2) + "\n")
+            from profile_harness.proposals import render_markdown
+            markdown_path.write_text(render_markdown(value), encoding="utf-8")
+
+            with self.assertRaisesRegex(ProposalError, "creation digest"):
+                store.load(manifest["proposal_id"])
+
     def test_legacy_markdown_is_readable_but_never_transitionable(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = self.make_profile(Path(temporary_directory))
@@ -126,7 +147,7 @@ class ProposalStoreTests(unittest.TestCase):
             self.assertTrue(loaded["legacy"])
             self.assertEqual("legacy", loaded["status"])
             self.assertEqual(loaded, store.list()[0])
-            with self.assertRaisesRegex(ProposalError, "legacy"):
+            with self.assertRaises(ProposalError):
                 store.transition("old-review", "legacy", "rejected", "replace it")
 
     def test_transitions_are_idempotent_strict_and_hash_chained(self) -> None:
@@ -144,12 +165,42 @@ class ProposalStoreTests(unittest.TestCase):
             self.assertEqual("rejected", rejected["status"])
             self.assertEqual("rejected", store.load(proposal_id)["status"])
             audit = verify_journal(root / ".harness/improvements/lifecycle.jsonl")
-            self.assertEqual(2, len(audit))
-            self.assertEqual(audit[0]["entry_hash"], audit[1]["previous_hash"])
+            self.assertEqual(3, len(audit))
+            self.assertEqual(audit[1]["entry_hash"], audit[2]["previous_hash"])
             with self.assertRaises(ProposalError):
                 store.transition(proposal_id, "rejected", "approved")
             with self.assertRaises(ProposalError):
                 store.transition(proposal_id, "notified", "expired")
+
+    def test_transition_rejects_invalid_edge_before_idempotent_target_check(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = self.make_profile(Path(temporary_directory))
+            store = ProposalStore(root)
+            proposal_id = self.create(store, root)["proposal_id"]
+            store.transition(proposal_id, "proposed", "notified")
+
+            with self.assertRaisesRegex(ProposalError, "invalid proposal transition"):
+                store.transition(proposal_id, "approved", "notified")
+
+            self.assertEqual(
+                "notified",
+                store.transition(proposal_id, "proposed", "notified")["status"],
+            )
+
+    def test_lifecycle_journal_is_checkpointed_and_survives_fresh_clone(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            parent = Path(temporary_directory)
+            root = self.make_profile(parent)
+            store = ProposalStore(root)
+            proposal_id = self.create(store, root)["proposal_id"]
+            store.transition(proposal_id, "proposed", "notified")
+            checkpoint = checkpoint_profile(root)
+            self.assertTrue(checkpoint.committed)
+            clone = parent / "clone"
+            import subprocess
+            subprocess.run(["git", "clone", "--quiet", str(root), str(clone)], check=True)
+
+            self.assertEqual("notified", ProposalStore(clone).load(proposal_id)["status"])
 
     def test_doctor_reports_invalid_manifests_and_legacy_read_only_items(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

@@ -64,7 +64,7 @@ class MaintenanceTests(unittest.TestCase):
             f"sys.path.insert(0,{str(ROOT / 'src')!r});"
             "from profile_harness.curation import apply_actions;"
             f"apply_actions(Path({str(root)!r}),{batch.batch_id!r},"
-            f"{{'actions':[{{'type':'profile_proposal','title':{title!r},"
+            f"{{'actions':[{{'type':'profile_memory','kind':'procedural','title':{title!r},"
             "'content':'body','source_receipt_ids':['receipt-00']}],'signals':[]},"
             f"crash_after_stage={stage!r})"
         )
@@ -495,7 +495,7 @@ class MaintenanceTests(unittest.TestCase):
                     f"sys.path.insert(0,{str(ROOT / 'src')!r});"
                     "from profile_harness.curation import apply_actions;"
                     f"apply_actions(Path({str(root)!r}),{batch.batch_id!r},"
-                    f"{{'actions':[{{'type':'profile_proposal','title':{title!r},"
+                    f"{{'actions':[{{'type':'profile_memory','kind':'procedural','title':{title!r},"
                     "'content':'body','source_receipt_ids':['receipt-00']}],'signals':[]},"
                     f"crash_after_stage={stage!r})"
                 )
@@ -517,7 +517,7 @@ class MaintenanceTests(unittest.TestCase):
                     ).stdout.strip(),
                 )
                 proposal_path = (
-                    ".harness/improvements/proposed/"
+                    ".harness/memory/procedural/"
                     f"recovered-{stage.replace('_', '-')}.md"
                 )
                 tracked = subprocess.run(
@@ -562,7 +562,7 @@ class MaintenanceTests(unittest.TestCase):
                 root = self.make_profile(Path(temporary_directory))
                 if wal_kind == "curation":
                     descriptor = self.crash_curation(root, "after_first_write")
-                    managed = root / ".harness/improvements/proposed/combined-after-first-write.md"
+                    managed = root / ".harness/memory/procedural/combined-after-first-write.md"
                 else:
                     descriptor, managed = self.create_improvement_wal(root)
                 failure_path = root / ".harness/state/profile-git-failure.json"

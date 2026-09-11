@@ -234,6 +234,7 @@ class ImprovementConfigurationTests(unittest.TestCase):
             'mode = "sometimes"\n',
             'automatic_paths = ["../USER.md"]\n',
             'automatic_paths = ["*.md"]\n',
+            'automatic_paths = ["scripts/run.sh"]\n',
             'automatic_paths = ["CONTEXT.md", "CONTEXT.md"]\n',
             'automatic_max_changed_bytes = 0\n',
             'automatic_max_changed_bytes = 1048577\n',

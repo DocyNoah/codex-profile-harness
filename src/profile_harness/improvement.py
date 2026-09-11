@@ -21,6 +21,7 @@ from .proposals import (
     MAX_RATIONALE_CHARS,
     MAX_REPLACEMENTS,
     ProposalError,
+    ProposalStore,
     render_markdown,
     validate_manifest,
 )
@@ -40,6 +41,8 @@ _TRANSACTION_ID = re.compile(r"[a-f0-9]{32}")
 _CURATION_JOURNAL = ".harness/memory/journal/curation.jsonl"
 _IMPROVEMENT_JOURNAL = ".harness/memory/journal/improvement.jsonl"
 _IMPROVEMENT_SNAPSHOT = ".harness/state/improvement-journal.before"
+_LIFECYCLE_JOURNAL = ".harness/improvements/lifecycle.jsonl"
+_LIFECYCLE_SNAPSHOT = ".harness/state/proposal-lifecycle.before"
 
 
 class ImprovementError(ValueError):
@@ -320,15 +323,19 @@ def _policy_decision(config: object, replacements: list[dict[str, Any]]) -> dict
 
 def _validated_transaction(
     root: Path, transaction: object
-) -> tuple[dict[str, Any], Path, Path | None, tuple[Path, ...]]:
+) -> tuple[dict[str, Any], Path, Path | None, Path, Path | None, tuple[Path, ...]]:
     fields = {
         "version", "state", "transaction_id", "targets", "journal_existed",
         "journal_snapshot", "journal_snapshot_digest",
     }
+    version = transaction.get("version") if isinstance(transaction, dict) else None
+    expected_fields = fields if version == 1 else fields | {
+        "lifecycle_existed", "lifecycle_snapshot", "lifecycle_snapshot_digest",
+    }
     if (
         not isinstance(transaction, dict)
-        or set(transaction) != fields
-        or transaction.get("version") != 1
+        or set(transaction) != expected_fields
+        or version not in {1, 2}
         or transaction.get("state") not in {"applying", "committed"}
         or not isinstance(transaction.get("transaction_id"), str)
         or _TRANSACTION_ID.fullmatch(transaction["transaction_id"]) is None
@@ -338,6 +345,7 @@ def _validated_transaction(
     ):
         raise ImprovementError("invalid improvement transaction descriptor")
     journal = _safe_journal(root, _IMPROVEMENT_JOURNAL)
+    lifecycle = _safe_journal(root, _LIFECYCLE_JOURNAL)
     snapshot: Path | None = None
     if transaction["journal_existed"]:
         if (
@@ -360,6 +368,32 @@ def _validated_transaction(
             raise ImprovementError("improvement journal snapshot digest is invalid")
     elif transaction.get("journal_snapshot") is not None or transaction.get("journal_snapshot_digest") is not None:
         raise ImprovementError("improvement journal snapshot member is invalid")
+
+    lifecycle_snapshot: Path | None = None
+    if version == 2:
+        if not isinstance(transaction.get("lifecycle_existed"), bool):
+            raise ImprovementError("proposal lifecycle snapshot member is invalid")
+        if transaction["lifecycle_existed"]:
+            if (
+                transaction.get("lifecycle_snapshot") != _LIFECYCLE_SNAPSHOT
+                or not isinstance(transaction.get("lifecycle_snapshot_digest"), str)
+                or _HASH.fullmatch(transaction["lifecycle_snapshot_digest"]) is None
+            ):
+                raise ImprovementError("proposal lifecycle snapshot member is invalid")
+            lifecycle_snapshot = require_safe_path(
+                root, root / _LIFECYCLE_SNAPSHOT, directory=False
+            )
+            if (
+                not lifecycle_snapshot.is_file()
+                or lifecycle_snapshot.stat().st_nlink != 1
+                or _file_digest(lifecycle_snapshot) != transaction["lifecycle_snapshot_digest"]
+            ):
+                raise ImprovementError("proposal lifecycle snapshot digest is invalid")
+        elif (
+            transaction.get("lifecycle_snapshot") is not None
+            or transaction.get("lifecycle_snapshot_digest") is not None
+        ):
+            raise ImprovementError("proposal lifecycle snapshot member is invalid")
 
     proposed_root = root / ".harness/improvements/proposed"
     transaction_id = transaction["transaction_id"]
@@ -402,7 +436,7 @@ def _validated_transaction(
             raise ImprovementError("committed improvement proposal is missing")
         seen.add(member["path"])
         validated_targets.append(target)
-    return transaction, journal, snapshot, tuple(validated_targets)
+    return transaction, journal, snapshot, lifecycle, lifecycle_snapshot, tuple(validated_targets)
 
 
 def recover_improvement_transaction(root: Path, *, checkpoint: bool = True) -> bool:
@@ -428,7 +462,7 @@ def recover_improvement_transaction(root: Path, *, checkpoint: bool = True) -> b
         raise
     except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as error:
         raise ImprovementError("invalid improvement transaction descriptor") from error
-    transaction, journal, snapshot, targets = _validated_transaction(profile_root, value)
+    transaction, journal, snapshot, lifecycle, lifecycle_snapshot, targets = _validated_transaction(profile_root, value)
 
     try:
         entries = successful_improvement_entries(journal)
@@ -441,6 +475,11 @@ def recover_improvement_transaction(root: Path, *, checkpoint: bool = True) -> b
     if matching:
         if matching[0]["proposal_digests"] != target_map or any(not target.is_file() for target in targets):
             raise ImprovementError("improvement transaction journal binding is invalid")
+        if transaction["version"] == 2:
+            try:
+                ProposalStore(profile_root).list()
+            except ProposalError as error:
+                raise ImprovementError(f"proposal creation provenance is invalid: {error}") from error
     else:
         referenced = {
             relative
@@ -466,11 +505,26 @@ def recover_improvement_transaction(root: Path, *, checkpoint: bool = True) -> b
             fsync_directory(target.parent)
         if snapshot is not None and not journal.exists():
             atomic_copy_file(snapshot, journal)
+        if transaction["version"] == 2:
+            try:
+                verify_journal(lifecycle)
+            except (OSError, UnicodeError, ValueError) as error:
+                raise ImprovementError(f"invalid proposal lifecycle journal: {error}") from error
+            if lifecycle_snapshot is not None:
+                if not lifecycle.read_bytes().startswith(lifecycle_snapshot.read_bytes()):
+                    raise ImprovementError("proposal lifecycle journal does not extend its snapshot")
+                atomic_copy_file(lifecycle_snapshot, lifecycle)
+            elif lifecycle.exists():
+                lifecycle.unlink()
+                fsync_directory(lifecycle.parent)
     descriptor.unlink()
     fsync_directory(descriptor.parent)
     if snapshot is not None:
         snapshot.unlink()
         fsync_directory(snapshot.parent)
+    if lifecycle_snapshot is not None:
+        lifecycle_snapshot.unlink()
+        fsync_directory(lifecycle_snapshot.parent)
     if matching and checkpoint:
         from .profile_git import RECOVERY_SUBJECT, checkpoint_profile
 
@@ -541,17 +595,27 @@ def _run_locked(
         from .profile_git import current_profile_commit
 
         base_commit = current_profile_commit(root)
+        lifecycle = _safe_journal(root, _LIFECYCLE_JOURNAL)
+        lifecycle_snapshot = root / _LIFECYCLE_SNAPSHOT
+        lifecycle_snapshot_digest = None
+        if lifecycle.exists():
+            atomic_copy_file(lifecycle, lifecycle_snapshot)
+            lifecycle_snapshot_digest = _file_digest(lifecycle_snapshot)
         transaction = {
-            "version": 1, "state": "applying", "targets": [],
+            "version": 2, "state": "applying", "targets": [],
             "transaction_id": transaction_id,
             "journal_existed": journal.exists(),
             "journal_snapshot": str(snapshot.relative_to(root)) if journal.exists() else None,
             "journal_snapshot_digest": snapshot_digest,
+            "lifecycle_existed": lifecycle.exists(),
+            "lifecycle_snapshot": str(lifecycle_snapshot.relative_to(root)) if lifecycle.exists() else None,
+            "lifecycle_snapshot_digest": lifecycle_snapshot_digest,
         }
         atomic_write_text(descriptor, json.dumps(transaction, sort_keys=True, indent=2) + "\n")
         created = []
         proposal_digests = {}
         try:
+            proposal_store = ProposalStore(root)
             for proposal in proposals:
                 proposal_id = uuid.uuid4().hex
                 manifest = {
@@ -596,6 +660,9 @@ def _run_locked(
                         raise RuntimeError("injected improvement write failure")
                     if crash_after_stage == "after_first_write" and len(created) == 1:
                         os._exit(91)
+                proposal_store._record_creation_unlocked(
+                    manifest, payloads[0][0], payloads[1][0]
+                )
             entry = append_entry(journal, {
                 "event": "improvement",
                 "transaction_id": transaction_id,

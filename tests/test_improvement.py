@@ -28,7 +28,7 @@ from profile_harness.journal import append_entry, verify_journal  # noqa: E402
 from profile_harness.packaging import build_local_marketplace  # noqa: E402
 from profile_harness.profile_git import CheckpointResult, IMPROVEMENT_SUBJECT  # noqa: E402
 import profile_harness.profile_git as profile_git_module  # noqa: E402
-from profile_harness.proposals import render_markdown  # noqa: E402
+from profile_harness.proposals import ProposalStore, render_markdown  # noqa: E402
 
 
 NOW = datetime(2026, 9, 11, 12, 0, 0, tzinfo=timezone.utc)
@@ -202,6 +202,9 @@ class ImprovementTests(unittest.TestCase):
                 "reason": "approval is required by configuration",
             }, manifest["policy"])
             self.assertEqual(proposal["replacements"], manifest["replacements"])
+            self.assertEqual("proposed", ProposalStore(root).load(manifest["proposal_id"])["status"])
+            creation = verify_journal(root / ".harness/improvements/lifecycle.jsonl")[0]
+            self.assertEqual("proposal_created", creation["event"])
             prompt = json.loads(invocation.read_text(encoding="utf-8"))["stdin"]
             self.assertIn(proposal["replacements"][0]["expected_old_sha256"], prompt)
 

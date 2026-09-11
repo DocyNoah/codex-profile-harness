@@ -210,6 +210,16 @@ def _automatic_paths(value: object, errors: list[str]) -> tuple[str, ...]:
         ):
             errors.append("improvement.automatic_paths must contain exact relative paths without patterns")
             continue
+        managed = item in {"AGENTS.md", "IDENTITY.md", "USER.md", "CONTEXT.md", "MEMORY.md"} or (
+            path.parent in {
+                Path(".harness/memory/semantic"),
+                Path(".harness/memory/procedural"),
+            }
+            and path.suffix == ".md"
+        )
+        if not managed:
+            errors.append("improvement.automatic_paths must contain managed proposal targets")
+            continue
         validated.append(item)
     if len(validated) != len(set(validated)):
         errors.append("improvement.automatic_paths must not contain duplicates")

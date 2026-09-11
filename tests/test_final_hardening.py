@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -367,6 +368,12 @@ class FinalHardeningTests(unittest.TestCase):
         signals: list[dict] | None = None,
     ) -> None:
         signals = [] if signals is None else signals
+        if action.get("type") == "profile_proposal":
+            action = {
+                **action,
+                "type": "profile_memory",
+                "kind": "procedural",
+            }
         script = (
             "import sys;from pathlib import Path;"
             f"sys.path.insert(0,{str(ROOT / 'src')!r});"
@@ -449,9 +456,7 @@ class FinalHardeningTests(unittest.TestCase):
 
             self.assertEqual((batch.batch_id,), recovered)
             self.assertFalse(descriptor.exists())
-            self.assertTrue(
-                (root / ".harness/improvements/proposed/old-v3.md").is_file()
-            )
+            self.assertTrue((root / ".harness/memory/procedural/old-v3.md").is_file())
 
     def test_recovery_fsyncs_unlinks_before_deleting_precommit_descriptor(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -462,7 +467,7 @@ class FinalHardeningTests(unittest.TestCase):
                 "type": "profile_proposal", "title": "New", "content": "body", "source_receipt_ids": ["one"]
             }, "after_journal")
             descriptor = (root / ".harness/state/transactions" / f"{batch.batch_id}.json").resolve()
-            proposal_parent = (root / ".harness/improvements/proposed").resolve()
+            proposal_parent = (root / ".harness/memory/procedural").resolve()
             journal_parent = (root / ".harness/memory/journal").resolve()
             events = []
             real_unlink = Path.unlink
@@ -608,6 +613,44 @@ class FinalHardeningTests(unittest.TestCase):
             self.assertEqual((batch.batch_id,), recover_transactions(root, checkpoint=False))
             self.assertFalse(descriptor.exists())
             self.assertEqual("# committed", (repo / "STATUS.md").read_text())
+
+    def test_recovery_decodes_historical_v4_proposal_target_without_accepting_new_action(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root, _ = self.make_profile(Path(temporary_directory))
+            self.add_receipt(root)
+            batch = prepare_curation(root)
+            self._crash_apply(root, batch.batch_id, {
+                "type": "profile_proposal", "title": "Historical", "content": "body",
+                "source_receipt_ids": ["one"],
+            }, "after_commit")
+            descriptor = root / ".harness/state/transactions" / f"{batch.batch_id}.json"
+            transaction = json.loads(descriptor.read_text(encoding="utf-8"))
+            old_relative = transaction["targets"][0]["path"]
+            new_relative = ".harness/improvements/proposed/historical.md"
+            (root / new_relative).parent.mkdir(parents=True, exist_ok=True)
+            os.replace(root / old_relative, root / new_relative)
+            transaction["targets"][0]["path"] = new_relative
+            descriptor.write_text(json.dumps(transaction), encoding="utf-8")
+            journal = root / ".harness/memory/journal/curation.jsonl"
+            entry = json.loads(journal.read_text(encoding="utf-8"))
+            digest = entry["target_digests"].pop(old_relative)
+            entry["target_digests"][new_relative] = digest
+            entry["changed_paths"] = [new_relative]
+            unsigned = {key: value for key, value in entry.items() if key != "entry_hash"}
+            canonical = json.dumps(unsigned, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+            entry["entry_hash"] = hashlib.sha256(canonical).hexdigest()
+            journal.write_text(
+                json.dumps(entry, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n",
+                encoding="utf-8",
+            )
+
+            self.assertEqual((batch.batch_id,), recover_transactions(root, checkpoint=False))
+            self.assertTrue((root / new_relative).is_file())
+            with self.assertRaisesRegex(CurationError, "unknown action"):
+                validate_actions({"actions": [{
+                    "type": "profile_proposal", "title": "New", "content": "body",
+                    "source_receipt_ids": ["one"],
+                }]}, {"one"}, set())
 
     def test_partial_batch_rmtree_is_recoverable_for_precommit_and_committed(self) -> None:
         for stage, committed in (("after_first_write", False), ("after_commit", True)):

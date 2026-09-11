@@ -205,31 +205,87 @@ class ProposalStore:
         except (OSError, UnicodeError, ValueError) as error:
             raise ProposalError(f"invalid proposal lifecycle journal: {error}") from error
         for entry in entries:
-            expected = {
-                "event", "proposal_id", "from_status", "target_status", "reason",
-                "changed_at", "sequence", "previous_hash", "entry_hash",
-            }
-            if (
-                not isinstance(entry, dict) or set(entry) != expected
-                or entry.get("event") != "proposal_transition"
-                or not isinstance(entry.get("proposal_id"), str)
-                or PROPOSAL_ID_PATTERN.fullmatch(entry["proposal_id"]) is None
-                or entry.get("from_status") not in _STATUSES
-                or entry.get("target_status") not in _STATUSES
-                or entry["target_status"] not in _TRANSITIONS[entry["from_status"]]
-                or (entry.get("reason") is not None and (
-                    not isinstance(entry["reason"], str) or not entry["reason"].strip()
-                    or len(entry["reason"]) > MAX_REASON_CHARS
-                ))
-                or not _valid_timestamp(entry.get("changed_at"))
-            ):
+            common_valid = (
+                isinstance(entry, dict)
+                and isinstance(entry.get("proposal_id"), str)
+                and PROPOSAL_ID_PATTERN.fullmatch(entry["proposal_id"]) is not None
+            )
+            is_creation = isinstance(entry, dict) and entry.get("event") == "proposal_created"
+            if is_creation:
+                expected = {
+                    "event", "proposal_id", "json_path", "markdown_path",
+                    "json_digest", "markdown_digest", "created_at", "sequence",
+                    "previous_hash", "entry_hash",
+                }
+                identifier = entry.get("proposal_id")
+                valid = (
+                    common_valid and set(entry) == expected
+                    and entry.get("json_path") == f".harness/improvements/proposed/{identifier}.json"
+                    and entry.get("markdown_path") == f".harness/improvements/proposed/{identifier}.md"
+                    and isinstance(entry.get("json_digest"), str)
+                    and _DIGEST.fullmatch(entry["json_digest"]) is not None
+                    and isinstance(entry.get("markdown_digest"), str)
+                    and _DIGEST.fullmatch(entry["markdown_digest"]) is not None
+                    and _valid_timestamp(entry.get("created_at"))
+                )
+            else:
+                expected = {
+                    "event", "proposal_id", "from_status", "target_status", "reason",
+                    "changed_at", "sequence", "previous_hash", "entry_hash",
+                }
+                valid = (
+                    common_valid and set(entry) == expected
+                    and entry.get("event") == "proposal_transition"
+                    and entry.get("from_status") in _STATUSES
+                    and entry.get("target_status") in _STATUSES
+                    and entry["target_status"] in _TRANSITIONS[entry["from_status"]]
+                    and (entry.get("reason") is None or (
+                        isinstance(entry["reason"], str) and entry["reason"].strip()
+                        and len(entry["reason"]) <= MAX_REASON_CHARS
+                    ))
+                    and _valid_timestamp(entry.get("changed_at"))
+                )
+            if not valid:
                 raise ProposalError("proposal lifecycle entry contract is invalid")
         return entries
+
+    def _creation(self, proposal_id: str) -> dict[str, Any]:
+        matches = [
+            entry for entry in self._entries()
+            if entry["event"] == "proposal_created" and entry["proposal_id"] == proposal_id
+        ]
+        if len(matches) != 1:
+            raise ProposalError("proposal creation provenance is missing or duplicated")
+        return matches[0]
+
+    def _record_creation_unlocked(
+        self, manifest: dict[str, Any], json_path: Path, markdown_path: Path
+    ) -> dict[str, Any]:
+        if self._creation_entries(manifest["proposal_id"]):
+            raise ProposalError("proposal creation provenance already exists")
+        try:
+            return append_entry(self._journal(), {
+                "event": "proposal_created",
+                "proposal_id": manifest["proposal_id"],
+                "json_path": str(json_path.relative_to(self.root)),
+                "markdown_path": str(markdown_path.relative_to(self.root)),
+                "json_digest": _file_digest(json_path),
+                "markdown_digest": _file_digest(markdown_path),
+                "created_at": manifest["created_at"],
+            })
+        except (OSError, ValueError) as error:
+            raise ProposalError(f"cannot record proposal creation: {error}") from error
+
+    def _creation_entries(self, proposal_id: str) -> list[dict[str, Any]]:
+        return [
+            entry for entry in self._entries()
+            if entry["event"] == "proposal_created" and entry["proposal_id"] == proposal_id
+        ]
 
     def _status(self, proposal_id: str) -> str:
         status = "proposed"
         for entry in self._entries():
-            if entry["proposal_id"] != proposal_id:
+            if entry["proposal_id"] != proposal_id or entry["event"] == "proposal_created":
                 continue
             if entry["from_status"] != status:
                 raise ProposalError("proposal lifecycle history is discontinuous")
@@ -263,25 +319,29 @@ class ProposalStore:
             "base_commit": base_commit,
             "policy": policy,
         }
-        validate_manifest(self.root, manifest, verify_current=True)
-        proposed = self._proposed_root()
-        json_path = proposed / f"{identifier}.json"
-        markdown_path = proposed / f"{identifier}.md"
-        try:
-            require_safe_path(self.root, json_path, directory=False)
-            require_safe_path(self.root, markdown_path, directory=False)
-        except ValueError as error:
-            raise ProposalError(str(error)) from error
-        encoded = json.dumps(manifest, ensure_ascii=False, sort_keys=True, indent=2) + "\n"
-        if not exclusive_write_text(json_path, encoded):
-            raise ProposalError("immutable proposal already exists")
-        try:
-            if not exclusive_write_text(markdown_path, render_markdown(manifest)):
-                raise ProposalError("immutable proposal rendering already exists")
-        except BaseException:
-            json_path.unlink(missing_ok=True)
-            fsync_directory(proposed)
-            raise
+        config = load_profile_config(self.root)
+        with ProfileLease(self.root, stale_timeout=config.curation.stale_timeout_seconds):
+            validate_manifest(self.root, manifest, verify_current=True)
+            proposed = self._proposed_root()
+            json_path = proposed / f"{identifier}.json"
+            markdown_path = proposed / f"{identifier}.md"
+            try:
+                require_safe_path(self.root, json_path, directory=False)
+                require_safe_path(self.root, markdown_path, directory=False)
+            except ValueError as error:
+                raise ProposalError(str(error)) from error
+            encoded = json.dumps(manifest, ensure_ascii=False, sort_keys=True, indent=2) + "\n"
+            if not exclusive_write_text(json_path, encoded):
+                raise ProposalError("immutable proposal already exists")
+            try:
+                if not exclusive_write_text(markdown_path, render_markdown(manifest)):
+                    raise ProposalError("immutable proposal rendering already exists")
+                self._record_creation_unlocked(manifest, json_path, markdown_path)
+            except BaseException:
+                json_path.unlink(missing_ok=True)
+                markdown_path.unlink(missing_ok=True)
+                fsync_directory(proposed)
+                raise
         return manifest
 
     def load(self, proposal_id: str) -> dict[str, Any]:
@@ -310,6 +370,12 @@ class ProposalStore:
                 raise ProposalError("proposal filename does not match its ID")
             if not markdown_path.is_file() or markdown_path.read_text(encoding="utf-8") != render_markdown(value):
                 raise ProposalError("proposal Markdown rendering does not match its manifest")
+            creation = self._creation(proposal_id)
+            if (
+                creation["json_digest"] != _file_digest(json_path)
+                or creation["markdown_digest"] != _file_digest(markdown_path)
+            ):
+                raise ProposalError("proposal creation digest does not match immutable artifacts")
             loaded = json.loads(json.dumps(value))
             loaded["status"] = self._status(proposal_id)
             return loaded
@@ -327,10 +393,7 @@ class ProposalStore:
         proposed = self._proposed_root()
         versioned_identifiers = {path.stem for path in proposed.glob("*.json")}
         entries = self._entries()
-        orphaned = sorted({
-            entry["proposal_id"] for entry in entries
-            if entry["proposal_id"] not in versioned_identifiers
-        })
+        orphaned = sorted({entry["proposal_id"] for entry in entries if entry["proposal_id"] not in versioned_identifiers})
         if orphaned:
             raise ProposalError(
                 "proposal lifecycle journal contains orphan entries: "
@@ -347,13 +410,15 @@ class ProposalStore:
         target: str,
         reason: str | None = None,
     ) -> dict[str, Any]:
+        if expected not in _STATUSES or target not in _STATUSES:
+            raise ProposalError("proposal lifecycle status is invalid")
+        if target not in _TRANSITIONS[expected]:
+            raise ProposalError(f"invalid proposal transition: {expected} -> {target}")
         config = load_profile_config(self.root)
         with ProfileLease(self.root, stale_timeout=config.curation.stale_timeout_seconds):
             manifest = self.load(proposal_id)
             if manifest.get("legacy"):
                 raise ProposalError("legacy Markdown proposals are read-only and never applicable")
-            if expected not in _STATUSES or target not in _STATUSES:
-                raise ProposalError("proposal lifecycle status is invalid")
             current = manifest["status"]
             if current == target:
                 return manifest
