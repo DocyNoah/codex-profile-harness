@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.2 - 2026-09-11
+
+- Serialize concurrent profile Git checkpoints on macOS by allowing bounded
+  waits only between checkpoint lease owners while preserving fail-fast
+  exclusion for curation and improvement transactions.
+
 ## 0.3.1 - 2026-09-11
 
 - Make the non-fast-forward Git push regression test portable when a clone

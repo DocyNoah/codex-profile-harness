@@ -187,7 +187,7 @@ and contributions follow [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Release verification
 
-Version 0.3.1 archives are reproducible and accompanied by a SHA-256 checksum.
+Version 0.3.2 archives are reproducible and accompanied by a SHA-256 checksum.
 After verifying the checksum, extract into a new directory and run the clean
 extraction validator:
 

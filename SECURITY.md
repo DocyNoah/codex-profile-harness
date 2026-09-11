@@ -88,7 +88,7 @@ tampering. Do not edit receipts, journal entries, or transaction descriptors to
 silence a finding. Recover with the harness where safe or restore an independently
 verified backup.
 
-Version 0.3.1 release archives use deterministic order, timestamps, ownership,
+Version 0.3.2 release archives use deterministic order, timestamps, ownership,
 and permissions and ship a SHA-256 checksum. Reproducibility detects accidental
 packaging drift; it does not replace review of the source and hook. Validate a
 clean extraction before installation.
