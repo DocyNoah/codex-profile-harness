@@ -342,11 +342,12 @@ def _publish_preparation(path: Path, descriptor: dict[str, Any]) -> None:
 
 
 def claim_receipts(
-    root: Path, limit: int | None = None, *, crash_after_stage: str | None = None
+    root: Path, limit: int | None = None, *, crash_after_stage: str | None = None,
+    config: HarnessConfig | None = None,
 ) -> CurationBatch:
     """Atomically claim valid inbox receipts into a unique processing batch."""
     profile_root = Path(root).resolve()
-    load_profile(profile_root)
+    load_profile(profile_root, config=config)
     if limit is not None and (isinstance(limit, bool) or limit < 1):
         raise CurationError("limit must be a positive integer")
     batch_id = _batch_id()
@@ -422,11 +423,14 @@ def _return_receipts(root: Path, batch_path: Path) -> None:
 
 
 def prepare_curation(
-    root: Path, limit: int | None = None, *, crash_after_stage: str | None = None
+    root: Path, limit: int | None = None, *, crash_after_stage: str | None = None,
+    config: HarnessConfig | None = None,
 ) -> CurationBatch:
     """Claim receipts and create the immutable batch manifest and bounded prompt."""
     profile_root = Path(root).resolve()
-    batch = claim_receipts(profile_root, limit, crash_after_stage=crash_after_stage)
+    batch = claim_receipts(
+        profile_root, limit, crash_after_stage=crash_after_stage, config=config
+    )
     try:
         if not batch.receipt_ids:
             return batch
@@ -1371,7 +1375,7 @@ def apply_actions(
     config: HarnessConfig | None = None,
 ) -> ApplyResult:
     """Apply one validated batch transactionally, restoring it on any failure."""
-    profile = load_profile(root)
+    profile = load_profile(root, config=config)
     applied_at = now or datetime.now(timezone.utc)
     if applied_at.tzinfo is None or applied_at.utcoffset() is None:
         raise CurationError("curation clock must be timezone-aware")

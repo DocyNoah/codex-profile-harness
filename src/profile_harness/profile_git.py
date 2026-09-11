@@ -203,6 +203,8 @@ def _git(
             "-c", f"core.hooksPath={hooks}",
             "-c", "core.fsmonitor=false",
             "-c", f"core.attributesFile={os.devnull}",
+            "-c", "core.autocrlf=false",
+            "-c", "core.safecrlf=false",
             "-c", "commit.gpgSign=false",
             "-c", "tag.gpgSign=false",
         ])
@@ -359,11 +361,12 @@ def _reject_repository_includes_and_attributes_file(root: Path) -> None:
         )
 
 
-def _reject_effective_filters(root: Path, paths: tuple[str, ...]) -> None:
+def _reject_effective_transformations(root: Path, paths: tuple[str, ...]) -> None:
     if not paths:
         return
     result = _git(
-        root, "check-attr", "-z", "--stdin", "filter",
+        root, "check-attr", "-z", "--stdin",
+        "filter", "text", "eol", "working-tree-encoding", "ident",
         input_text="\0".join(paths) + "\0", literal_pathspecs=False, read_only=True,
     )
     fields = result.stdout.split("\0")
@@ -371,9 +374,81 @@ def _reject_effective_filters(root: Path, paths: tuple[str, ...]) -> None:
         fields.pop()
     if len(fields) % 3:
         raise ProfileGitError("Git attribute response is malformed")
-    active = [fields[index] for index in range(0, len(fields), 3) if fields[index + 2] not in {"unspecified", "unset"}]
+    active = [
+        f"{fields[index]}:{fields[index + 1]}"
+        for index in range(0, len(fields), 3)
+        if fields[index + 2] not in {"unspecified", "unset"}
+    ]
     if active:
-        raise ProfileGitError("managed Git paths have an effective filter attribute: " + ", ".join(active[:20]))
+        raise ProfileGitError(
+            "managed Git paths have transforming attributes: " + ", ".join(active[:20])
+        )
+
+
+def _exact_blob_snapshot(root: Path, paths: tuple[str, ...]) -> dict[str, str | None]:
+    algorithm = _git(
+        root, "rev-parse", "--show-object-format", read_only=True
+    ).stdout.strip()
+    if algorithm not in {"sha1", "sha256"}:
+        raise ProfileGitError("repository object format is unsupported")
+    snapshot: dict[str, str | None] = {}
+    for relative in paths:
+        path = root / relative
+        if not path.exists():
+            snapshot[relative] = None
+            continue
+        before = path.stat(follow_symlinks=False)
+        digest = hashlib.new(algorithm)
+        digest.update(f"blob {before.st_size}\0".encode("ascii"))
+        with path.open("rb") as handle:
+            while chunk := handle.read(1024 * 1024):
+                digest.update(chunk)
+        after = path.stat(follow_symlinks=False)
+        identity = lambda value: (
+            value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns,
+            value.st_ctime_ns,
+        )
+        if identity(before) != identity(after):
+            raise ProfileGitError("managed Git file changed during exact snapshot")
+        snapshot[relative] = digest.hexdigest()
+    return snapshot
+
+
+def _verify_exact_blobs(
+    root: Path, snapshot: dict[str, str | None], *, committed: bool
+) -> None:
+    items = tuple(snapshot.items())
+    for offset in range(0, len(items), 100):
+        chunk = items[offset:offset + 100]
+        paths = tuple(relative for relative, _expected in chunk)
+        if committed:
+            result = _git(
+                root, "ls-tree", "-z", "HEAD", "--", *paths,
+                check=False, read_only=True,
+                max_output=512_000,
+            )
+        else:
+            result = _git(
+                root, "ls-files", "--stage", "-z", "--", *paths,
+                check=False, read_only=True,
+                max_output=512_000,
+            )
+        records = [item for item in result.stdout.split("\0") if item]
+        observed: dict[str, str] = {}
+        for record in records:
+            if "\t" not in record:
+                raise ProfileGitError("managed Git blob inventory is ambiguous")
+            metadata, recorded_path = record.split("\t", 1)
+            fields = metadata.split()
+            if recorded_path in observed or len(fields) < 3:
+                raise ProfileGitError("managed Git blob inventory is malformed")
+            observed[recorded_path] = fields[2] if committed else fields[1]
+        for relative, expected in chunk:
+            if observed.get(relative) != expected:
+                boundary = "committed" if committed else "staged"
+                raise ProfileGitError(
+                    f"{boundary} managed blob differs from exact worktree bytes: {relative}"
+                )
 
 
 def _is_managed(relative: str) -> bool:
@@ -638,13 +713,15 @@ def _checkpoint_locked(
     _safe_git_directory(profile_root)
     _reject_repository_includes_and_attributes_file(profile_root)
     candidates = _managed_candidates(profile_root)
-    _reject_effective_filters(profile_root, candidates)
+    _reject_effective_transformations(profile_root, candidates)
     dirty = _dirty_paths(profile_root, candidates)
     if not dirty:
         _failure_path(profile_root).unlink(missing_ok=True)
         return CheckpointResult(False)
     filters = _configured_filter_names(profile_root)
+    snapshot = _exact_blob_snapshot(profile_root, candidates)
     _git(profile_root, "add", "--", *candidates, filter_names=filters)
+    _verify_exact_blobs(profile_root, snapshot, committed=False)
     prepared = _prepare_push_intent(profile_root, subject, config=config)
     _git(
         profile_root,
@@ -654,6 +731,7 @@ def _checkpoint_locked(
         "--", *candidates,
         filter_names=filters,
     )
+    _verify_exact_blobs(profile_root, snapshot, committed=True)
     sha = _git(profile_root, "rev-parse", "HEAD", read_only=True).stdout.strip()
     if prepared is not None:
         try:

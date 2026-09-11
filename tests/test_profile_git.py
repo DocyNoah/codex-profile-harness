@@ -752,6 +752,41 @@ class ProfileGitTests(unittest.TestCase):
             self.assertFalse(marker.exists())
             self.assertEqual("", git(profile, "diff", "--cached", "--name-only", "--", "MEMORY.md").stdout)
 
+    def test_checkpoint_preserves_exact_crlf_blob_with_autocrlf_enabled(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            profile = Path(temporary_directory) / "profile"
+            init_profile(profile, "Work")
+            git(profile, "config", "core.autocrlf", "true")
+            exact = b"# Memory\r\n\r\nExact CRLF.\r\n"
+            (profile / "MEMORY.md").write_bytes(exact)
+
+            result = checkpoint_profile(profile, CHECKPOINT_SUBJECT)
+            committed = subprocess.run(
+                ["git", "-C", str(profile), "cat-file", "blob", "HEAD:MEMORY.md"],
+                capture_output=True, check=True,
+            ).stdout
+
+            self.assertTrue(result.committed, result.error)
+            self.assertEqual(exact, committed)
+
+    def test_transforming_attributes_fail_closed_before_staging(self) -> None:
+        for attribute in ("text", "eol=lf", "working-tree-encoding=UTF-16", "ident"):
+            with self.subTest(attribute=attribute), tempfile.TemporaryDirectory() as temporary_directory:
+                profile = Path(temporary_directory) / "profile"
+                init_profile(profile, "Work")
+                (profile / ".git/info/attributes").write_text(
+                    f"MEMORY.md {attribute}\n", encoding="utf-8"
+                )
+                (profile / "MEMORY.md").write_bytes(b"exact\r\nbytes\r\n")
+
+                result = checkpoint_profile(profile, CHECKPOINT_SUBJECT)
+
+                self.assertFalse(result.committed)
+                self.assertIn("attribute", (result.error or "").lower())
+                self.assertEqual(
+                    "", git(profile, "diff", "--cached", "--name-only", "--", "MEMORY.md").stdout
+                )
+
     def test_disabled_hooks_directory_must_remain_empty(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             profile = Path(temporary_directory) / "profile"

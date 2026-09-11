@@ -458,11 +458,13 @@ def _load_profile_registry(profile_root: Path, name: str) -> ProfileConfig:
     return ProfileConfig(profile_root, name, tuple(repositories))
 
 
-def load_profile(root: Path) -> ProfileConfig:
+def load_profile(
+    root: Path, *, config: HarnessConfig | None = None
+) -> ProfileConfig:
     """Load and validate profile identity and registered repositories."""
     profile_root = Path(root).expanduser().resolve()
-    config = load_profile_config(profile_root)
-    return _load_profile_registry(profile_root, config.name)
+    run_config = config or load_profile_config(profile_root)
+    return _load_profile_registry(profile_root, run_config.name)
 
 
 def load_profile_for_recovery(root: Path) -> ProfileConfig:

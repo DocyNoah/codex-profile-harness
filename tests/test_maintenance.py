@@ -101,9 +101,7 @@ class MaintenanceTests(unittest.TestCase):
                 model_calls.append((kwargs["model"], kwargs["reasoning_effort"]))
                 config_path = root / ".harness/config.toml"
                 config_path.write_text(
-                    config_path.read_text(encoding="utf-8")
-                    + '\n[improvement]\nmode = "auto_safe"\nmodel = "changed-model"\n'
-                    + '\n[git]\nauto_push = true\nupstream = "origin/main"\nprivate_data_acknowledged = true\n',
+                    "this is invalid TOML = [",
                     encoding="utf-8",
                 )
                 Path(result_path).write_text('{"actions":[],"signals":[]}', encoding="utf-8")
@@ -124,6 +122,8 @@ class MaintenanceTests(unittest.TestCase):
             self.assertEqual(1, len(push_configs))
             self.assertFalse(push_configs[0].git.auto_push)
             self.assertEqual("approval_required", push_configs[0].improvement.mode)
+            with self.assertRaises(ValueError):
+                run_maintenance(root, now=NOW + timedelta(minutes=1))
 
     def test_maintenance_push_failure_preserves_commit_and_later_run_retries(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

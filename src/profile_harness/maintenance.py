@@ -94,7 +94,9 @@ def _run_maintenance_locked(
             "seconds_until_due": due.seconds_until_curation,
         }
     else:
-        batch = prepare_curation(profile_root, config.curation.maintenance_max_receipts)
+        batch = prepare_curation(
+            profile_root, config.curation.maintenance_max_receipts, config=config
+        )
         if not batch.receipt_ids:
             curation = {"status": "no_op", "reason": "empty", "receipt_count": 0}
         else:
