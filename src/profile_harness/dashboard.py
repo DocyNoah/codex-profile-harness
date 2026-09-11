@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from urllib.parse import quote
 
-from .config import load_profile
+from .config import load_profile, load_profile_config
 from .fs import atomic_write_text, require_safe_path
 from .profile_git import inspect_profile_git
 from .proposals import ProposalStore
@@ -53,6 +53,7 @@ def _summary(path: Path) -> str:
 def generate_dashboard(root: Path) -> Path:
     """Atomically replace DASHBOARD.md from registered repository indexes only."""
     profile = load_profile(root)
+    harness_config = load_profile_config(profile.root)
     lines = [
         "# Profile Dashboard",
         "",
@@ -72,6 +73,8 @@ def generate_dashboard(root: Path) -> Path:
             f"- Last commit: {head}" + (f" — {git.last_subject}" if git.last_subject else ""),
             f"- Managed paths: {dirty}",
             f"- Remote: {'configured' if git.has_remote else 'not configured'}",
+            f"- Automatic push: {'enabled for ' + str(harness_config.git.upstream) if harness_config.git.auto_push else 'disabled'}",
+            f"- Push retry: {'pending' if (profile.root / '.harness/state/profile-git-push.json').is_file() else 'none'}",
         ))
     else:
         lines.extend(("", "## Git checkpoint", "", f"Unavailable: {git.error or 'not initialized'}"))

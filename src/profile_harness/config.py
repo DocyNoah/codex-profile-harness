@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import json
 import math
 from pathlib import Path
+import re
 import tomllib
 
 from .fs import (
@@ -118,11 +119,19 @@ class ImprovementConfig:
 
 
 @dataclass(frozen=True)
+class GitConfig:
+    auto_push: bool = False
+    upstream: str | None = None
+    private_data_acknowledged: bool = False
+
+
+@dataclass(frozen=True)
 class HarnessConfig:
     name: str
     capture: CaptureConfig
     curation: CurationConfig
     improvement: ImprovementConfig
+    git: GitConfig
 
 
 def _toml_string(value: str) -> str:
@@ -377,6 +386,35 @@ def load_profile_config(root: Path) -> HarnessConfig:
         "improvement.reminder_seconds",
         errors,
     )
+    git = config.get("git", {})
+    if not isinstance(git, dict):
+        errors.append("git configuration must be a TOML table")
+        git = {}
+    unknown_git_fields = sorted(
+        set(git) - {"auto_push", "upstream", "private_data_acknowledged"}
+    )
+    if unknown_git_fields:
+        errors.append("unknown git configuration fields: " + ", ".join(unknown_git_fields))
+    auto_push = git.get("auto_push", False)
+    acknowledged = git.get("private_data_acknowledged", False)
+    upstream = git.get("upstream")
+    if not isinstance(auto_push, bool):
+        errors.append("git.auto_push must be boolean")
+        auto_push = False
+    if not isinstance(acknowledged, bool):
+        errors.append("git.private_data_acknowledged must be boolean")
+        acknowledged = False
+    if upstream is not None and (
+        not isinstance(upstream, str)
+        or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._/-]*", upstream) is None
+        or ".." in upstream.split("/")
+    ):
+        errors.append("git.upstream must be an exact remote/branch name")
+        upstream = None
+    if auto_push and not acknowledged:
+        errors.append("git.auto_push requires explicit private_data_acknowledged=true")
+    if auto_push and upstream is None:
+        errors.append("git.auto_push requires git.upstream")
     if errors:
         raise ValueError("invalid profile configuration: " + "; ".join(errors))
     return HarnessConfig(
@@ -391,6 +429,7 @@ def load_profile_config(root: Path) -> HarnessConfig:
             high_threshold, low_interval, low_minimum, mode, automatic_paths,
             automatic_max_changed_bytes, reminder_seconds,
         ),
+        GitConfig(auto_push, upstream, acknowledged),
     )
 
 

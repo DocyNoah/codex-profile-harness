@@ -125,7 +125,13 @@ def run_maintenance(root: Path, *, now: datetime | None = None) -> dict[str, Any
     """Run maintenance and durably surface failures without masking them."""
     profile_root = Path(root).resolve()
     try:
-        return _run_maintenance(profile_root, now=now)
+        result = _run_maintenance(profile_root, now=now)
+        from .profile_git import auto_push_profile
+
+        pushed = auto_push_profile(profile_root)
+        if pushed.commit_sha is not None or pushed.error is not None:
+            result["push"] = pushed.as_json_object()
+        return result
     except BaseException as error:
         try:
             from .control import emit_failure_with_default_lease

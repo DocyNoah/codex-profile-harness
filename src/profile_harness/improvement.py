@@ -749,7 +749,13 @@ def run_improvement(
     config = load_profile_config(profile_root)
     current = _now(now)
     with ProfileLease(profile_root, stale_timeout=config.curation.stale_timeout_seconds):
-        return _run_locked(
+        result = _run_locked(
             profile_root, now=current, force=force,
             fail_after_writes=fail_after_writes, crash_after_stage=crash_after_stage,
         )
+    from .profile_git import auto_push_profile
+
+    pushed = auto_push_profile(profile_root)
+    if pushed.commit_sha is not None or pushed.error is not None:
+        result["push"] = pushed.as_json_object()
+    return result

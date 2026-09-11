@@ -235,6 +235,32 @@ class ControlOutbox:
                 claimed += 1
         return {"total": len(events), "pending": len(events) - acknowledged, "claimed": claimed, "acknowledged": acknowledged}
 
+    def _resolve_dedupe_unlocked(
+        self, dedupe_key: str, *, now: datetime | None = None
+    ) -> int:
+        """Mark matching pending events resolved after deterministic recovery."""
+        current = _time(now)
+        _, claims = self._dirs()
+        resolved = 0
+        for event in self._events_unlocked():
+            if event["dedupe_key"] != dedupe_key:
+                continue
+            claim = self._claim(event["event_id"])
+            if claim and claim["acknowledged_at"] is not None:
+                continue
+            value = {
+                "event_id": event["event_id"],
+                "claim_token": claim["claim_token"] if claim else uuid.uuid4().hex,
+                "claimed_at": claim["claimed_at"] if claim else _timestamp(current),
+                "acknowledged_at": _timestamp(current),
+            }
+            atomic_write_text(
+                claims / f"{event['event_id']}.json",
+                json.dumps(value, sort_keys=True, indent=2) + "\n",
+            )
+            resolved += 1
+        return resolved
+
 
 def emit_proposal_event_unlocked(root: Path, manifest: dict[str, Any]) -> dict[str, Any]:
     return ControlOutbox(root)._emit_unlocked(

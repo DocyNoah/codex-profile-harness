@@ -15,6 +15,7 @@ import subprocess
 import threading
 import time
 from typing import Any, BinaryIO
+from urllib.parse import urlsplit
 
 from .fs import atomic_write_text, ensure_safe_directory, require_safe_path
 
@@ -96,6 +97,7 @@ _GUARD_TIMEOUT = 0.5
 _MAX_MANAGED_FILES = 2_000
 _MAX_PATH_CHARS = 4_096
 _DISABLED_HOOKS = ".harness/state/profile-git-disabled-hooks"
+_PUSH_FAILURE_PATH = ".harness/state/profile-git-push.json"
 
 
 @dataclass(frozen=True)
@@ -103,6 +105,17 @@ class CheckpointResult:
     committed: bool
     commit_sha: str | None = None
     changed_paths: tuple[str, ...] = ()
+    error: str | None = None
+
+    def as_json_object(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class PushResult:
+    pushed: bool
+    commit_sha: str | None = None
+    upstream: str | None = None
     error: str | None = None
 
     def as_json_object(self) -> dict[str, Any]:
@@ -120,6 +133,9 @@ class ProfileGitStatus:
     dirty_paths: tuple[str, ...] = ()
     has_remote: bool = False
     error: str | None = None
+    auto_push_enabled: bool = False
+    configured_upstream: str | None = None
+    push_retry_pending: bool = False
 
     def as_json_object(self) -> dict[str, Any]:
         return asdict(self)
@@ -138,6 +154,7 @@ def _git(
     read_only: bool = False,
     filter_names: tuple[str, ...] = (),
     max_output: int = _MAX_OUTPUT,
+    push_mode: bool = False,
 ) -> subprocess.CompletedProcess[str]:
     started = time.monotonic()
     deadline = started + _TIMEOUT
@@ -156,6 +173,11 @@ def _git(
         "GIT_OPTIONAL_LOCKS": "0" if read_only else "1",
         "LC_ALL": "C",
     })
+    if push_mode:
+        environment.update({
+            "GCM_INTERACTIVE": "Never",
+            "GIT_SSH_COMMAND": "ssh -oBatchMode=yes -oPasswordAuthentication=no",
+        })
     git_dir = root / ".git"
     hooks = root / _DISABLED_HOOKS
     try:
@@ -168,6 +190,11 @@ def _git(
             "-c", "commit.gpgSign=false",
             "-c", "tag.gpgSign=false",
         ]
+        if push_mode:
+            command.extend((
+                "-c", "credential.helper=",
+                "-c", "core.askPass=",
+            ))
         for name in filter_names:
             command.extend((
                 "-c", f"filter.{name}.clean=",
@@ -591,6 +618,210 @@ def current_profile_commit(root: Path) -> str:
     return result
 
 
+def _one_local_config(root: Path, key: str) -> str | None:
+    result = _git(
+        root, "config", "--local", "--get-all", key,
+        check=False, read_only=True,
+    )
+    if result.returncode not in {0, 1}:
+        raise ProfileGitError(f"cannot inspect repository configuration: {key}")
+    values = result.stdout.splitlines()
+    if len(values) > 1:
+        raise ProfileGitError(f"ambiguous repository configuration: {key}")
+    return values[0] if values else None
+
+
+def _validate_push_repository_config(root: Path) -> None:
+    result = _git(
+        root, "config", "--local", "--name-only", "--get-regexp",
+        r"^(core\.hookspath|core\.sshcommand|filter\.|credential\.|url\.|remote\..*\.(receivepack|uploadpack|vcs|proxy)|protocol\.)",
+        check=False, read_only=True,
+    )
+    if result.returncode not in {0, 1}:
+        raise ProfileGitError("cannot inspect repository helper configuration")
+    keys = tuple(line for line in result.stdout.splitlines() if line)
+    if keys:
+        raise ProfileGitError("repository Git helpers are not allowed for automatic push: " + ", ".join(keys[:20]))
+    _safe_hooks_directory(root)
+    if _configured_filter_names(root):
+        raise ProfileGitError("repository Git filters are not allowed for automatic push")
+
+
+def _validate_remote_url(url: str) -> None:
+    if not url or "\n" in url or "\0" in url or "\\" in url or "::" in url:
+        raise ProfileGitError("remote URL is unsafe")
+    if re.fullmatch(r"(?:[^/@:\s]+@)?[^/:\s]+:[^:\s][^\s]*", url):
+        return
+    parsed = urlsplit(url)
+    if parsed.scheme in {"https", "ssh"} and parsed.netloc and parsed.path:
+        return
+    if parsed.scheme == "file" and not parsed.netloc and Path(parsed.path).is_absolute():
+        return
+    raise ProfileGitError("remote URL scheme is unsupported or ambiguous")
+
+
+def validate_push_configuration(root: Path) -> tuple[str, str]:
+    """Validate configured automatic-push policy without contacting a remote."""
+    from .config import load_profile_config
+
+    profile_root = Path(root).resolve()
+    config = load_profile_config(profile_root).git
+    if not config.auto_push or not config.private_data_acknowledged or config.upstream is None:
+        raise ProfileGitError("automatic push is not fully enabled")
+    _safe_git_directory(profile_root)
+    _validate_push_repository_config(profile_root)
+    branch_result = _git(
+        profile_root, "symbolic-ref", "--quiet", "--short", "HEAD",
+        check=False, read_only=True,
+    )
+    branch = branch_result.stdout.strip()
+    if branch_result.returncode != 0 or not branch or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]*", branch) is None:
+        raise ProfileGitError("automatic push requires an attached safe branch")
+    remote, configured_branch = config.upstream.split("/", 1)
+    if configured_branch != branch:
+        raise ProfileGitError("configured upstream branch does not match the attached branch")
+    if _one_local_config(profile_root, f"branch.{branch}.remote") != remote or _one_local_config(
+        profile_root, f"branch.{branch}.merge"
+    ) != f"refs/heads/{branch}":
+        raise ProfileGitError("attached branch does not have the exact configured upstream")
+    urls = _git(
+        profile_root, "remote", "get-url", "--push", "--all", remote,
+        read_only=True,
+    ).stdout.splitlines()
+    if len(urls) != 1:
+        raise ProfileGitError("configured remote URL is missing or ambiguous")
+    _validate_remote_url(urls[0])
+    return branch, remote
+
+
+def push_profile(root: Path, commit_sha: str | None) -> PushResult:
+    """Push one exact attached HEAD to its explicitly configured upstream."""
+    profile_root = Path(root).expanduser().resolve()
+    try:
+        from .config import load_profile_config
+
+        config = load_profile_config(profile_root).git
+        if not config.auto_push:
+            raise ProfileGitError("automatic push is disabled")
+        if not config.private_data_acknowledged:
+            raise ProfileGitError("private profile data acknowledgement is required")
+        if config.upstream is None:
+            raise ProfileGitError("automatic push upstream is missing")
+        branch, remote = validate_push_configuration(profile_root)
+        if not isinstance(commit_sha, str) or re.fullmatch(r"[a-f0-9]{40,64}", commit_sha) is None:
+            raise ProfileGitError("push commit identity is invalid")
+        head = current_profile_commit(profile_root)
+        branch_sha = _git(
+            profile_root, "rev-parse", "--verify", f"refs/heads/{branch}",
+            read_only=True,
+        ).stdout.strip()
+        if commit_sha != head or commit_sha != branch_sha:
+            raise ProfileGitError("push commit is not the exact attached branch HEAD")
+        remote_ref = f"refs/heads/{branch}"
+        advertised = _git(
+            profile_root, "ls-remote", "--heads", remote, remote_ref,
+            literal_pathspecs=False, read_only=True, push_mode=True,
+        ).stdout.splitlines()
+        if len(advertised) > 1:
+            raise ProfileGitError("remote branch advertisement is ambiguous")
+        if advertised:
+            fields = advertised[0].split()
+            if len(fields) != 2 or fields[1] != remote_ref or re.fullmatch(r"[a-f0-9]{40,64}", fields[0]) is None:
+                raise ProfileGitError("remote branch advertisement is invalid")
+            remote_sha = fields[0]
+            fetched = _git(
+                profile_root, "fetch", "--no-tags", "--no-write-fetch-head", remote, remote_ref,
+                check=False, literal_pathspecs=False, push_mode=True,
+            )
+            if fetched.returncode != 0:
+                raise ProfileGitError("cannot validate remote fast-forward state")
+            fast_forward = _git(
+                profile_root, "merge-base", "--is-ancestor", remote_sha, commit_sha,
+                check=False, read_only=True,
+            )
+            if fast_forward.returncode != 0:
+                raise ProfileGitError("remote update is not a fast-forward")
+        pushed = _git(
+            profile_root, "push", "--porcelain", "--no-verify", "--no-recurse-submodules",
+            remote, f"{commit_sha}:{remote_ref}",
+            literal_pathspecs=False, push_mode=True,
+        )
+        if pushed.returncode != 0:
+            raise ProfileGitError("automatic push was rejected: " + (pushed.stderr or pushed.stdout).strip())
+        return PushResult(True, commit_sha, config.upstream)
+    except (OSError, ValueError, ProfileGitError) as error:
+        return PushResult(False, commit_sha, error=str(error))
+
+
+def _auto_push_unlocked(root: Path) -> PushResult:
+    """Attempt configured push while the caller holds the profile lease."""
+    from .config import load_profile_config
+    from .control import ControlOutbox
+
+    profile_root = Path(root).resolve()
+    config = load_profile_config(profile_root)
+    if not config.git.auto_push:
+        return PushResult(False)
+    try:
+        commit_sha = current_profile_commit(profile_root)
+    except (OSError, ValueError, ProfileGitError) as error:
+        return PushResult(False, error=str(error))
+    result = push_profile(profile_root, commit_sha)
+    diagnostic = require_safe_path(
+        profile_root, profile_root / _PUSH_FAILURE_PATH, directory=False
+    )
+    dedupe_key = f"git-push-failure:{commit_sha}"
+    outbox = ControlOutbox(profile_root)
+    if result.pushed:
+        try:
+            previous_commit = None
+            if diagnostic.is_file() and not diagnostic.is_symlink():
+                previous = json.loads(diagnostic.read_text(encoding="utf-8"))
+                previous_commit = previous.get("commit_sha") if isinstance(previous, dict) else None
+            outbox._resolve_dedupe_unlocked(dedupe_key)
+            if isinstance(previous_commit, str):
+                outbox._resolve_dedupe_unlocked(f"git-push-failure:{previous_commit}")
+            diagnostic.unlink(missing_ok=True)
+        except (OSError, ValueError):
+            pass
+        return result
+    detail = {
+        "version": 1,
+        "commit_sha": commit_sha,
+        "upstream": config.git.upstream,
+        "error": (result.error or "automatic push failed")[:4000],
+        "retry": "next successful checkpoint or explicit push",
+        "failed_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+    }
+    try:
+        atomic_write_text(diagnostic, json.dumps(detail, sort_keys=True, indent=2) + "\n")
+        outbox._emit_unlocked(
+            "failure", "git-push", detail,
+            dedupe_key=dedupe_key,
+        )
+    except (OSError, ValueError):
+        pass
+    return result
+
+
+def auto_push_profile(root: Path) -> PushResult:
+    """Safely retry the configured exact HEAD push under the profile lease."""
+    from .config import load_profile_config
+    from .locking import ProfileLease
+
+    profile_root = Path(root).resolve()
+    try:
+        config = load_profile_config(profile_root)
+        if not config.git.auto_push:
+            return PushResult(False)
+        with ProfileLease(
+            profile_root, stale_timeout=config.curation.stale_timeout_seconds
+        ):
+            return _auto_push_unlocked(profile_root)
+    except (OSError, ValueError, RuntimeError, ProfileGitError) as error:
+        return PushResult(False, error=str(error))
+
+
 def validate_application_baseline(
     root: Path,
     base_commit: str,
@@ -755,9 +986,18 @@ def inspect_profile_git(root: Path) -> ProfileGitStatus:
             if len(values) == 3:
                 sha, subject, committed_at = values
         remotes = _git(profile_root, "remote", read_only=True).stdout.splitlines()
+        try:
+            from .config import load_profile_config
+
+            git_config = load_profile_config(profile_root).git
+        except (OSError, ValueError):
+            git_config = None
         return ProfileGitStatus(
             True, branch, detached, sha, subject, committed_at,
             _dirty_paths(profile_root), bool(remotes), None,
+            git_config.auto_push if git_config is not None else False,
+            git_config.upstream if git_config is not None else None,
+            (profile_root / _PUSH_FAILURE_PATH).is_file(),
         )
     except (OSError, ValueError, ProfileGitError) as error:
         return ProfileGitStatus(False, error=str(error))

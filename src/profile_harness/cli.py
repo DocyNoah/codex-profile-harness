@@ -34,10 +34,13 @@ from .control import ControlOutbox, MAX_POLL_BYTES
 from .proposals import MAX_MANIFEST_BYTES, ProposalStore
 from .runner import run_codex
 from .profile_git import (
+    auto_push_profile,
     CHECKPOINT_SUBJECT,
     checkpoint_profile,
+    current_profile_commit,
     inspect_profile_git,
     profile_git_log,
+    push_profile,
 )
 
 
@@ -93,6 +96,7 @@ def _parser() -> argparse.ArgumentParser:
     git_status = git_commands.add_parser("status", help="show managed profile Git status")
     git_status.add_argument("--json", action="store_true")
     git_commands.add_parser("checkpoint", help="checkpoint changed managed documents")
+    git_commands.add_parser("push", help="push exact HEAD to the configured upstream")
     git_log = git_commands.add_parser("log", help="show the local profile checkpoint log")
     git_log.add_argument("--json", action="store_true")
     git_log.add_argument("--limit", type=int, default=20)
@@ -209,7 +213,11 @@ def _curate(arguments: argparse.Namespace) -> int:
                 raise ValueError("--batch is only valid with --apply")
             batch = prepare_curation(root, arguments.limit)
             if not batch.receipt_ids:
-                print(json.dumps({"status": "no_op", "receipt_ids": []}, sort_keys=True))
+                output = {"status": "no_op", "receipt_ids": []}
+                pushed = auto_push_profile(root)
+                if pushed.commit_sha is not None or pushed.error is not None:
+                    output["push"] = pushed.as_json_object()
+                print(json.dumps(output, sort_keys=True))
                 return 0
             result_path = batch.path / "result.json"
             try:
@@ -237,6 +245,9 @@ def _curate(arguments: argparse.Namespace) -> int:
                 "batch_id": applied.batch_id,
                 "changed_paths": [str(path) for path in applied.changed_paths],
             }
+    pushed = auto_push_profile(root)
+    if pushed.commit_sha is not None or pushed.error is not None:
+        output["push"] = pushed.as_json_object()
     print(json.dumps(output, ensure_ascii=False, sort_keys=True))
     return 0
 
@@ -285,12 +296,21 @@ def main(argv: list[str] | None = None) -> int:
                 else:
                     location = "detached HEAD" if status.detached else (status.branch or "unborn branch")
                     dirty = ", ".join(status.dirty_paths) if status.dirty_paths else "clean"
-                    print(f"Git: {location}; managed paths: {dirty}")
+                    push = (
+                        f"enabled for {status.configured_upstream}"
+                        if status.auto_push_enabled else "disabled"
+                    )
+                    retry = "; retry pending" if status.push_retry_pending else ""
+                    print(f"Git: {location}; managed paths: {dirty}; auto push: {push}{retry}")
                 return 0 if status.initialized else 1
             if arguments.git_command == "checkpoint":
                 result = checkpoint_profile(root, CHECKPOINT_SUBJECT)
                 print(json.dumps(result.as_json_object(), ensure_ascii=False, sort_keys=True))
                 return 0 if result.error is None else 1
+            if arguments.git_command == "push":
+                result = push_profile(root, current_profile_commit(root))
+                print(json.dumps(result.as_json_object(), ensure_ascii=False, sort_keys=True))
+                return 0 if result.pushed else 1
             entries = profile_git_log(root, arguments.limit)
             if arguments.json:
                 print(json.dumps(entries, ensure_ascii=False, sort_keys=True))

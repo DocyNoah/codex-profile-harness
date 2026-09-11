@@ -447,7 +447,7 @@ def _finish_committed_unlocked(
     return result
 
 
-def apply_proposal(
+def _apply_proposal_local(
     root: Path,
     proposal_id: str,
     *,
@@ -659,3 +659,33 @@ def apply_proposal(
             if isinstance(error, ApplicationError):
                 raise
             raise ApplicationError(str(error)) from error
+
+
+def apply_proposal(
+    root: Path,
+    proposal_id: str,
+    *,
+    approve: bool = False,
+    automatic: bool = False,
+    doctor_fn=None,
+    checkpoint_fn=None,
+    fail_after_writes: int | None = None,
+    crash_after_checkpoint: bool = False,
+) -> dict[str, Any]:
+    """Apply locally first, then attempt optional push outside the apply lease."""
+    result = _apply_proposal_local(
+        root,
+        proposal_id,
+        approve=approve,
+        automatic=automatic,
+        doctor_fn=doctor_fn,
+        checkpoint_fn=checkpoint_fn,
+        fail_after_writes=fail_after_writes,
+        crash_after_checkpoint=crash_after_checkpoint,
+    )
+    from .profile_git import auto_push_profile
+
+    pushed = auto_push_profile(Path(root).resolve())
+    if pushed.commit_sha is not None or pushed.error is not None:
+        result["push"] = pushed.as_json_object()
+    return result

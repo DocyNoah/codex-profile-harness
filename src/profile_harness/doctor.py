@@ -884,6 +884,7 @@ def diagnose(
         inspect_profile_git,
         missing_ignore_rules,
         tracked_forbidden_paths,
+        validate_push_configuration,
     )
 
     git_status = inspect_profile_git(profile_root)
@@ -906,6 +907,13 @@ def diagnose(
             findings.append(Finding("WARN", "git", "profile repository has detached HEAD"))
         if not git_status.has_remote:
             findings.append(Finding("WARN", "git", "no remote is configured; local Git does not protect against disk loss"))
+        if profile_config is not None and profile_config.git.auto_push:
+            try:
+                branch, remote = validate_push_configuration(profile_root)
+            except (OSError, ValueError, RuntimeError) as error:
+                findings.append(Finding("ERROR", "git push", str(error)))
+            else:
+                findings.append(Finding("OK", "git push", f"enabled for exact upstream {remote}/{branch}"))
         if not any(item.subject == "git" and item.severity == "ERROR" for item in findings):
             findings.append(Finding("OK", "git", "local profile repository is readable"))
     checkpoint_failure = profile_root / ".harness/state/profile-git-failure.json"
@@ -918,6 +926,16 @@ def diagnose(
         except (OSError, ValueError) as error:
             detail = f"unreadable diagnostic: {error}"
         findings.append(Finding("ERROR", "git", f"failed pending checkpoint: {detail or 'unknown Git failure'}"))
+    push_failure = profile_root / ".harness/state/profile-git-push.json"
+    if push_failure.is_symlink():
+        findings.append(Finding("ERROR", "git push", "push diagnostic path is unsafe"))
+    elif push_failure.is_file():
+        try:
+            failure = _json_file(push_failure)
+            detail = failure.get("error") if isinstance(failure, dict) else None
+        except (OSError, ValueError) as error:
+            detail = f"unreadable diagnostic: {error}"
+        findings.append(Finding("WARN", "git push", f"pending automatic push retry: {detail or 'unknown push failure'}"))
 
     transaction_dir = profile_root / ".harness/state/transactions"
     if transaction_dir.is_symlink():
