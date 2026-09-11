@@ -50,15 +50,10 @@ def ensure_safe_directory(root: Path, path: Path) -> Path:
 
 
 def fsync_directory(path: Path) -> None:
-    """Durably publish directory metadata where the platform supports it."""
-    try:
-        descriptor = os.open(path, os.O_RDONLY)
-    except OSError:
-        return
+    """Durably publish directory metadata or fail closed."""
+    descriptor = os.open(path, os.O_RDONLY)
     try:
         os.fsync(descriptor)
-    except OSError:
-        pass
     finally:
         os.close(descriptor)
 

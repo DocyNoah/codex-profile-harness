@@ -252,7 +252,7 @@ def _ensure_durable_directory(root: Path, path: Path) -> Path:
                 raise CurationError(f"expected harness directory: {child}")
         else:
             child.mkdir()
-            fsync_directory(current)
+        fsync_directory(current)
         current = child
     return candidate
 

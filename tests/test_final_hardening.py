@@ -658,6 +658,108 @@ class FinalHardeningTests(unittest.TestCase):
             self.assertEqual([], claim_calls)
             self.assertTrue((root / ".harness/memory/inbox/one.json").is_file())
 
+    def test_directory_fsync_syscall_errors_propagate_and_prevent_claim_move(self) -> None:
+        import profile_harness.fs as fs_module
+
+        with mock.patch.object(fs_module.os, "open", side_effect=OSError("open failed")):
+            with self.assertRaisesRegex(OSError, "open failed"):
+                fs_module.fsync_directory(Path("/unused"))
+
+        with (
+            mock.patch.object(fs_module.os, "open", return_value=91),
+            mock.patch.object(fs_module.os, "fsync", side_effect=OSError("fsync failed")),
+            mock.patch.object(fs_module.os, "close") as close,
+        ):
+            with self.assertRaisesRegex(OSError, "fsync failed"):
+                fs_module.fsync_directory(Path("/unused"))
+            close.assert_called_once_with(91)
+
+        for syscall in ("open", "fsync"):
+            with self.subTest(syscall=syscall), tempfile.TemporaryDirectory() as temporary_directory:
+                root, _ = self.make_profile(Path(temporary_directory))
+                self.add_receipt(root, "one")
+                processing = (root / ".harness/memory/processing").resolve()
+                real_open = fs_module.os.open
+                real_fsync = fs_module.os.fsync
+                directory_fds: set[int] = set()
+                failed = False
+
+                def open_path(path: object, flags: int, *args: object, **kwargs: object) -> int:
+                    nonlocal failed
+                    if Path(path).resolve() == processing and syscall == "open" and not failed:
+                        failed = True
+                        raise OSError("injected os.open failure")
+                    descriptor = real_open(path, flags, *args, **kwargs)
+                    if Path(path).resolve() == processing:
+                        directory_fds.add(descriptor)
+                    return descriptor
+
+                def fsync_descriptor(descriptor: int) -> None:
+                    nonlocal failed
+                    if descriptor in directory_fds and syscall == "fsync" and not failed:
+                        failed = True
+                        raise OSError("injected os.fsync failure")
+                    real_fsync(descriptor)
+
+                with (
+                    mock.patch.object(fs_module.os, "open", side_effect=open_path),
+                    mock.patch.object(fs_module.os, "fsync", side_effect=fsync_descriptor),
+                    mock.patch.object(curation_module, "_durable_replace", wraps=curation_module._durable_replace) as replace,
+                    self.assertRaisesRegex(OSError, f"os.{syscall} failure"),
+                ):
+                    prepare_curation(root)
+
+                self.assertFalse(any(
+                    call.args[0].parent == (root / ".harness/memory/inbox").resolve()
+                    for call in replace.call_args_list
+                ))
+                self.assertTrue((root / ".harness/memory/inbox/one.json").is_file())
+
+    def test_retry_fsyncs_parent_of_preexisting_unconfirmed_batch_before_claim(self) -> None:
+        import profile_harness.fs as fs_module
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root, _ = self.make_profile(Path(temporary_directory))
+            self.add_receipt(root, "one")
+            batch_id = "20260911T010203123456Z-123456789abc"
+            batch_path = root / ".harness/memory/processing" / batch_id
+            batch_path.mkdir()
+            real_open = fs_module.os.open
+            real_fsync = fs_module.os.fsync
+            opened: dict[int, Path] = {}
+            events: list[tuple[str, Path]] = []
+
+            def open_path(path: object, flags: int, *args: object, **kwargs: object) -> int:
+                descriptor = real_open(path, flags, *args, **kwargs)
+                opened[descriptor] = Path(path).resolve()
+                return descriptor
+
+            def fsync_descriptor(descriptor: int) -> None:
+                if descriptor in opened:
+                    events.append(("fsync", opened[descriptor]))
+                real_fsync(descriptor)
+
+            real_replace = curation_module._durable_replace
+
+            def replace(source: Path, destination: Path) -> None:
+                if source.parent == (root / ".harness/memory/inbox").resolve():
+                    events.append(("claim", destination.parent.resolve()))
+                real_replace(source, destination)
+
+            with (
+                mock.patch.object(curation_module, "_batch_id", return_value=batch_id),
+                mock.patch.object(fs_module.os, "open", side_effect=open_path),
+                mock.patch.object(fs_module.os, "fsync", side_effect=fsync_descriptor),
+                mock.patch.object(curation_module, "_durable_replace", side_effect=replace),
+            ):
+                prepare_curation(root)
+
+            processing = (root / ".harness/memory/processing").resolve()
+            self.assertLess(
+                events.index(("fsync", processing)),
+                events.index(("claim", batch_path.resolve())),
+            )
+
     def test_orphan_return_recovery_is_idempotent_and_same_digest_duplicate_is_safe(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root, _ = self.make_profile(Path(temporary_directory))
