@@ -233,6 +233,30 @@ def _ensure_dir(root: Path, relative: str) -> Path:
         raise CurationError(str(error)) from error
 
 
+def _ensure_durable_directory(root: Path, path: Path) -> Path:
+    """Create each missing directory and durably publish its parent entry."""
+    profile_root = Path(root).absolute()
+    candidate = Path(path).absolute()
+    try:
+        relative = candidate.relative_to(profile_root)
+        require_safe_path(profile_root, candidate, directory=True)
+    except ValueError as error:
+        raise CurationError(str(error)) from error
+    current = profile_root
+    for component in relative.parts:
+        child = current / component
+        if child.is_symlink():
+            raise CurationError(f"symlink is not allowed in harness path: {child}")
+        if child.exists():
+            if not child.is_dir():
+                raise CurationError(f"expected harness directory: {child}")
+        else:
+            child.mkdir()
+            fsync_directory(current)
+        current = child
+    return candidate
+
+
 def _durable_replace(source: Path, destination: Path) -> None:
     os.replace(source, destination)
     fsync_directory(source.parent)
@@ -282,7 +306,7 @@ def _batch_id() -> str:
 
 
 def _preparation_path(root: Path, batch_id: str) -> Path:
-    directory = _ensure_dir(root, ".harness/state/preparations")
+    directory = _ensure_durable_directory(root, root / ".harness/state/preparations")
     return directory / f"{batch_id}.json"
 
 
@@ -333,7 +357,7 @@ def claim_receipts(
     if crash_after_stage == "after_claim_manifest":
         os._exit(91)
     try:
-        ensure_safe_directory(profile_root, batch_path)
+        _ensure_durable_directory(profile_root, batch_path)
         atomic_write_text(
             batch_path / "batch.json",
             json.dumps(manifest, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
@@ -1221,8 +1245,10 @@ def recover_transactions(root: Path, *, checkpoint: bool = True) -> tuple[str, .
     for transaction_path in transaction_paths:
         transaction = _strict_json(transaction_path)
         transaction = _validate_transaction(profile_root, transaction_path, transaction)
-        preparation_path = (
-            profile_root / ".harness/state/preparations" / f"{transaction['batch_id']}.json"
+        preparation_path = _transaction_member(
+            profile_root,
+            f".harness/state/preparations/{transaction['batch_id']}.json",
+            directory=False,
         )
         if preparation_path.exists():
             preparation = _strict_json(preparation_path)

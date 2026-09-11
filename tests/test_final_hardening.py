@@ -589,6 +589,75 @@ class FinalHardeningTests(unittest.TestCase):
                 self.assertFalse(list((root / ".harness/memory/processing").iterdir()))
                 self.assertFalse(list((root / ".harness/state/preparations").glob("*.json")))
 
+    def test_preparation_and_batch_directory_fsyncs_precede_first_claim_move(self) -> None:
+        import profile_harness.fs as fs_module
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root, _ = self.make_profile(Path(temporary_directory))
+            self.add_receipt(root, "one")
+            events: list[tuple[str, Path]] = []
+            real_curation_fsync = curation_module.fsync_directory
+            real_fs_fsync = fs_module.fsync_directory
+            real_replace = curation_module._durable_replace
+
+            def curation_fsync(path: Path) -> None:
+                events.append(("fsync", Path(path).resolve()))
+                real_curation_fsync(path)
+
+            def fs_fsync(path: Path) -> None:
+                events.append(("fsync", Path(path).resolve()))
+                real_fs_fsync(path)
+
+            def replace(source: Path, destination: Path) -> None:
+                if source.parent == (root / ".harness/memory/inbox").resolve():
+                    events.append(("claim", destination.parent.resolve()))
+                real_replace(source, destination)
+
+            with (
+                mock.patch.object(curation_module, "fsync_directory", side_effect=curation_fsync),
+                mock.patch.object(fs_module, "fsync_directory", side_effect=fs_fsync),
+                mock.patch.object(curation_module, "_durable_replace", side_effect=replace),
+            ):
+                batch = prepare_curation(root)
+
+            claim_index = events.index(("claim", batch.path.resolve()))
+            for required in (
+                (root / ".harness/state").resolve(),
+                (root / ".harness/state/preparations").resolve(),
+                (root / ".harness/memory/processing").resolve(),
+                batch.path.resolve(),
+            ):
+                self.assertLess(events.index(("fsync", required)), claim_index)
+
+    def test_failed_batch_parent_fsync_prevents_first_claim_move(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root, _ = self.make_profile(Path(temporary_directory))
+            self.add_receipt(root, "one")
+            processing = (root / ".harness/memory/processing").resolve()
+            real_fsync = curation_module.fsync_directory
+            failed = False
+
+            def fail_once(path: Path) -> None:
+                nonlocal failed
+                if Path(path).resolve() == processing and not failed:
+                    failed = True
+                    raise OSError("injected batch parent fsync failure")
+                real_fsync(path)
+
+            with (
+                mock.patch.object(curation_module, "fsync_directory", side_effect=fail_once),
+                mock.patch.object(curation_module, "_durable_replace", wraps=curation_module._durable_replace) as replace,
+                self.assertRaisesRegex(OSError, "batch parent fsync"),
+            ):
+                prepare_curation(root)
+
+            claim_calls = [
+                call for call in replace.call_args_list
+                if call.args[0].parent == (root / ".harness/memory/inbox").resolve()
+            ]
+            self.assertEqual([], claim_calls)
+            self.assertTrue((root / ".harness/memory/inbox/one.json").is_file())
+
     def test_orphan_return_recovery_is_idempotent_and_same_digest_duplicate_is_safe(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root, _ = self.make_profile(Path(temporary_directory))
@@ -646,6 +715,42 @@ class FinalHardeningTests(unittest.TestCase):
             self.assertEqual((batch.batch_id,), recover_transactions(root, checkpoint=False))
             self.assertTrue((root / ".harness/memory/inbox/one.json").is_file())
             self.assertFalse((root / ".harness/state/preparations" / f"{batch.batch_id}.json").exists())
+
+    def test_apply_wal_handoff_rejects_dangling_preparation_symlinks_without_mutation(self) -> None:
+        for kind in ("descriptor", "parent"):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as temporary_directory:
+                root, _ = self.make_profile(Path(temporary_directory))
+                self.add_receipt(root, "one")
+                batch = prepare_curation(root)
+                self._crash_apply(
+                    root,
+                    batch.batch_id,
+                    {
+                        "type": "profile_memory", "kind": "semantic", "title": "Owned",
+                        "content": "body", "source_receipt_ids": ["one"],
+                    },
+                    "after_transaction_publish",
+                )
+                preparation_dir = root / ".harness/state/preparations"
+                descriptor = preparation_dir / f"{batch.batch_id}.json"
+                if kind == "descriptor":
+                    descriptor.unlink()
+                    descriptor.symlink_to(root / "missing-preparation.json")
+                else:
+                    descriptor.unlink()
+                    preparation_dir.rmdir()
+                    preparation_dir.symlink_to(root / "missing-preparations")
+                transaction = root / ".harness/state/transactions" / f"{batch.batch_id}.json"
+                receipt = batch.path / "one.json"
+                before = {transaction: transaction.read_bytes(), receipt: receipt.read_bytes()}
+
+                with self.assertRaises(CurationError):
+                    recover_transactions(root, checkpoint=False)
+
+                self.assertEqual(before, {path: path.read_bytes() for path in before})
+                self.assertTrue(
+                    descriptor.is_symlink() if kind == "descriptor" else preparation_dir.is_symlink()
+                )
 
     def test_tampered_orphan_preparation_fails_closed_and_doctor_reports_it(self) -> None:
         for mutation in ("digest", "unexpected", "symlink", "different_duplicate"):
