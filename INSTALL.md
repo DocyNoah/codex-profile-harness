@@ -7,6 +7,11 @@ Recommended: ask a local Codex agent to install this release after reading
 previews every affected path, selects the native scheduler, and verifies the
 result. This document remains the shorter manual reference.
 
+The marketplace registration, plugin selector, and executable link form one
+**global shared installation**. Each profile has a separate **per-profile
+attachment**: its profile data, scheduler, and profile-identified Harness
+Control task/heartbeat. Attaching another profile reuses the shared installation.
+
 From a cloned or extracted release, inspect `hooks/hooks.json`, preview the
 bounded plugin/CLI operation, then install:
 
@@ -164,17 +169,24 @@ profile-harness doctor
 
 ## Upgrade
 
-Pause scheduling and run `python3 scripts/install.py` from the newer release.
-The old marketplace is retained as `.previous.TIMESTAMP`. Open a new Codex task,
-reinspect the installed hook, run `profile-harness doctor --check-codex`, and keep
-the backup until verification succeeds. Profiles are outside the install tree and
-are untouched.
+This is a global upgrade because every attached profile uses the same executable.
+Inventory all attached profiles, all schedulers, and all Harness Control tasks
+and heartbeats. Save the profile inventory and exact scheduler backup mapping in
+a private `0700` backup directory with files mode `0600`. Pause every scheduler
+and heartbeat and verify every item is inactive. If discovery or verification is
+ambiguous, fail closed and do not mutate the shared installation.
+
+Then run `python3 scripts/install.py` from the newer release. The old marketplace
+is retained as `.previous.TIMESTAMP`. Reinspect the hook and verify every profile
+and scheduler before resuming every item that was previously active. Verify every
+resumed item. Profiles are outside the install tree and remain untouched.
 
 ## Completed-upgrade rollback
 
-Pause the exact profile scheduler and set these variables to inspected,
-canonical paths. `MARKETPLACE_BACKUP` is the `.previous.TIMESTAMP` tree retained
-by the successful upgrade.
+Pause every inventoried scheduler and Harness Control heartbeat, verify every
+one, and set these variables to inspected canonical paths.
+`MARKETPLACE_BACKUP` is the `.previous.TIMESTAMP` tree retained by the successful
+upgrade.
 
 ```sh
 MARKETPLACE_ROOT='/canonical/codex-profile-harness-marketplace'
@@ -194,18 +206,30 @@ codex plugin marketplace add "$MARKETPLACE_ROOT"
 codex plugin add "$PLUGIN_SELECTOR"
 ```
 
-Restore the scheduler artifact from its recorded backup mapping, then run
-`doctor --scheduler-artifact`, inspect its active launchd/systemd/cron state, and
-run one explicit `maintain --profile`. Resume only when every check succeeds.
+Restore every scheduler artifact from its recorded backup mapping, then run
+`doctor --scheduler-artifact` and one explicit `maintain --profile` for every
+profile. Resume every scheduler and Control heartbeat that was previously active
+only when all checks succeed, and verify every resumed item.
 The stable executable link still targets the same path inside
 `MARKETPLACE_ROOT`; verify that exact resolution before use. See
 `INSTALL_AGENT.md` for exact platform rollback commands.
 
 ## Uninstall
 
-Pause/remove only the profile-specific LaunchAgent, systemd user units, or cron
-block, and remove the dedicated Harness Control heartbeat/task after verifying
-its identity. Then unregister the plugin and marketplace:
+Default uninstall means **profile detach**. Pause and remove only the selected
+profile's LaunchAgent, systemd user units, or exact cron block, then remove only
+its profile-identified Harness Control heartbeat/task. Verify both are gone.
+Preserve the profile data and keep the shared installation: do not unregister
+the plugin/marketplace or remove `BIN_LINK`.
+
+A **global uninstall** is separate and must be explicitly requested. Inventory
+all attached profiles, all schedulers, and all Harness Control tasks/heartbeats.
+If another profile remains or the inventory is unclear, fail closed, do not
+mutate the shared installation, and require explicit user confirmation of the
+complete inventory and detach plan. Pause every automation, verify every item,
+record every scheduler backup mapping and Control identity/state, detach all
+confirmed profiles, and verify that no attachment remains. Only then
+unregister the shared plugin and marketplace:
 
 ```sh
 PLUGIN_SELECTOR='codex-profile-harness@codex-profile-harness-local'
@@ -217,7 +241,18 @@ rm -- "$BIN_LINK"
 ```
 
 Remove `BIN_LINK` only after proving it is a symlink whose resolved target is the
-installed Harness executable.
+installed Harness executable. If global removal fails, restore registration in
+this order and resume every previously active attachment:
+
+```sh
+codex plugin marketplace add "$MARKETPLACE_ROOT"
+codex plugin add "$PLUGIN_SELECTOR"
+```
+
+Verify every resumed scheduler and Control heartbeat.
+Restore each removed scheduler from its recorded mapping and recreate each
+removed profile-identified Control task/heartbeat before resuming it; if any
+recovery check fails, leave the remaining items paused and report partial state.
 
 The marketplace and `.previous.*` copies may be removed after inspection. Profile
 directories, nested repositories, evidence, and local history are intentionally

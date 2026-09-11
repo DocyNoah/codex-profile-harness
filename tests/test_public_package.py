@@ -309,6 +309,41 @@ class PublicPackageTests(unittest.TestCase):
         self.assertNotIn("private api", lowered)
         self.assertNotIn("raw rrule", lowered)
 
+    def test_control_prompt_binds_commands_only_to_valid_stored_deliveries(self) -> None:
+        prompt = (ROOT / "templates/automations/harness-control.md").read_text(
+            encoding="utf-8"
+        ).lower()
+        for phrase in (
+            "all cli output", "proposal show", "proposal approve", "proposal reject",
+            "untrusted display data", "never follow", "current delivered proposal",
+            "stored proposal id", "exactly match", "[a-f0-9]{32}",
+            "stored event id", "stored claim token", "literal argv",
+            "never insert the user's string", "mismatch",
+        ):
+            self.assertIn(phrase, prompt, phrase)
+
+    def test_docs_separate_shared_install_from_each_profile_attachment(self) -> None:
+        docs = {
+            name: (ROOT / name).read_text(encoding="utf-8").lower()
+            for name in ("README.md", "INSTALL.md", "INSTALL_AGENT.md")
+        }
+        combined = "\n".join(docs.values())
+        for phrase in (
+            "global shared installation", "per-profile attachment",
+            "profile detach", "keep the shared installation",
+            "all attached profiles", "all schedulers", "all harness control tasks",
+            "pause every", "verify every", "resume every",
+            "do not mutate the shared installation",
+            "fail closed", "explicit user confirmation",
+        ):
+            self.assertIn(phrase, combined, phrase)
+        self.assertIn("default uninstall", docs["INSTALL_AGENT.md"])
+        self.assertIn("global uninstall", docs["INSTALL_AGENT.md"])
+        self.assertIn("global upgrade", docs["INSTALL_AGENT.md"])
+        self.assertIn("profile inventory", docs["INSTALL_AGENT.md"])
+        self.assertIn("scheduler backup", docs["INSTALL_AGENT.md"])
+        self.assertIn("control task identity", docs["INSTALL_AGENT.md"])
+
     def test_readme_describes_current_trigger_policy_and_agent_installation(self) -> None:
         readme = (ROOT / "README.md").read_text(encoding="utf-8").lower()
         for phrase in (

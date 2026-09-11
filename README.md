@@ -31,6 +31,11 @@ The installer builds a fixed allowlist into a local marketplace, installs select
 Start a new Codex task and approve the hook only after inspecting it. See
 [INSTALL.md](INSTALL.md) for dry-run, manual installation, and recovery.
 
+The marketplace, plugin selector, and executable link are one **global shared
+installation**. Each profile adds a **per-profile attachment** consisting of its
+profile data, scheduler, and profile-identified Harness Control task/heartbeat.
+Additional profiles reuse the shared installation.
+
 ## How it works
 
 ```text
@@ -162,7 +167,14 @@ scanner, or guarantee against a hostile local account. Codex hooks and transcrip
 formats can change. Scheduling requires one verified native scheduler or the
 documented cron fallback.
 
-For upgrade and uninstall commands, see [INSTALL.md](INSTALL.md). Uninstalling the
-plugin intentionally preserves profiles and their local history. Released under
+For upgrade and uninstall commands, see [INSTALL.md](INSTALL.md). Default
+uninstall is a profile detach: it removes only that profile's scheduler and
+Control task while keeping its data and the shared installation. A global
+upgrade or global uninstall must inventory all attached profiles, schedulers,
+and Control tasks, pause every item, verify every item, and fail closed without
+mutating the shared installation when inventory is ambiguous. Global removal
+also requires explicit user confirmation if another profile remains. Rollback
+and recovery resume every attachment that was active before the operation.
+Profiles and their local history are preserved. Released under
 the [MIT License](LICENSE); changes are listed in [CHANGELOG.md](CHANGELOG.md),
 and contributions follow [CONTRIBUTING.md](CONTRIBUTING.md).
