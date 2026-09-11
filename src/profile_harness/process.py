@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import signal
 import subprocess
+import sys
 import threading
 import time
 from typing import Mapping, Sequence
@@ -24,11 +25,15 @@ class ProcessOutputLimitError(RuntimeError):
     """A child exceeded the combined stdout/stderr byte budget."""
 
 
-def _group_members(process_group: int) -> tuple[int, ...]:
-    """Return same-user members using the POSIX ps available on macOS/Linux."""
+class ProcessCleanupError(RuntimeError):
+    """The complete process-tree cleanup could not be confirmed in time."""
+
+
+def _group_members(process_group: int) -> tuple[int, ...] | None:
+    """Return same-user PGID members, or None when fallback inspection failed."""
     try:
         completed = subprocess.run(
-            ["ps", "-axo", "pid=,pgid="],
+            ["ps", "-axo", "uid=,pid=,pgid="],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
@@ -36,64 +41,117 @@ def _group_members(process_group: int) -> tuple[int, ...]:
             timeout=0.5,
         )
     except (OSError, subprocess.SubprocessError):
-        return ()
+        return None
+    if completed.returncode != 0 or len(completed.stdout) > 2 * 1024 * 1024:
+        return None
     members: list[int] = []
-    for line in completed.stdout.splitlines()[:100_000]:
+    current_uid = os.geteuid()
+    for line in completed.stdout.splitlines():
         fields = line.split()
-        if len(fields) != 2:
+        if len(fields) != 3:
             continue
         try:
-            pid, group = (int(field) for field in fields)
+            uid, pid, group = (int(field) for field in fields)
         except ValueError:
             continue
-        if group == process_group:
+        if uid == current_uid and group == process_group:
             members.append(pid)
     return tuple(members)
 
 
-def _group_exists(process_group: int) -> bool:
+def _group_exists(process_group: int) -> bool | None:
     try:
         os.killpg(process_group, 0)
     except ProcessLookupError:
         return False
     except PermissionError:
-        return bool(_group_members(process_group))
+        members = _group_members(process_group)
+        return None if members is None else bool(members)
     return True
 
 
-def _signal_group(process_group: int, number: int) -> None:
+def _signal_group(process_group: int, number: int) -> bool:
+    """Signal a PGID, using confirmed same-user membership as fallback."""
     try:
         os.killpg(process_group, number)
+        return True
     except ProcessLookupError:
-        pass
+        return True
     except PermissionError:
-        # Some sandboxed POSIX hosts reject killpg while allowing signals to the
-        # same-user members. PGID matching avoids touching unrelated processes.
-        for pid in _group_members(process_group):
+        members = _group_members(process_group)
+        if members is None:
+            return False
+        for pid in members:
             try:
                 os.kill(pid, number)
-            except (ProcessLookupError, PermissionError):
-                pass
+            except ProcessLookupError:
+                continue
+            except PermissionError:
+                return False
+        return True
+
+
+def _poll_cleanup(
+    process: subprocess.Popen[bytes],
+    process_group: int,
+    deadline: float,
+) -> tuple[bool, bool]:
+    """Poll finite cleanup state: (direct child reaped, process group gone)."""
+    while True:
+        direct_reaped = process.poll() is not None
+        group_state = _group_exists(process_group)
+        if direct_reaped and group_state is False:
+            return True, True
+        if time.monotonic() >= deadline:
+            return direct_reaped, group_state is False
+        time.sleep(min(0.01, max(0.0, deadline - time.monotonic())))
 
 
 def _terminate_group(
     process: subprocess.Popen[bytes],
     *,
     grace_seconds: float,
+    kill_timeout_seconds: float = 1.0,
 ) -> None:
-    """Terminate the fresh session and reap its direct child before returning."""
+    """TERM→KILL, then confirm group disappearance and direct-child reap."""
+    if grace_seconds < 0 or not math.isfinite(grace_seconds):
+        raise ValueError("termination grace must be finite and nonnegative")
+    if kill_timeout_seconds <= 0 or not math.isfinite(kill_timeout_seconds):
+        raise ValueError("kill timeout must be positive and finite")
     process_group = process.pid
-    _signal_group(process_group, signal.SIGTERM)
-    deadline = time.monotonic() + grace_seconds
-    while time.monotonic() < deadline and _group_exists(process_group):
-        time.sleep(0.01)
-    if _group_exists(process_group):
-        _signal_group(process_group, signal.SIGKILL)
+    if not _signal_group(process_group, signal.SIGTERM):
+        raise ProcessCleanupError("could not signal process group with TERM")
+    term_deadline = time.monotonic() + grace_seconds
+    reaped, gone = _poll_cleanup(process, process_group, term_deadline)
+    if reaped and gone:
+        return
+    if not _signal_group(process_group, signal.SIGKILL):
+        raise ProcessCleanupError("could not signal process group with KILL")
+    kill_deadline = time.monotonic() + kill_timeout_seconds
+    reaped, gone = _poll_cleanup(process, process_group, kill_deadline)
+    if not reaped or not gone:
+        states = []
+        if not reaped:
+            states.append("direct child was not reaped")
+        if not gone:
+            states.append("process group disappearance was not confirmed")
+        raise ProcessCleanupError("; ".join(states))
+
+
+def _cleanup_after(
+    process: subprocess.Popen[bytes],
+    primary: BaseException,
+    *,
+    grace_seconds: float,
+) -> None:
     try:
-        process.wait(timeout=max(0.2, grace_seconds))
-    except subprocess.TimeoutExpired:
-        _signal_group(process_group, signal.SIGKILL)
-        process.wait()
+        _terminate_group(process, grace_seconds=grace_seconds)
+    except BaseException as cleanup:
+        raise ProcessCleanupError(
+            "process cleanup failed after "
+            f"{type(primary).__name__}: {primary}; cleanup: "
+            f"{type(cleanup).__name__}: {cleanup}"
+        ) from cleanup
 
 
 def run_bounded_process(
@@ -176,28 +234,45 @@ def run_bounded_process(
 
     workers = readers + ([writer] if writer is not None else [])
     deadline = time.monotonic() + timeout
-    timed_out = False
+    primary: BaseException | None = None
+    returncode: int | None = None
     try:
         try:
             returncode = process.wait(timeout=max(0.0, deadline - time.monotonic()))
         except subprocess.TimeoutExpired:
-            timed_out = True
-            _terminate_group(process, grace_seconds=term_grace_seconds)
-            returncode = process.returncode
+            primary = subprocess.TimeoutExpired(command, timeout)
+        except BaseException as error:
+            primary = error
 
-        # A descendant may still hold inherited pipes after the direct child exits.
-        for worker in workers:
-            worker.join(timeout=max(0.0, deadline - time.monotonic()))
-        if overflow.is_set() or any(worker.is_alive() for worker in workers):
-            if not overflow.is_set():
-                timed_out = True
-            _terminate_group(process, grace_seconds=term_grace_seconds)
-        elif _group_exists(process.pid):
-            _terminate_group(process, grace_seconds=term_grace_seconds)
-            raise RuntimeError("process exited while descendant processes remained")
-    except BaseException:
-        _terminate_group(process, grace_seconds=term_grace_seconds)
-        raise
+        if primary is None:
+            for worker in workers:
+                worker.join(timeout=max(0.0, deadline - time.monotonic()))
+            if overflow.is_set():
+                primary = ProcessOutputLimitError(
+                    f"process output limit exceeded ({max_output_bytes} bytes)"
+                )
+            elif any(worker.is_alive() for worker in workers):
+                primary = subprocess.TimeoutExpired(command, timeout)
+            elif returncode != 0:
+                primary = subprocess.CalledProcessError(int(returncode), command)
+
+        group_state = _group_exists(process.pid)
+        needs_cleanup = (
+            primary is not None
+            or process.poll() is None
+            or group_state is not False
+        )
+        if needs_cleanup:
+            cleanup_primary = primary or ProcessCleanupError(
+                "process exited while descendant cleanup remained"
+            )
+            _cleanup_after(
+                process,
+                cleanup_primary,
+                grace_seconds=term_grace_seconds,
+            )
+            if primary is None:
+                primary = cleanup_primary
     finally:
         for stream in (process.stdin, process.stdout, process.stderr):
             if stream is not None:
@@ -205,25 +280,24 @@ def run_bounded_process(
                     stream.close()
                 except OSError:
                     pass
+        join_deadline = time.monotonic() + 1.0
         for worker in workers:
-            worker.join(timeout=max(0.5, term_grace_seconds))
+            worker.join(timeout=max(0.0, join_deadline - time.monotonic()))
         if any(worker.is_alive() for worker in workers):
-            _terminate_group(process, grace_seconds=0)
-            for worker in workers:
-                worker.join(timeout=1.0)
-            if any(worker.is_alive() for worker in workers):
-                raise RuntimeError("process pipes did not close after tree termination")
-        if process.poll() is None:
-            _terminate_group(process, grace_seconds=term_grace_seconds)
+            active = sys.exc_info()[1]
+            context = active or primary
+            if context is not None:
+                raise ProcessCleanupError(
+                    "process pipe cleanup failed after "
+                    f"{type(context).__name__}: {context}"
+                ) from context
+            raise ProcessCleanupError(
+                "process pipes did not close after confirmed tree cleanup"
+            )
 
-    if timed_out:
-        raise subprocess.TimeoutExpired(command, timeout)
-    if overflow.is_set():
-        raise ProcessOutputLimitError(
-            f"process output limit exceeded ({max_output_bytes} bytes)"
-        )
-    if returncode != 0:
-        raise subprocess.CalledProcessError(returncode, command)
+    if primary is not None:
+        raise primary
+    assert returncode is not None
     stdout = b"".join(chunks["stdout"]).decode("utf-8", errors="replace")
     stderr = b"".join(chunks["stderr"]).decode("utf-8", errors="replace")
     return ProcessResult(returncode, stdout, stderr)

@@ -19,6 +19,7 @@ sys.path.insert(0, str(ROOT / "src"))
 from profile_harness.config import init_profile  # noqa: E402
 from profile_harness.curation import apply_actions, prepare_curation  # noqa: E402
 from profile_harness.locking import ProfileLease  # noqa: E402
+import profile_harness.process as process_module  # noqa: E402
 from profile_harness.runner import run_codex  # noqa: E402
 
 
@@ -65,9 +66,11 @@ class ProcessBoundaryTests(unittest.TestCase):
             prompt = batch.prompt_path
             output = batch.path / "result.json"
             pid_path = profile / "grandchild.pid"
+            group_path = profile / "process-group.pid"
             late_path = profile / "late-write"
             fake = self.make_executable(parent / "fake-codex", f'''
-import subprocess, sys, time
+import os, subprocess, sys, time
+open({str(group_path)!r}, "w").write(str(os.getpid()))
 child = subprocess.Popen([sys.executable, "-c", {("import os,signal,time; "
     "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
     f"open({str(pid_path)!r},'w').write(str(os.getpid())); "
@@ -78,14 +81,21 @@ time.sleep(30)
 
             started = time.monotonic()
             with ProfileLease(profile, stale_timeout=60):
-                with self.assertRaises(subprocess.TimeoutExpired):
+                try:
                     run_codex(profile, prompt, output, command=str(fake), timeout=0.5)
+                except subprocess.TimeoutExpired:
+                    pid = int(pid_path.read_text())
+                    process_group = int(group_path.read_text())
+                    with self.assertRaises(ProcessLookupError):
+                        os.kill(pid, 0)
+                    with self.assertRaises(ProcessLookupError):
+                        os.killpg(process_group, 0)
+                else:
+                    self.fail("runner did not time out")
                 with self.assertRaises(ValueError):
                     apply_actions(profile, batch.batch_id, {"invalid": True})
             self.assertLess(time.monotonic() - started, 3.0)
             self.assertTrue(pid_path.is_file())
-            pid = int(pid_path.read_text())
-            self.assertTrue(wait_pid_gone(pid), f"grandchild {pid} survived timeout")
             self.assertFalse(output.exists())
             self.assertTrue(receipt.is_file())
             self.assertFalse(batch.path.exists())
@@ -109,9 +119,12 @@ time.sleep(30)
             batch = prepare_curation(profile)
             output = batch.path / "result.json"
             pid_path = profile / "interrupt-grandchild.pid"
+            group_path = profile / "interrupt-process-group.pid"
+            cleanup_marker = profile / "cleanup-confirmed-before-rollback"
             late_path = profile / "interrupt-late-write"
             fake = self.make_executable(parent / "fake-codex", f'''
-import subprocess, sys, time
+import os, subprocess, sys, time
+open({str(group_path)!r}, "w").write(str(os.getpid()))
 subprocess.Popen([sys.executable, "-c", {("import os,signal,time; "
     "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
     f"open({str(pid_path)!r},'w').write(str(os.getpid())); "
@@ -129,6 +142,23 @@ time.sleep(30)
                 "with ProfileLease(root, stale_timeout=60):\n"
                 "  try:\n"
                 f"    run_codex(root, Path({str(batch.prompt_path)!r}), Path({str(output)!r}), command={str(fake)!r}, timeout=30)\n"
+                "  except BaseException:\n"
+                f"    pid=int(Path({str(pid_path)!r}).read_text())\n"
+                f"    group=int(Path({str(group_path)!r}).read_text())\n"
+                "    try:\n"
+                "      __import__('os').kill(pid, 0)\n"
+                "    except ProcessLookupError:\n"
+                "      pass\n"
+                "    else:\n"
+                "      raise AssertionError('grandchild survived before rollback')\n"
+                "    try:\n"
+                "      __import__('os').killpg(group, 0)\n"
+                "    except ProcessLookupError:\n"
+                "      pass\n"
+                "    else:\n"
+                "      raise AssertionError('process group survived before rollback')\n"
+                f"    Path({str(cleanup_marker)!r}).write_text('confirmed-before-rollback')\n"
+                "    raise\n"
                 "  finally:\n"
                 f"    apply_actions(root, {batch.batch_id!r}, {{'invalid': True}})\n"
             )
@@ -144,8 +174,7 @@ time.sleep(30)
             worker.send_signal(signal.SIGINT)
             worker.communicate(timeout=5)
             self.assertNotEqual(0, worker.returncode)
-            pid = int(pid_path.read_text())
-            self.assertTrue(wait_pid_gone(pid), f"grandchild {pid} survived interrupt")
+            self.assertEqual("confirmed-before-rollback", cleanup_marker.read_text())
             self.assertTrue(receipt.is_file())
             self.assertFalse(batch.path.exists())
             with ProfileLease(profile, stale_timeout=60):
@@ -153,11 +182,68 @@ time.sleep(30)
             time.sleep(1.1)
             self.assertFalse(late_path.exists())
 
+    def test_cleanup_wait_that_never_reaps_is_bounded_and_explicit(self) -> None:
+        self.assertTrue(
+            hasattr(process_module, "ProcessCleanupError"),
+            "cleanup must expose a dedicated bounded-failure exception",
+        )
+
+        class NeverReaped:
+            pid = 999_999_991
+
+            @staticmethod
+            def poll():
+                return None
+
+        started = time.monotonic()
+        with (
+            mock.patch.object(process_module, "_signal_group", return_value=True),
+            mock.patch.object(process_module, "_group_exists", return_value=False),
+            self.assertRaisesRegex(
+                process_module.ProcessCleanupError, "direct child was not reaped"
+            ),
+        ):
+            process_module._terminate_group(
+                NeverReaped(), grace_seconds=0.01, kill_timeout_seconds=0.05
+            )
+        self.assertLess(time.monotonic() - started, 0.5)
+
+    def test_permission_fallback_selects_only_same_user_group_members(self) -> None:
+        current_uid = os.geteuid()
+        completed = subprocess.CompletedProcess(
+            ["ps"], 0,
+            stdout=(
+                f"{current_uid} 12001 77\n"
+                f"{current_uid + 1} 12002 77\n"
+                f"{current_uid} 12003 88\n"
+            ).encode(),
+            stderr=b"",
+        )
+        with mock.patch.object(
+            process_module.subprocess, "run", return_value=completed
+        ):
+            self.assertEqual((12001,), process_module._group_members(77))
+
+    def test_cleanup_interrupt_preserves_primary_and_cleanup_context(self) -> None:
+        primary = subprocess.TimeoutExpired(["fake-codex"], 0.1)
+        process = mock.Mock()
+        with (
+            mock.patch.object(
+                process_module, "_terminate_group", side_effect=KeyboardInterrupt()
+            ),
+            self.assertRaises(process_module.ProcessCleanupError) as raised,
+        ):
+            process_module._cleanup_after(process, primary, grace_seconds=0.01)
+        self.assertIn("TimeoutExpired", str(raised.exception))
+        self.assertIn("KeyboardInterrupt", str(raised.exception))
+        self.assertIsInstance(raised.exception.__cause__, KeyboardInterrupt)
+
     @unittest.skipUnless(os.name == "posix", "process-group contract is POSIX")
     def test_real_codex_boundary_is_noninteractive_bounded_and_kills_descendants(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             parent = Path(directory)
             pid_path = parent / "grandchild.pid"
+            group_path = parent / "process-group.pid"
             late_path = parent / "late-write"
             mode = parent / "mode"
             flag = parent / "once"
@@ -177,6 +263,7 @@ behavior = open({str(mode)!r}).read() if os.path.exists({str(mode)!r}) else "ok"
 is_add = args[:3] == ["plugin", "marketplace", "add"]
 if behavior == "block" and is_add and not os.path.exists({str(flag)!r}):
   open({str(flag)!r}, "w").write("1")
+  open({str(group_path)!r}, "w").write(str(os.getpid()))
   subprocess.Popen([sys.executable, "-c", {("import os,signal,time; "
       "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
       f"open({str(pid_path)!r},'w').write(str(os.getpid())); "
@@ -211,7 +298,24 @@ elif args[:2] == ["plugin", "list"]:
 
             mode.write_text("block")
             started = time.monotonic()
-            with self.assertRaises(subprocess.TimeoutExpired):
+            real_replace = os.replace
+
+            def replace_with_cleanup_assertion(source, destination):
+                if Path(destination).name == "failed-installation":
+                    pid = int(pid_path.read_text())
+                    process_group = int(group_path.read_text())
+                    with self.assertRaises(ProcessLookupError):
+                        os.kill(pid, 0)
+                    with self.assertRaises(ProcessLookupError):
+                        os.killpg(process_group, 0)
+                return real_replace(source, destination)
+
+            with (
+                mock.patch.object(
+                    module.os, "replace", side_effect=replace_with_cleanup_assertion
+                ),
+                self.assertRaises(subprocess.TimeoutExpired),
+            ):
                 module.install(
                     ROOT, parent / "marketplace", parent / "bin",
                     codex=boundary, timestamp="20260911T160000Z",
