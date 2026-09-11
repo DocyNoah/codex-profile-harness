@@ -137,3 +137,65 @@ boundary was checked against actual read-only `codex plugin ... list --json`
 output; all mutation and compensation paths use stateful injected boundaries in
 tests. The controller must still exclude internal planning/review files from the
 single-root public history.
+
+## Final fix D: bounded descendant process cleanup
+
+Implementation commit: `568cb62226b859f242c4098b066d545e6b2d0735`.
+
+RED evidence:
+
+```text
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_process_boundaries -v
+Ran 3 tests: 3 errors plus one overflow subtest failure
+```
+
+The old runner left timeout descendants outside its direct-child timeout
+contract, and the installer boundary had no injectable timeout/output controls.
+The initial new tests therefore failed on missing constructor controls and the
+old execution path. Two further RED assertions verified that failed installs
+must remove the created binary directory/failed marketplace and that recovery
+errors must expose both primary and compensation failures.
+
+Implemented:
+
+- Added the stdlib-only `profile_harness.process` boundary. Every child starts a
+  fresh POSIX session with prompt bytes on stdin rather than argv, combined
+  stdout/stderr bounds, one elapsed timeout, TERM grace then KILL for the process
+  group, direct-child wait/reap, bounded pipe-thread joins, and cleanup on any
+  interruption.
+- `run_codex` retains the exact read-only sandbox, output schema, model/reasoning,
+  profile cwd, output file, and stdin prompt contracts while using the bounded
+  process-tree boundary.
+- Real tests start a fake Codex parent and SIGTERM-ignoring grandchild. Timeout
+  and actual SIGINT prove the descendant PID disappears before receipt rollback
+  and lease release; a delayed write cannot occur afterward.
+- Installer Codex inspection, registration, and compensation now use `/dev/null`
+  stdin, bounded output/time, descendant cleanup, and a reduced allowlisted
+  environment with prompt/pager controls. Fake CLI tests cover stdin blocking,
+  oversized output, timeout grandchildren, complete filesystem rollback, and a
+  bounded recovery failure that identifies both exception types.
+- Added the process module to the marketplace allowlist and documented the
+  boundary in INSTALL/SECURITY.
+
+Fresh verification:
+
+```text
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest \
+  tests.test_process_boundaries tests.test_public_package -q
+Ran 19 tests — OK
+
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -q
+Ran 209 tests in 59.919s — OK
+
+PYTHONDONTWRITEBYTECODE=1 python3 scripts/validate_release.py
+release validation: ok
+```
+
+Official plugin/skill validators passed through the same temporary YAML shim.
+Compileall plus cache cleanup, `git diff --check`, secret/development-path/
+placeholder scans, cache and `.DS_Store` checks, and large/binary file scans all
+passed for the intended public tree.
+
+Portability: process groups are deliberately POSIX-only, matching the documented
+macOS/Linux support and Python 3.11+ CI. The `ps` fallback is used only where a
+sandbox denies `killpg` but same-user PGID members remain signalable.
