@@ -162,18 +162,25 @@ a later successful checkpoint or explicit command.
 
 ## Installation and operation
 
-The release contains no unbounded install-time network behavior. Installation:
+Installation is deliberately agent-assisted rather than a universal one-click
+installer. The release ships `INSTALL_AGENT.md`, a shorter manual guide, exact
+platform templates, and verification commands. A local Codex agent reads that
+contract, inspects the actual machine, previews the affected paths, and then:
 
-1. builds and installs the allowlisted local Codex plugin and CLI;
+1. installs the allowlisted local Codex plugin and CLI with the existing bounded
+   installer or documented manual commands;
 2. initializes or upgrades a profile without replacing user-owned files;
-3. installs a per-profile LaunchAgent or user systemd timer only after an
-   explicit install command;
-4. prints a Codex setup prompt for creating `Harness Control` and its recurring
-   automation in the app;
-5. optionally configures automatic push after validating a single upstream.
+3. fills and installs the macOS LaunchAgent or Linux user-systemd template, using
+   the documented cron template only when user systemd is unavailable;
+4. creates one `Harness Control` task and recurring heartbeat in the Codex app
+   from the supplied prompt, without private app APIs;
+5. optionally configures automatic push only after the privacy acknowledgement
+   and exact-upstream checks.
 
-`scheduler status`, `control status`, `doctor`, and `dashboard` expose each
-layer. Removing the scheduler or plugin preserves profile data and Git history.
+The package does not promise to mutate every scheduler implementation correctly
+from a single script. Instead, `doctor`, `control status`, scheduler inspection
+commands in the guide, and an end-to-end smoke test define completion. Upgrade,
+uninstall, rollback, and recovery steps preserve profile data and Git history.
 
 ## Failure behavior
 
@@ -193,10 +200,10 @@ layer. Removing the scheduler or plugin preserves profile data and Git history.
 ## Release acceptance
 
 A release is ready only when all unit and integration tests pass from a clean
-checkout, release validation succeeds, scheduler artifacts validate on their
-supported platforms or parsers, a disposable profile completes capture through
-proposal polling and approval application, and documentation describes both the
-OS scheduler and the one-time Codex application setup without claiming private
-API automation. The release builder emits a reproducible versioned archive and
-SHA-256 checksum; tag CI validates a clean extracted archive on macOS and Linux
-before attaching it to a GitHub Release.
+checkout, release validation succeeds, scheduler templates and agent-run
+instructions validate, a disposable profile completes capture through proposal
+polling and approval application, and documentation describes install, verify,
+upgrade, rollback, and uninstall without claiming universal one-click support or
+private API automation. The release builder emits a reproducible versioned
+archive and SHA-256 checksum; tag CI validates a clean extracted archive on
+macOS and Linux before attaching it to a GitHub Release.
