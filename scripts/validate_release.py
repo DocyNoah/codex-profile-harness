@@ -172,6 +172,10 @@ def validate_release_workflow(path: Path) -> None:
     require("$GITHUB_REF_NAME" in publish, "release publication must bind the triggering tag")
     require("--verify-tag" in publish, "release publication must verify the tag")
     require(
+        '--repo "$GITHUB_REPOSITORY"' in publish,
+        "release publication must bind explicit repository context",
+    )
+    require(
         'archive="dist/codex-profile-harness-${version}.tar.gz"' in publish
         and 'checksum="${archive}.sha256"' in publish,
         "release publication must name the exact versioned assets",
@@ -181,7 +185,7 @@ def validate_release_workflow(path: Path) -> None:
 def validate_source() -> None:
     manifest = validate_manifest(ROOT / ".codex-plugin/plugin.json")
     require(manifest.get("name") == "codex-profile-harness", "invalid plugin name")
-    require(manifest.get("version") == "0.3.2", "invalid plugin version")
+    require(manifest.get("version") == "0.3.3", "invalid plugin version")
     skill = validate_skill(ROOT / "skills/profile-harness/SKILL.md")
     require(skill["name"] == "profile-harness", "invalid skill name")
     validate_release_workflow(ROOT / ".github/workflows/release.yml")

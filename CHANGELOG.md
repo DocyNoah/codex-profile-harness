@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.3.3 - 2026-09-11
+
+- Bind GitHub CLI publication to the workflow repository explicitly so release
+  tag verification works in the checkout-free, least-privilege publish job.
+
 ## 0.3.2 - 2026-09-11
 
 - Serialize concurrent profile Git checkpoints on macOS by allowing bounded

@@ -93,7 +93,7 @@ class PublicPackageTests(unittest.TestCase):
 
     def test_release_metadata_and_selector_are_consistent(self) -> None:
         manifest = json.loads((ROOT / ".codex-plugin/plugin.json").read_text())
-        self.assertEqual("0.3.2", manifest["version"])
+        self.assertEqual("0.3.3", manifest["version"])
         self.assertEqual("codex-profile-harness", manifest["name"])
         self.assertIn("MIT License", (ROOT / "LICENSE").read_text())
         self.assertIn(
@@ -117,7 +117,7 @@ class PublicPackageTests(unittest.TestCase):
             first, first_checksum = build_release_archive(ROOT, output / "one")
             second, second_checksum = build_release_archive(ROOT, output / "two")
 
-            self.assertEqual("codex-profile-harness-0.3.2.tar.gz", first.name)
+            self.assertEqual("codex-profile-harness-0.3.3.tar.gz", first.name)
             self.assertEqual(first.read_bytes(), second.read_bytes())
             self.assertEqual(first_checksum.read_text(), second_checksum.read_text())
             self.assertEqual(
@@ -131,14 +131,14 @@ class PublicPackageTests(unittest.TestCase):
                 members = archive.getmembers()
                 self.assertTrue(members)
                 self.assertTrue(all(
-                    member.name == "codex-profile-harness-0.3.2"
-                    or member.name.startswith("codex-profile-harness-0.3.2/")
+                    member.name == "codex-profile-harness-0.3.3"
+                    or member.name.startswith("codex-profile-harness-0.3.3/")
                     for member in members
                 ))
                 self.assertTrue(all(member.uid == member.gid == 0 for member in members))
                 self.assertTrue(all(member.mtime == 0 for member in members))
                 archive.extractall(extracted, filter="data")
-            release_root = extracted / "codex-profile-harness-0.3.2"
+            release_root = extracted / "codex-profile-harness-0.3.3"
             validated = subprocess.run(
                 [sys.executable, str(release_root / "scripts/validate_release.py"), str(release_root)],
                 text=True, capture_output=True, check=False,
@@ -209,7 +209,7 @@ class PublicPackageTests(unittest.TestCase):
             output = Path(temporary_directory)
             victim = output / "victim"
             victim.write_text("unchanged", encoding="utf-8")
-            predictable = output / ".codex-profile-harness-0.3.2.tar.gz.tmp"
+            predictable = output / ".codex-profile-harness-0.3.3.tar.gz.tmp"
             predictable.symlink_to(victim)
 
             archive, checksum = build_release_archive(ROOT, output)
@@ -243,6 +243,7 @@ class PublicPackageTests(unittest.TestCase):
         self.assertIn("scripts/build_release.py", release)
         self.assertNotIn("softprops/action-gh-release", release)
         self.assertIn("gh release create", publish)
+        self.assertIn('--repo "$GITHUB_REPOSITORY"', publish)
         self.assertIn("GH_TOKEN: ${{ github.token }}", publish)
         self.assertNotIn("password", release.lower())
         self.assertNotIn("private api", release.lower())
@@ -256,6 +257,12 @@ class PublicPackageTests(unittest.TestCase):
                 validator.validate_release_workflow(unsafe)
             unsafe.write_text(release.replace("gh release create", "uses: vendor/mutable@main #"), encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "GitHub CLI"):
+                validator.validate_release_workflow(unsafe)
+            unsafe.write_text(
+                release.replace(' --repo "$GITHUB_REPOSITORY"', ""),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "repository context"):
                 validator.validate_release_workflow(unsafe)
 
     def test_packaged_agent_policies_match_runtime_modes_and_push_authority(self) -> None:
@@ -283,7 +290,7 @@ class PublicPackageTests(unittest.TestCase):
         ):
             self.assertIn(command, agent)
         for phrase in (
-            "0.3.2", "automatic_apply = false", "approval_required",
+            "0.3.3", "automatic_apply = false", "approval_required",
             "automatic_apply = true", "legacy markdown", "read-only",
             "reproducible", "sha-256", "clean extraction",
         ):

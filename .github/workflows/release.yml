@@ -55,4 +55,4 @@ jobs:
           checksum="${archive}.sha256"
           test -f "$archive"
           test -f "$checksum"
-          gh release create "$GITHUB_REF_NAME" "$archive" "$checksum" --verify-tag --generate-notes
+          gh release create "$GITHUB_REF_NAME" "$archive" "$checksum" --verify-tag --generate-notes --repo "$GITHUB_REPOSITORY"
