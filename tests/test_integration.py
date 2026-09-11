@@ -124,7 +124,8 @@ class EndToEndTests(unittest.TestCase):
                                 "content": "# Status\n\nAPI launch-ready.\n",
                                 "source_receipt_ids": [receipt_ids[0]],
                             },
-                        ]
+                        ],
+                        "signals": [],
                     }
                 ),
                 encoding="utf-8",

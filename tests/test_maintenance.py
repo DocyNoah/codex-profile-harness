@@ -65,7 +65,7 @@ class MaintenanceTests(unittest.TestCase):
             "from profile_harness.curation import apply_actions;"
             f"apply_actions(Path({str(root)!r}),{batch.batch_id!r},"
             f"{{'actions':[{{'type':'profile_proposal','title':{title!r},"
-            "'content':'body','source_receipt_ids':['receipt-00']}]},"
+            "'content':'body','source_receipt_ids':['receipt-00']}],'signals':[]},"
             f"crash_after_stage={stage!r})"
         )
         crashed = subprocess.run([sys.executable, "-c", script], check=False)
@@ -189,7 +189,7 @@ class MaintenanceTests(unittest.TestCase):
                 "#!/usr/bin/env python3\n"
                 "import json, os, pathlib, sys\n"
                 f"pathlib.Path({str(invocation_path)!r}).write_text(json.dumps({{'argv': sys.argv[1:], 'stdin': sys.stdin.read(), 'cwd': os.getcwd(), 'curator': os.environ.get('PROFILE_HARNESS_CURATOR')}}))\n"
-                "pathlib.Path(sys.argv[sys.argv.index('-o') + 1]).write_text('{\"actions\": []}')\n",
+                "pathlib.Path(sys.argv[sys.argv.index('-o') + 1]).write_text('{\"actions\": [], \"signals\": []}')\n",
                 encoding="utf-8",
             )
             fake.chmod(fake.stat().st_mode | stat.S_IXUSR)
@@ -496,7 +496,7 @@ class MaintenanceTests(unittest.TestCase):
                     "from profile_harness.curation import apply_actions;"
                     f"apply_actions(Path({str(root)!r}),{batch.batch_id!r},"
                     f"{{'actions':[{{'type':'profile_proposal','title':{title!r},"
-                    "'content':'body','source_receipt_ids':['receipt-00']}]},"
+                    "'content':'body','source_receipt_ids':['receipt-00']}],'signals':[]},"
                     f"crash_after_stage={stage!r})"
                 )
                 crashed = subprocess.run([sys.executable, "-c", script], check=False)
@@ -619,7 +619,7 @@ class MaintenanceTests(unittest.TestCase):
             fake = parent / "fake-codex"
             fake.write_text(
                 "#!/usr/bin/env python3\nimport pathlib,sys\n"
-                "pathlib.Path(sys.argv[sys.argv.index('-o')+1]).write_text('{\"actions\":[]}')\n",
+                "pathlib.Path(sys.argv[sys.argv.index('-o')+1]).write_text('{\"actions\":[],\"signals\":[]}')\n",
                 encoding="utf-8",
             )
             fake.chmod(fake.stat().st_mode | stat.S_IXUSR)
@@ -718,7 +718,7 @@ class MaintenanceTests(unittest.TestCase):
             fake = parent / "fake-codex"
             fake.write_text(
                 "#!/usr/bin/env python3\nimport pathlib,sys\n"
-                "pathlib.Path(sys.argv[sys.argv.index('-o')+1]).write_text('{\"actions\":[]}')\n",
+                "pathlib.Path(sys.argv[sys.argv.index('-o')+1]).write_text('{\"actions\":[],\"signals\":[]}')\n",
                 encoding="utf-8",
             )
             fake.chmod(fake.stat().st_mode | stat.S_IXUSR)
@@ -782,7 +782,7 @@ class MaintenanceTests(unittest.TestCase):
                 "import json,pathlib,re,sys\n"
                 "prompt=sys.stdin.read(); schema=sys.argv[sys.argv.index('--output-schema')+1]\n"
                 f"with pathlib.Path({str(calls)!r}).open('a') as h: h.write(json.dumps({{'argv':sys.argv[1:]}})+'\\n')\n"
-                "if schema.endswith('curation-result.schema.json'): result={'actions':[]}\n"
+                "if schema.endswith('curation-result.schema.json'): result={'actions':[],'signals':[]}\n"
                 "else:\n"
                 " hashes=re.findall(r'\\\"entry_hash\\\": \\\"([a-f0-9]{64})\\\"',prompt)\n"
                 " result={'proposals':[{'title':'After ten','content':'Review it.','source_journal_hashes':[hashes[-1]]}]}\n"
@@ -823,7 +823,7 @@ class MaintenanceTests(unittest.TestCase):
             fake = parent / "fake-codex"
             fake.write_text(
                 "#!/usr/bin/env python3\nimport pathlib,sys\n"
-                "pathlib.Path(sys.argv[sys.argv.index('-o')+1]).write_text('{\"actions\":[]}')\n",
+                "pathlib.Path(sys.argv[sys.argv.index('-o')+1]).write_text('{\"actions\":[],\"signals\":[]}')\n",
                 encoding="utf-8",
             )
             fake.chmod(fake.stat().st_mode | stat.S_IXUSR)

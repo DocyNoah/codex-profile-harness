@@ -18,15 +18,30 @@ sys.path.insert(0, str(ROOT / "src"))
 from profile_harness.config import init_profile, register_repo  # noqa: E402
 from profile_harness.curation import (  # noqa: E402
     CurationError,
-    apply_actions,
+    apply_actions as _runtime_apply_actions,
     claim_receipts,
     prepare_curation,
-    validate_actions,
+    validate_actions as _runtime_validate_actions,
 )
 from profile_harness.journal import append_entry, verify_journal  # noqa: E402
 from profile_harness.runner import run_codex  # noqa: E402
 from profile_harness.profile_git import CheckpointResult, CURATION_SUBJECT  # noqa: E402
 import profile_harness.profile_git as profile_git_module  # noqa: E402
+
+
+def _curation_result(result: dict) -> dict:
+    return result if "signals" in result else {**result, "signals": []}
+
+
+def apply_actions(*args, **kwargs):
+    positional = list(args)
+    if len(positional) >= 3:
+        positional[2] = _curation_result(positional[2])
+    return _runtime_apply_actions(*positional, **kwargs)
+
+
+def validate_actions(result, *args, **kwargs):
+    return _runtime_validate_actions(_curation_result(result), *args, **kwargs)
 
 
 class CurationTests(unittest.TestCase):
@@ -253,6 +268,18 @@ class CurationTests(unittest.TestCase):
                 {"one", "two"},
                 set(),
             )
+
+    def test_runtime_requires_explicit_signals_for_validation_and_apply(self) -> None:
+        with self.assertRaisesRegex(CurationError, "actions and signals"):
+            _runtime_validate_actions({"actions": []}, {"one"}, set())
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root, _, _ = self.make_profile(Path(temporary_directory))
+            self.add_receipt(root, "one")
+            batch = prepare_curation(root)
+
+            with self.assertRaisesRegex(CurationError, "actions and signals"):
+                _runtime_apply_actions(root, batch.batch_id, {"actions": []})
 
     def test_successful_curation_journal_binds_validated_signals(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -807,7 +834,8 @@ class CurationCliTests(unittest.TestCase):
                                 "content": "# Status\n\nReady.\n",
                                 "source_receipt_ids": ["one"],
                             }
-                        ]
+                        ],
+                        "signals": [],
                     }
                 ),
                 encoding="utf-8",

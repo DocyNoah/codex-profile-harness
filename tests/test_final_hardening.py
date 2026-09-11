@@ -18,10 +18,10 @@ from profile_harness.capture import CaptureError, capture_event  # noqa: E402
 from profile_harness.config import init_profile, register_repo  # noqa: E402
 from profile_harness.curation import (  # noqa: E402
     CurationError,
-    apply_actions,
+    apply_actions as _runtime_apply_actions,
     load_result,
     prepare_curation,
-    validate_actions,
+    validate_actions as _runtime_validate_actions,
     _valid_receipt,
     recover_transactions,
 )
@@ -32,6 +32,21 @@ from profile_harness.locking import LeaseBusyError, ProfileLease  # noqa: E402
 from profile_harness.runner import run_codex  # noqa: E402
 from profile_harness.profile_git import CheckpointResult, RECOVERY_SUBJECT  # noqa: E402
 import profile_harness.profile_git as profile_git_module  # noqa: E402
+
+
+def _curation_result(result: dict) -> dict:
+    return result if "signals" in result else {**result, "signals": []}
+
+
+def apply_actions(*args, **kwargs):
+    positional = list(args)
+    if len(positional) >= 3:
+        positional[2] = _curation_result(positional[2])
+    return _runtime_apply_actions(*positional, **kwargs)
+
+
+def validate_actions(result, *args, **kwargs):
+    return _runtime_validate_actions(_curation_result(result), *args, **kwargs)
 
 
 class FinalHardeningTests(unittest.TestCase):
@@ -155,7 +170,7 @@ class FinalHardeningTests(unittest.TestCase):
                 f"sys.path.insert(0,{str(ROOT / 'src')!r});"
                 "from profile_harness.curation import apply_actions;"
                 f"apply_actions(Path({str(root)!r}),{batch.batch_id!r},"
-                "{'actions':[{'type':'repo_status','repository':'api','content':'# CRASHED','source_receipt_ids':['one']}]},"
+                "{'actions':[{'type':'repo_status','repository':'api','content':'# CRASHED','source_receipt_ids':['one']}],'signals':[]},"
                 "crash_after_stage='after_first_write')"
             )
             crashed = subprocess.run([sys.executable, "-c", script], check=False)
@@ -180,7 +195,7 @@ class FinalHardeningTests(unittest.TestCase):
                     f"sys.path.insert(0,{str(ROOT / 'src')!r});"
                     "from profile_harness.curation import apply_actions;"
                     f"apply_actions(Path({str(root)!r}),{batch.batch_id!r},"
-                    "{'actions':[{'type':'repo_status','repository':'api','content':'# durable','source_receipt_ids':['one']}]},"
+                    "{'actions':[{'type':'repo_status','repository':'api','content':'# durable','source_receipt_ids':['one']}],'signals':[]},"
                     f"crash_after_stage={stage!r})"
                 )
                 crashed = subprocess.run([sys.executable, "-c", script], check=False)
@@ -229,7 +244,7 @@ class FinalHardeningTests(unittest.TestCase):
             fake.write_text(
                 "#!/usr/bin/env python3\nimport os,pathlib,sys\n"
                 f"pathlib.Path({str(marker)!r}).write_text(os.environ.get('PROFILE_HARNESS_CURATOR',''))\n"
-                "pathlib.Path(sys.argv[sys.argv.index('-o')+1]).write_text('{\"actions\":[]}')\n",
+                "pathlib.Path(sys.argv[sys.argv.index('-o')+1]).write_text('{\"actions\":[],\"signals\":[]}')\n",
                 encoding="utf-8",
             )
             fake.chmod(fake.stat().st_mode | stat.S_IXUSR)
@@ -343,16 +358,67 @@ class FinalHardeningTests(unittest.TestCase):
             recover.assert_not_called()
             self.assertIn("actively locked", report.format())
 
-    def _crash_apply(self, root: Path, batch_id: str, action: dict, stage: str) -> None:
+    def _crash_apply(
+        self,
+        root: Path,
+        batch_id: str,
+        action: dict,
+        stage: str,
+        signals: list[dict] | None = None,
+    ) -> None:
+        signals = [] if signals is None else signals
         script = (
             "import sys;from pathlib import Path;"
             f"sys.path.insert(0,{str(ROOT / 'src')!r});"
             "from profile_harness.curation import apply_actions;"
             f"apply_actions(Path({str(root)!r}),{batch_id!r},"
-            f"{{'actions':[{action!r}]}},crash_after_stage={stage!r})"
+            f"{{'actions':[{action!r}],'signals':{signals!r}}},crash_after_stage={stage!r})"
         )
         crashed = subprocess.run([sys.executable, "-c", script], check=False)
         self.assertEqual(91, crashed.returncode)
+
+    def test_committed_recovery_rejects_journal_with_different_valid_signals(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root, _ = self.make_profile(Path(temporary_directory))
+            self.add_receipt(root)
+            batch = prepare_curation(root)
+            original_signal = {
+                "signal_id": "workflow.original",
+                "summary": "Original recurring concern.",
+                "source_receipt_ids": ["one"],
+            }
+            self._crash_apply(
+                root,
+                batch.batch_id,
+                {
+                    "type": "profile_proposal",
+                    "title": "Bound",
+                    "content": "body",
+                    "source_receipt_ids": ["one"],
+                },
+                "after_commit",
+                [original_signal],
+            )
+            journal = root / ".harness/memory/journal/curation.jsonl"
+            entry = json.loads(journal.read_text(encoding="utf-8"))
+            entry["signals"] = [{
+                **original_signal,
+                "signal_id": "workflow.substituted",
+                "summary": "Different but still valid concern.",
+            }]
+            entry.pop("entry_hash")
+            canonical = json.dumps(
+                entry, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+            ).encode("utf-8")
+            entry["entry_hash"] = __import__("hashlib").sha256(canonical).hexdigest()
+            journal.write_text(
+                json.dumps(entry, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+                + "\n",
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(CurationError, "journal binding"):
+                recover_transactions(root, checkpoint=False)
 
     def test_recovery_fsyncs_unlinks_before_deleting_precommit_descriptor(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -913,7 +979,7 @@ class FinalHardeningTests(unittest.TestCase):
             fake = parent / "fake-codex"
             fake.write_text(
                 "#!/usr/bin/env python3\nimport pathlib,sys\n"
-                "sys.stdin.read()\npathlib.Path(sys.argv[sys.argv.index('-o')+1]).write_text('{\"actions\":[]}')\n",
+                "sys.stdin.read()\npathlib.Path(sys.argv[sys.argv.index('-o')+1]).write_text('{\"actions\":[],\"signals\":[]}')\n",
                 encoding="utf-8",
             )
             fake.chmod(fake.stat().st_mode | stat.S_IXUSR)
@@ -957,7 +1023,7 @@ class FinalHardeningTests(unittest.TestCase):
             fake.write_text(
                 "#!/usr/bin/env python3\nimport pathlib,sys\n"
                 "sys.stdin.read()\n"
-                "pathlib.Path(sys.argv[sys.argv.index('-o')+1]).write_text('{\"actions\":[]}')\n",
+                "pathlib.Path(sys.argv[sys.argv.index('-o')+1]).write_text('{\"actions\":[],\"signals\":[]}')\n",
                 encoding="utf-8",
             )
             retried = subprocess.run(command, cwd=root, text=True, capture_output=True, check=False)
@@ -1178,7 +1244,7 @@ class FinalHardeningTests(unittest.TestCase):
                     "import sys;from pathlib import Path;"
                     f"sys.path.insert(0,{str(ROOT / 'src')!r});"
                     "from profile_harness.curation import apply_actions;"
-                    f"apply_actions(Path({str(root)!r}),{batch.batch_id!r},{{'actions':{actions!r}}},"
+                    f"apply_actions(Path({str(root)!r}),{batch.batch_id!r},{{'actions':{actions!r},'signals':[]}},"
                     f"crash_after_stage={stage!r})"
                 )
                 crashed = subprocess.run([sys.executable, "-c", script], check=False)
@@ -1203,6 +1269,8 @@ class FinalHardeningTests(unittest.TestCase):
                 value = json.loads(descriptor.read_text())
                 value["version"] = 1
                 value.pop("batch_files")
+                value.pop("result_digest")
+                value.pop("signals")
                 for target in value["targets"]:
                     target.pop("snapshot_digest", None)
                     target.pop("previous_digest", None)
@@ -1245,6 +1313,8 @@ class FinalHardeningTests(unittest.TestCase):
             value = json.loads(descriptor.read_text())
             value["version"] = 1
             value.pop("batch_files")
+            value.pop("result_digest")
+            value.pop("signals")
             for target in value["targets"]:
                 target.pop("snapshot_digest", None)
                 target.pop("previous_digest", None)

@@ -649,7 +649,7 @@ def validate_actions(
     registered_repositories: set[str],
 ) -> tuple[dict[str, Any], ...]:
     """Validate exact action shapes, evidence provenance, and repository names."""
-    if not isinstance(result, dict) or not set(result) <= {"actions", "signals"} or "actions" not in result:
+    if not isinstance(result, dict) or set(result) != {"actions", "signals"}:
         raise CurationError("result must contain only actions and signals")
     _validate_signals(result.get("signals", []), batch_receipt_ids)
     actions = result["actions"]
@@ -997,6 +997,13 @@ def _journal_entry_binds_transaction(
         and entry.get("archived_receipts") == archived
         and entry.get("target_digests") == target_digests
         and set(entry.get("changed_paths", [])) == set(target_digests)
+        and (
+            transaction.get("version") != 3
+            or (
+                entry.get("result_digest") == transaction.get("result_digest")
+                and entry.get("signals") == transaction.get("signals")
+            )
+        )
     )
 
 
@@ -1013,12 +1020,18 @@ def _validate_transaction(root: Path, transaction_path: Path, transaction: objec
     if (
         not isinstance(transaction, dict)
         or transaction.get("version") not in {1, 2, 3}
-        or set(transaction) != (fields | {"batch_files"} if transaction.get("version") == 3 else fields)
+        or set(transaction) != (
+            fields | {"batch_files", "result_digest", "signals"}
+            if transaction.get("version") == 3
+            else fields
+        )
         or transaction.get("state") not in {"applying", "committed"}
     ):
         raise CurationError(f"invalid transaction descriptor: {transaction_path.name}")
     legacy = transaction["version"] == 1
     self_contained = transaction["version"] == 3
+    if self_contained and not _is_digest(transaction.get("result_digest")):
+        raise CurationError("transaction result digest is invalid")
     batch_id = transaction.get("batch_id")
     if (
         not isinstance(batch_id, str) or _BATCH_ID.fullmatch(batch_id) is None
@@ -1048,6 +1061,7 @@ def _validate_transaction(root: Path, transaction_path: Path, transaction: objec
         if len(derived_ids) != len(set(derived_ids)):
             raise CurationError("transaction archive receipt IDs are not unique")
         receipt_ids = tuple(derived_ids)
+        _validate_signals(transaction.get("signals"), set(receipt_ids))
         batch_files = _validate_remaining_batch_files(batch_path, transaction["batch_files"], receipt_ids)
         if batch_path.exists() and (batch_path / "batch.json").exists():
             manifest_ids, recorded_digests = _transaction_manifest(batch_path, batch_id)
@@ -1413,6 +1427,8 @@ def apply_actions(
 
     try:
         receipt_ids = _read_batch(batch_path)
+        actions = validate_actions(result, set(receipt_ids), set(repositories))
+        signals = _validate_signals(result["signals"], set(receipt_ids))
         ensure_safe_directory(profile.root, snapshot_root)
         journal_snapshot = snapshot_root / "journal.before"
         if journal.exists():
@@ -1433,6 +1449,8 @@ def apply_actions(
             "state": "applying",
             "batch_path": str(batch_path.relative_to(profile.root)),
             "batch_files": _batch_file_digests(batch_path, receipt_ids),
+            "result_digest": _digest(result),
+            "signals": list(signals),
             "targets": [],
             "archives": archives,
             "journal": {
@@ -1467,8 +1485,6 @@ def apply_actions(
                     require_safe_path(profile.root, repository / filename, directory=False)
             except ValueError as error:
                 raise CurationError(str(error)) from error
-        actions = validate_actions(result, set(receipt_ids), set(repositories))
-        signals = _validate_signals(result.get("signals", []), set(receipt_ids))
         for action in actions:
             action_type = action["type"]
             if action_type == "discard":
