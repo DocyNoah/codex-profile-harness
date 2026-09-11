@@ -16,11 +16,17 @@ From a cloned or extracted release, inspect `hooks/hooks.json`, preview the
 bounded plugin/CLI operation, then install:
 
 ```sh
-python3 scripts/install.py --dry-run
-python3 scripts/install.py
+BACKUP_ID='20260911T120000Z-a1b2c3d4'
+python3 scripts/install.py --backup-id "$BACKUP_ID" --dry-run
+python3 scripts/install.py --backup-id "$BACKUP_ID"
 export PATH="$HOME/.local/bin:$PATH"
 profile-harness --help
 ```
+
+Generate `BACKUP_ID` once and reuse it. For an upgrade, preview and execution
+must print/use the same exact `.previous.BACKUP_ID` destination. Unsafe IDs and
+an existing destination fail before mutation. Omitting the option generates a
+safe ID, but the agent-assisted flow always supplies it explicitly.
 
 Persist `$HOME/.local/bin` in the shell `PATH`. The noninteractive installer
 builds a staging marketplace from a fixed file allowlist, moves an existing
@@ -176,10 +182,21 @@ a private `0700` backup directory with files mode `0600`. Pause every scheduler
 and heartbeat and verify every item is inactive. If discovery or verification is
 ambiguous, fail closed and do not mutate the shared installation.
 
-Then run `python3 scripts/install.py` from the newer release. The old marketplace
-is retained as `.previous.TIMESTAMP`. Reinspect the hook and verify every profile
-and scheduler before resuming every item that was previously active. Verify every
-resumed item. Profiles are outside the install tree and remain untouched.
+Before shared mutation, record and reread the exact marketplace and scheduler
+backup mappings. If recording fails, do not run the installer. Then pass the
+same once-generated `BACKUP_ID` to both commands from the newer release:
+
+```sh
+python3 scripts/install.py --backup-id "$BACKUP_ID" --dry-run
+python3 scripts/install.py --backup-id "$BACKUP_ID"
+```
+
+The old marketplace is retained at the identical previewed destination.
+Reinspect the hook and verify every profile and scheduler before resuming every
+item that was previously active. Installer failure restores the prior shared
+tree and registrations. If post-install path/map validation fails, keep all
+automation paused and immediately use the exact reported backup path for the
+completed-upgrade rollback below. Profiles remain untouched.
 
 ## Completed-upgrade rollback
 

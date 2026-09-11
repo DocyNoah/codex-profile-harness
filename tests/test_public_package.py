@@ -401,6 +401,86 @@ class PublicPackageTests(unittest.TestCase):
             self.assertIn("INSTALL_AGENT.md", completed.stdout)
             self.assertIn("does not install a scheduler", completed.stdout)
 
+    def test_explicit_backup_id_binds_preview_and_upgrade_destination(self) -> None:
+        module = self.load_script("profile_harness_installer_bound_backup", "install.py")
+        with tempfile.TemporaryDirectory() as directory:
+            parent = Path(directory)
+            marketplace = parent / "marketplace"
+            bin_home = parent / "bin"
+            build_local_marketplace(ROOT, marketplace)
+            executable = marketplace / "plugins/codex-profile-harness/bin/profile-harness"
+            bin_home.mkdir()
+            (bin_home / "profile-harness").symlink_to(executable)
+            backup_id = "agent-20260911t120000z"
+            expected = parent / f"marketplace.previous.{backup_id}"
+
+            preview = subprocess.run(
+                [
+                    sys.executable, str(ROOT / "scripts/install.py"),
+                    "--marketplace-root", str(marketplace), "--bin-home", str(bin_home),
+                    "--backup-id", backup_id, "--dry-run",
+                ],
+                text=True, capture_output=True, check=False,
+            )
+            self.assertEqual(0, preview.returncode, preview.stderr)
+            self.assertIn(f"Backup destination: {expected}", preview.stdout)
+            self.assertFalse(expected.exists())
+
+            boundary = self.memory_boundary(
+                module, marketplace_source=marketplace, plugin_installed=True
+            )
+            result = module.install(
+                ROOT, marketplace, bin_home, codex=boundary, backup_id=backup_id
+            )
+            self.assertEqual(expected, result.backup_path)
+            self.assertTrue(expected.is_dir())
+
+    def test_backup_id_rejects_unsafe_values_and_collision_before_mutation(self) -> None:
+        module = self.load_script("profile_harness_installer_backup_guard", "install.py")
+        for value in ("", "../escape", "slash/value", "space value", "bad\nvalue", "x" * 65):
+            with self.subTest(value=value), tempfile.TemporaryDirectory() as directory:
+                parent = Path(directory)
+                marketplace = parent / "marketplace"
+                build_local_marketplace(ROOT, marketplace)
+                boundary = self.memory_boundary(
+                    module, marketplace_source=marketplace, plugin_installed=True
+                )
+                with self.assertRaisesRegex(ValueError, "backup ID"):
+                    module.install(
+                        ROOT, marketplace, parent / "bin", codex=boundary,
+                        backup_id=value,
+                    )
+                self.assertTrue(marketplace.is_dir())
+                self.assertEqual([], boundary.commands)
+
+        with tempfile.TemporaryDirectory() as directory:
+            parent = Path(directory)
+            marketplace = parent / "marketplace"
+            build_local_marketplace(ROOT, marketplace)
+            (marketplace / "old-marker").write_text("old")
+            collision = parent / "marketplace.previous.fixed-backup"
+            collision.mkdir()
+            boundary = self.memory_boundary(
+                module, marketplace_source=marketplace, plugin_installed=True
+            )
+            with self.assertRaisesRegex(FileExistsError, "backup already exists"):
+                module.install(
+                    ROOT, marketplace, parent / "bin", codex=boundary,
+                    backup_id="fixed-backup",
+                )
+            self.assertEqual("old", (marketplace / "old-marker").read_text())
+            self.assertEqual([], boundary.commands)
+
+    def test_agent_backup_contract_prepares_mapping_before_shared_mutation(self) -> None:
+        contract = (ROOT / "INSTALL_AGENT.md").read_text(encoding="utf-8").lower()
+        for phrase in (
+            "backup_id", "--backup-id \"$backup_id\"", "same backup destination",
+            "before shared installation mutation", "backup map recording fails",
+            "do not run the installer", "exact backup path reported by the installer",
+            "immediately restore", "collision",
+        ):
+            self.assertIn(phrase, contract, phrase)
+
     def test_installer_uses_injectable_codex_boundary_and_recoverable_upgrade(self) -> None:
         module = self.load_script("profile_harness_installer", "install.py")
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -469,7 +549,7 @@ class PublicPackageTests(unittest.TestCase):
                     marketplace,
                     bin_home,
                     codex=boundary,
-                    timestamp="20260911T130000Z",
+                    backup_id="failed-upgrade",
                 )
             self.assertEqual("old", (marketplace / "old-marker").read_text())
             self.assertEqual(
@@ -477,7 +557,7 @@ class PublicPackageTests(unittest.TestCase):
                 executable.resolve(),
             )
             self.assertTrue(boundary.plugin_installed)
-            self.assertFalse((parent / "marketplace.failed.20260911T130000Z").exists())
+            self.assertFalse((parent / "marketplace.previous.failed-upgrade").exists())
 
     def test_new_install_failure_restores_files_and_codex_state(self) -> None:
         module = self.load_script("profile_harness_installer_new_failure", "install.py")

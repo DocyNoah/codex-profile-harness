@@ -35,6 +35,9 @@ The marketplace, plugin selector, and executable link are one **global shared
 installation**. Each profile adds a **per-profile attachment** consisting of its
 profile data, scheduler, and profile-identified Harness Control task/heartbeat.
 Additional profiles reuse the shared installation.
+Agent-assisted upgrades generate one safe backup ID and pass the same
+`--backup-id` to preview and execution, binding both to one collision-checked
+backup destination before shared state changes.
 
 ## How it works
 

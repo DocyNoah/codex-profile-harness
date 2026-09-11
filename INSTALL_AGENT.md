@@ -44,15 +44,16 @@ RELEASE_ROOT='/canonical/release/root'
 USER_HOME='/canonical/current-user-home'
 PROFILE_ROOT='/canonical/profile/root'
 PROFILE_NAME='Work'
+BACKUP_ID='20260911T120000Z-a1b2c3d4'
 MARKETPLACE_ROOT='/canonical/codex-profile-harness-marketplace'
-MARKETPLACE_BACKUP='/canonical/codex-profile-harness-marketplace.previous.TIMESTAMP'
+MARKETPLACE_BACKUP='/canonical/codex-profile-harness-marketplace.previous.20260911T120000Z-a1b2c3d4'
 BIN_LINK='/canonical/bin/profile-harness'
 HARNESS_EXECUTABLE='/canonical/marketplace/plugins/codex-profile-harness/bin/profile-harness'
 PLUGIN_SELECTOR='codex-profile-harness@codex-profile-harness-local'
 MARKETPLACE_NAME='codex-profile-harness-local'
-BACKUP_DIR='/canonical/private/backup/TIMESTAMP'
-INVENTORY_FILE='/canonical/private/backup/TIMESTAMP/profile-inventory.tsv'
-BACKUP_MAP='/canonical/private/backup/TIMESTAMP/path-backups.tsv'
+BACKUP_DIR='/canonical/private/backup/20260911T120000Z-a1b2c3d4'
+INVENTORY_FILE='/canonical/private/backup/20260911T120000Z-a1b2c3d4/profile-inventory.tsv'
+BACKUP_MAP='/canonical/private/backup/20260911T120000Z-a1b2c3d4/path-backups.tsv'
 ```
 
 Derive `PROFILE_ID` exactly as doctor does: lowercase the configured profile
@@ -83,6 +84,12 @@ record every original scheduler path and its unique backup path in `BACKUP_MAP`;
 this is the authoritative scheduler backup mapping. Never derive a rollback
 mapping after the mutation.
 
+Generate `BACKUP_ID` exactly once per operation, then freeze it as the displayed
+literal. It must satisfy the installer's 1-64 character ASCII
+`[A-Za-z0-9][A-Za-z0-9_-]{0,63}` contract. It cannot contain path separators,
+whitespace, dots, or control characters. Derive `MARKETPLACE_BACKUP` exactly as
+`MARKETPLACE_ROOT` plus `.previous.` plus that frozen ID.
+
 ## 2. Preview
 
 Show the user whether the requested scope is global shared installation,
@@ -93,9 +100,12 @@ this is install or upgrade. Show one profile-identified `Harness Control` task u
 `gpt-5.6-luna` / `low` and one control-only 15-minute heartbeat. Run:
 
 ```sh
-python3 "$RELEASE_ROOT/scripts/install.py" --dry-run
+python3 "$RELEASE_ROOT/scripts/install.py" --backup-id "$BACKUP_ID" --dry-run
 ```
 
+Confirm its `Backup ID` is exactly `BACKUP_ID` and its `Backup destination` is
+exactly `MARKETPLACE_BACKUP` for an upgrade. This is the same backup destination
+that the real command must use. A collision or mismatch stops the operation.
 Proceed only within the displayed installation scope.
 
 ## 3. Install shared plugin, then attach the profile
@@ -104,7 +114,7 @@ For a first installation or global upgrade, run the bounded global shared
 plugin/CLI primitive; it never installs a scheduler:
 
 ```sh
-python3 "$RELEASE_ROOT/scripts/install.py"
+python3 "$RELEASE_ROOT/scripts/install.py" --backup-id "$BACKUP_ID"
 ```
 
 If the inspected shared installation is already current, do not run the
@@ -320,6 +330,27 @@ Codex app actions, pause every scheduler and every heartbeat. Verify every one i
 inactive, populate `BACKUP_MAP`, and copy every scheduler artifact to its mapped
 backup. If any item cannot be identified, paused, backed up, or verified, fail
 closed: do not mutate the shared installation.
+
+Before shared installation mutation, write the exact
+`MARKETPLACE_ROOT -> MARKETPLACE_BACKUP` row and every attachment backup row to
+`BACKUP_MAP`, flush it, set mode `0600`, and reread it successfully. If
+backup map recording fails, do not run the installer. Run preview and installation with
+the same frozen ID:
+
+```sh
+python3 "$RELEASE_ROOT/scripts/install.py" --backup-id "$BACKUP_ID" --dry-run
+python3 "$RELEASE_ROOT/scripts/install.py" --backup-id "$BACKUP_ID"
+```
+
+The first command must report the exact backup path recorded in `BACKUP_MAP`.
+The second must report that identical path as `Previous installation retained
+at`. The installer rejects an existing backup-path collision before mutation.
+If installation itself fails, it immediately restores the prior shared tree and
+Codex registrations and does not leave that backup path as a completed backup.
+If post-install output/path validation or any unavoidable post-install backup
+map recording fails, keep all automation paused and immediately restore using
+the exact backup path reported by the installer and the registration rollback
+commands below; never guess or generate a replacement path.
 
 For each inventory row, derive these unique paths and record the applicable
 original-to-backup pairs before copying. The crontab is shared state, so snapshot
