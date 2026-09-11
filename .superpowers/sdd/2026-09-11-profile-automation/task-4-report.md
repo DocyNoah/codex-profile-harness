@@ -199,3 +199,58 @@ passed for the intended public tree.
 Portability: process groups are deliberately POSIX-only, matching the documented
 macOS/Linux support and Python 3.11+ CI. The `ps` fallback is used only where a
 sandbox denies `killpg` but same-user PGID members remain signalable.
+
+## Final fix D round 1: confirmed bounded reap
+
+Implementation commit: `97e33e90c245c2e34ad6496fdfe84f779b49d539`.
+
+RED evidence:
+
+```text
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest \
+  tests.test_process_boundaries.ProcessBoundaryTests.test_cleanup_wait_that_never_reaps_is_bounded_and_explicit -q
+AssertionError: cleanup must expose a dedicated bounded-failure exception
+
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest \
+  tests.test_process_boundaries.ProcessBoundaryTests.test_permission_fallback_selects_only_same_user_group_members -q
+AssertionError: (12001,) != ()
+
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest \
+  tests.test_process_boundaries tests.test_public_package -q
+AssertionError: 'KeyboardInterrupt' not found in cleanup context
+```
+
+Implemented:
+
+- Removed the unbounded post-KILL `wait()`. TERM and KILL phases now have
+  independent monotonic deadlines and poll both nonblocking direct-child reap
+  and process-group disappearance before returning.
+- Added `ProcessCleanupError` for bounded cleanup failures. Cleanup interruptions
+  and pipe cleanup preserve both the primary operation and cleanup context.
+- Permission fallback now parses UID/PID/PGID and signals only same-user members.
+- Timeout and real SIGINT tests assert descendant PID and PGID absence inside the
+  lease, before rollback. The real installer test asserts the same at its first
+  filesystem rollback operation. A never-reaped fake proves bounded failure.
+
+Fresh verification:
+
+```text
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest \
+  tests.test_process_boundaries tests.test_public_package -q
+Ran 22 tests in 9.671s — OK
+
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -q
+Ran 212 tests in 60.470s — OK
+
+PYTHONDONTWRITEBYTECODE=1 python3 scripts/validate_release.py
+release validation: ok
+```
+
+`compileall`, official local plugin/skill validators, `git diff --check`, cache/
+`.DS_Store`/large-file scans, and public-tree development-path/placeholder scans
+also passed. Secret-like matches were limited to intentional redaction fixtures.
+
+Remaining concern: POSIX process groups remain an intentional macOS/Linux-only
+contract. If the OS cannot confirm group state or reap the direct child within
+the finite deadline, the caller receives `ProcessCleanupError`; installer
+rollback then proceeds only after that bounded failure is reported.
