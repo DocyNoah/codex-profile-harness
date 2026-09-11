@@ -54,6 +54,28 @@ def subjects(root: Path) -> list[str]:
     return output
 
 
+def repository_invariants(root: Path) -> dict[str, object]:
+    """Snapshot security-relevant state independent of Git object layout."""
+    git_directory = root / ".git"
+    worktree = {
+        path.relative_to(root): path.read_bytes()
+        for path in root.rglob("*")
+        if path.is_file() and ".git" not in path.relative_to(root).parts
+    }
+    return {
+        "head": git(root, "rev-parse", "HEAD").stdout.strip(),
+        "symbolic_head": git(root, "symbolic-ref", "-q", "HEAD").stdout.strip(),
+        "refs": tuple(sorted(git(root, "show-ref").stdout.splitlines())),
+        "status": git(root, "status", "--porcelain=v1", "-z").stdout,
+        "index": (git_directory / "index").read_bytes(),
+        "config": (git_directory / "config").read_bytes(),
+        "objects": tuple(sorted(git(
+            root, "cat-file", "--batch-all-objects", "--batch-check=%(objectname)"
+        ).stdout.splitlines())),
+        "worktree": worktree,
+    }
+
+
 _FAKE_REMOTES: dict[str, str] = {}
 _FAKE_FAILURES: set[str] = set()
 
@@ -652,10 +674,8 @@ class ProfileGitTests(unittest.TestCase):
             git(external, "add", "external.txt")
             git(external, "-c", "user.name=X", "-c", "user.email=x@x", "commit", "-m", "external")
             external_index = external / ".git/index"
-            before = {
-                path.relative_to(external): path.read_bytes()
-                for path in external.rglob("*") if path.is_file()
-            }
+            before = repository_invariants(external)
+            git(external, "repack", "-ad")
             (profile / "MEMORY.md").write_text("profile only\n", encoding="utf-8")
             hostile = {
                 "GIT_DIR": str(external / ".git"),
@@ -675,10 +695,7 @@ class ProfileGitTests(unittest.TestCase):
                 result = checkpoint_profile(profile, CHECKPOINT_SUBJECT)
 
             self.assertTrue(result.committed, result.error)
-            self.assertEqual(
-                before,
-                {path.relative_to(external): path.read_bytes() for path in external.rglob("*") if path.is_file()},
-            )
+            self.assertEqual(before, repository_invariants(external))
             self.assertEqual("profile only\n", git(profile, "show", "HEAD:MEMORY.md").stdout)
 
     def test_add_and_commit_hooks_signing_filters_and_fsmonitor_never_execute(self) -> None:
