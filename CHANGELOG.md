@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.3.1 - 2026-09-11
+
+- Make the non-fast-forward Git push regression test portable when a clone
+  automatically checks out its default branch, restoring macOS and Ubuntu CI.
+
 ## 0.3.0 - 2026-09-11
 
 - Add versioned improvement manifests, lifecycle auditing, deterministic
