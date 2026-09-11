@@ -57,24 +57,31 @@ profile/                         one Codex project and profile
 - **Curated** data is a model-produced, schema-bounded reconciliation of missed,
   duplicate, or conflicting state. Normal work should update repository
   `STATUS.md` and `TASKS.md` directly and naturally.
-- **Improved** data is a model-produced proposal under
-  `.harness/improvements/proposed/`. It is proposal-only and requires user
-  approval before anything is applied.
+- **Improved** data is a versioned, reviewable proposal under
+  `.harness/improvements/proposed/`. `proposal_only` retains it locally,
+  `approval_required` proactively routes it to Harness Control, and `auto_safe`
+  applies only exact user-allowlisted targets that pass deterministic limits.
 
 The transcript file format and Codex hook payload are host implementation details,
 not guaranteed public APIs. Unsafe or changed formats degrade to safe fallback.
 
 ## Models, schedule, and token use
 
-Run [the cron example](examples/cron.example) every **15 minutes**. Each
-`profile-harness maintain` first performs model-free due checks:
+Agent-assisted installation uses a macOS launchd or Linux user-systemd timer by
+default, with [cron](examples/cron.example) only as a fallback. Every **15
+minutes**, `profile-harness maintain --profile PATH` first performs model-free
+due checks:
 
 - Curation uses `gpt-5.6-sol` at `medium` only when at least **30** valid receipts
   exist or the oldest valid receipt is at least **4 hours** old; at most 30 are
   processed per run.
-- Improvement uses `gpt-6-astra` at `high`. After a **24 hours** minimum cooldown,
-  it runs when there are at least 10 new curations, or after **72 hours** when
-  there are at least 3. It only writes proposals.
+- Improvement uses `gpt-6-astra` at `high`. It requires a **24 hours** cooldown
+  and then runs when either at least **10** new curations exist or the same
+  validated signal appears in **three distinct curations**.
+
+One dedicated `Harness Control` Codex task uses `gpt-5.6-luna` at `low`. Its
+separate 15-minute heartbeat polls the local outbox, stays quiet for `[]`, and
+asks before applying or acknowledging anything.
 
 Empty and not-due runs use no model tokens. Due curation and improvement consume
 Codex model tokens in proportion to bounded evidence and curated state. A new
@@ -98,9 +105,15 @@ model = "gpt-6-astra"
 reasoning_effort = "high"
 cooldown_seconds = 86400
 high_threshold = 10
-low_interval_seconds = 259200
-low_minimum = 3
-automatic_apply = false
+mode = "approval_required" # or proposal_only / auto_safe
+automatic_paths = []       # exact allowlist required by auto_safe
+automatic_max_changed_bytes = 64000
+reminder_seconds = 86400
+
+[git]
+auto_push = false
+private_data_acknowledged = false
+# upstream = "origin/main"
 ```
 
 Unknown, invalid, non-finite, or unsafe configuration values are rejected.
@@ -109,8 +122,12 @@ Unknown, invalid, non-finite, or unsafe configuration values are rejected.
 
 Initialization creates a Git repository for profile-owned documents. The harness
 stages only code-owned managed paths, uses deterministic commit messages, ignores
-runtime evidence and nested `projects/`, and records failures for `doctor`. There
-is **no automatic push** and repository Git histories remain independent.
+runtime evidence and nested `projects/`, and records failures for `doctor`.
+`auto_push` is opt-in only: it requires a privacy acknowledgement and exact
+upstream, then rejects detached or non-fast-forward state, interactive auth,
+unsafe transports/configuration, and force pushes. Repository histories remain
+independent.
+Configuration names one exact upstream as `remote/branch`.
 Each scheduled `maintain` run acquires the profile lease with the built-in safe
 stale timeout and first validates pending checkpoint metadata without running
 Git or recovery. It then recovers abandoned curation/improvement WAL with their
@@ -137,11 +154,13 @@ See [INSTALL.md](INSTALL.md#backup-and-restore).
 Captured text can contain confidential material even after redaction. Evidence and
 backups stay local but must be protected. Transcript reads are contained below
 `CODEX_HOME`, fixed paths reject symlinks, model output has narrow write targets,
-and Git checkpoints never push. See [SECURITY.md](SECURITY.md).
+and Git push remains disabled unless explicitly configured. See
+[SECURITY.md](SECURITY.md).
 
 This is a local harness, not a background service, cloud sync system, secret
 scanner, or guarantee against a hostile local account. Codex hooks and transcript
-formats can change. Scheduling requires cron or an equivalent scheduler.
+formats can change. Scheduling requires one verified native scheduler or the
+documented cron fallback.
 
 For upgrade and uninstall commands, see [INSTALL.md](INSTALL.md). Uninstalling the
 plugin intentionally preserves profiles and their local history. Released under

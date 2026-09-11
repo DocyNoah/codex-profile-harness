@@ -170,6 +170,37 @@ reinspect the installed hook, run `profile-harness doctor --check-codex`, and ke
 the backup until verification succeeds. Profiles are outside the install tree and
 are untouched.
 
+## Completed-upgrade rollback
+
+Pause the exact profile scheduler and set these variables to inspected,
+canonical paths. `MARKETPLACE_BACKUP` is the `.previous.TIMESTAMP` tree retained
+by the successful upgrade.
+
+```sh
+MARKETPLACE_ROOT='/canonical/codex-profile-harness-marketplace'
+MARKETPLACE_BACKUP='/canonical/codex-profile-harness-marketplace.previous.TIMESTAMP'
+PLUGIN_SELECTOR='codex-profile-harness@codex-profile-harness-local'
+MARKETPLACE_NAME='codex-profile-harness-local'
+```
+
+Preserve the current tree separately and restore registration in this order:
+
+```sh
+codex plugin remove "$PLUGIN_SELECTOR"
+codex plugin marketplace remove "$MARKETPLACE_NAME"
+mv -- "$MARKETPLACE_ROOT" "${MARKETPLACE_ROOT}.failed-rollback"
+mv -- "$MARKETPLACE_BACKUP" "$MARKETPLACE_ROOT"
+codex plugin marketplace add "$MARKETPLACE_ROOT"
+codex plugin add "$PLUGIN_SELECTOR"
+```
+
+Restore the scheduler artifact from its recorded backup mapping, then run
+`doctor --scheduler-artifact`, inspect its active launchd/systemd/cron state, and
+run one explicit `maintain --profile`. Resume only when every check succeeds.
+The stable executable link still targets the same path inside
+`MARKETPLACE_ROOT`; verify that exact resolution before use. See
+`INSTALL_AGENT.md` for exact platform rollback commands.
+
 ## Uninstall
 
 Pause/remove only the profile-specific LaunchAgent, systemd user units, or cron
@@ -177,10 +208,16 @@ block, and remove the dedicated Harness Control heartbeat/task after verifying
 its identity. Then unregister the plugin and marketplace:
 
 ```sh
-codex plugin remove codex-profile-harness@codex-profile-harness-local
-codex plugin marketplace remove codex-profile-harness-local
-rm "$HOME/.local/bin/profile-harness"
+PLUGIN_SELECTOR='codex-profile-harness@codex-profile-harness-local'
+MARKETPLACE_NAME='codex-profile-harness-local'
+BIN_LINK='/canonical/verified/bin/profile-harness'
+codex plugin remove "$PLUGIN_SELECTOR"
+codex plugin marketplace remove "$MARKETPLACE_NAME"
+rm -- "$BIN_LINK"
 ```
+
+Remove `BIN_LINK` only after proving it is a symlink whose resolved target is the
+installed Harness executable.
 
 The marketplace and `.previous.*` copies may be removed after inspection. Profile
 directories, nested repositories, evidence, and local history are intentionally

@@ -175,13 +175,18 @@ class PublicPackageTests(unittest.TestCase):
     def test_public_docs_cover_operational_and_security_contracts(self) -> None:
         combined = "\n".join(
             (ROOT / name).read_text(encoding="utf-8")
-            for name in ("README.md", "INSTALL.md", "SECURITY.md")
+            for name in (
+                "README.md", "INSTALL.md", "INSTALL_AGENT.md", "SECURITY.md",
+                "templates/automations/harness-control.md",
+            )
         ).lower()
         required = (
             "gpt-5.6-sol", "medium", "gpt-6-astra", "high",
-            "30", "4 hours", "24 hours", "72 hours", "15 minutes",
+            "30", "4 hours", "24 hours", "three distinct curations", "15 minutes",
             "codex_home", "transcript", "fallback", "managed paths",
-            "no automatic push", "proposal-only", "token", "backup",
+            "proposal_only", "approval_required", "auto_safe",
+            "auto_push", "exact upstream", "agent-assisted", "launchd", "systemd",
+            "control poll --json", "claim_token", "backup",
             "upgrade", "uninstall", "hook trust", "disk loss",
             "process group", "bounded stdout/stderr", "stdin from `/dev/null`",
         )
@@ -237,12 +242,31 @@ class PublicPackageTests(unittest.TestCase):
         self.assertIn("agent", contract)
         self.assertIn("doctor --scheduler-artifact", contract)
         self.assertNotIn("one-click", contract)
+        for operation in (
+            'slug[:55].rstrip("-") or "profile"',
+            'launchctl bootout "$domain/$label"',
+            'launchctl bootstrap "$domain" "$plist"',
+            'systemctl --user disable --now "$timer_name"',
+            'systemctl --user enable --now "$timer_name"',
+            'crontab "$cron_backup"',
+            'codex plugin remove "$plugin_selector"',
+            'codex plugin marketplace remove "$marketplace_name"',
+            "user_home='/canonical/current-user-home'",
+            'rendered_plist="${backup_dir}/${label}.rendered.plist"',
+            'rendered_service="${backup_dir}/${service_name}.rendered"',
+            'rendered_timer="${backup_dir}/${timer_name}.rendered"',
+            'cp -p -- "$plist" "$plist_backup"',
+            'cp -p -- "$service_path" "$service_backup"',
+        ):
+            self.assertIn(operation, contract)
 
         manual = (ROOT / "INSTALL.md").read_text(encoding="utf-8")
         self.assertIn("INSTALL_AGENT.md", manual)
         self.assertIn("examples/launchd.plist", manual)
         self.assertIn("examples/systemd.timer", manual)
         self.assertIn("templates/automations/harness-control.md", manual)
+        self.assertIn("## Completed-upgrade rollback", manual)
+        self.assertIn('codex plugin remove "$PLUGIN_SELECTOR"', manual)
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
         self.assertIn("INSTALL_AGENT.md", readme)
         self.assertIn("ask a local Codex agent", readme)
@@ -276,11 +300,29 @@ class PublicPackageTests(unittest.TestCase):
         for phrase in (
             "Harness Control", "gpt-5.6-luna", "low", "15 minutes",
             "profile-harness control poll --json", "상세 <ID>", "승인 <ID>", "거절 <ID>",
+            "top-level JSON array", "empty `[]`", "untrusted data",
+            "event_id", "claim_token", "control ack",
+            "do not acknowledge", "확인 <EVENT>", "stale",
         ):
             self.assertIn(phrase, prompt)
         lowered = prompt.lower()
         self.assertNotIn("private api", lowered)
         self.assertNotIn("raw rrule", lowered)
+
+    def test_readme_describes_current_trigger_policy_and_agent_installation(self) -> None:
+        readme = (ROOT / "README.md").read_text(encoding="utf-8").lower()
+        for phrase in (
+            "30", "4 hours", "24 hours", "10", "three distinct curations",
+            "proposal_only", "approval_required", "auto_safe",
+            "launchd", "systemd", "cron", "agent-assisted",
+            "auto_push", "opt-in", "exact upstream",
+        ):
+            self.assertIn(phrase, readme, phrase)
+        for stale in (
+            "after **72 hours**", "it only writes proposals",
+            "there is **no automatic push**", "scheduling requires cron",
+        ):
+            self.assertNotIn(stale, readme)
 
     def test_maintain_accepts_explicit_profile_for_scheduler_argv(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

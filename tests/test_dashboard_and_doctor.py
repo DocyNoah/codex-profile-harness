@@ -5,6 +5,7 @@ import copy
 from datetime import datetime, timedelta, timezone
 import hashlib
 import json
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -19,7 +20,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from profile_harness.config import init_profile, register_repo  # noqa: E402
 from profile_harness.dashboard import generate_dashboard  # noqa: E402
-from profile_harness.doctor import diagnose  # noqa: E402
+from profile_harness.doctor import _scheduler_profile_id, diagnose  # noqa: E402
 from profile_harness.locking import ProfileLease  # noqa: E402
 from profile_harness.control import ControlOutbox  # noqa: E402
 
@@ -115,6 +116,18 @@ class DashboardTests(unittest.TestCase):
 
 
 class DoctorTests(unittest.TestCase):
+    def test_scheduler_profile_id_matches_documented_ascii_slug_boundary(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory).resolve() / "profile"
+            init_profile(root, "À__B-" + "X" * 100)
+            digest = hashlib.sha256(str(root).encode("utf-8")).hexdigest()[:8]
+            self.assertEqual("b-" + "x" * 53 + "-" + digest, _scheduler_profile_id(root))
+
+            fallback = root.parent / "fallback"
+            init_profile(fallback, "🔥")
+            fallback_digest = hashlib.sha256(str(fallback).encode("utf-8")).hexdigest()[:8]
+            self.assertEqual("profile-" + fallback_digest, _scheduler_profile_id(fallback))
+
     def test_doctor_validates_installed_launchd_scheduler_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             parent = Path(temporary_directory)
@@ -153,7 +166,7 @@ class DoctorTests(unittest.TestCase):
             rendered = (ROOT / "examples/launchd.plist").read_text(encoding="utf-8")
             rendered = rendered.replace("<integer>900</integer>", "<integer>60</integer>")
             artifact.write_text(rendered, encoding="utf-8")
-            artifact.chmod(0o666)
+            artifact.chmod(0o600)
 
             report = diagnose(root, scheduler_artifacts=(artifact.resolve(),))
 
@@ -161,7 +174,10 @@ class DoctorTests(unittest.TestCase):
             output = report.format().lower()
             self.assertIn("scheduler", output)
             self.assertIn("placeholder", output)
-            self.assertIn("writable", output)
+            artifact.chmod(0o666)
+            mode_report = diagnose(root, scheduler_artifacts=(artifact.resolve(),))
+            self.assertFalse(mode_report.ok)
+            self.assertIn("mode 0600", mode_report.format().lower())
 
     def test_doctor_validates_installed_systemd_pair_and_cron_fallback(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -301,7 +317,7 @@ class DoctorTests(unittest.TestCase):
 
             report = diagnose(root, scheduler_artifacts=tuple(item.resolve() for item in units))
             self.assertFalse(report.ok)
-            self.assertIn("hardening", report.format().lower())
+            self.assertIn("missing required key", report.format().lower())
 
     def test_doctor_rejects_scheduler_variable_expansion(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -320,7 +336,183 @@ class DoctorTests(unittest.TestCase):
             report = diagnose(root, scheduler_artifacts=(artifact.resolve(),))
 
             self.assertFalse(report.ok)
-            self.assertIn("shell interpolation", report.format().lower())
+            self.assertIn("expansion", report.format().lower())
+
+    def test_doctor_requires_exact_scheduler_modes_owner_and_executable(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            parent = Path(temporary_directory).resolve()
+            root = parent / "work"
+            init_profile(root, "Work")
+            executable = parent / "profile-harness"
+            executable.write_text("#!/bin/sh\n", encoding="utf-8")
+            executable.chmod(0o700)
+            profile_id = "work-" + hashlib.sha256(str(root.resolve()).encode()).hexdigest()[:8]
+            cron = (ROOT / "examples/cron.example").read_text(encoding="utf-8")
+            for marker, value in {
+                "__PROFILE_ID__": profile_id,
+                "__PROFILE_ROOT__": str(root.resolve()),
+                "__HARNESS_EXECUTABLE__": str(executable.resolve()),
+            }.items():
+                cron = cron.replace(marker, value)
+            artifact = parent / "installed.crontab"
+            artifact.write_text(cron, encoding="utf-8")
+            artifact.chmod(0o640)
+
+            report = diagnose(root, scheduler_artifacts=(artifact,))
+
+            self.assertFalse(report.ok)
+            output = report.format().lower()
+            self.assertIn("mode 0600", output)
+
+            artifact.chmod(0o600)
+            executable.chmod(0o600)
+            executable_report = diagnose(root, scheduler_artifacts=(artifact,))
+            self.assertFalse(executable_report.ok)
+            self.assertIn("executable bit", executable_report.format().lower())
+
+    def test_doctor_rejects_launchd_extra_keys_and_systemd_extra_commands(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            parent = Path(temporary_directory).resolve()
+            root = parent / "work"
+            init_profile(root, "Work")
+            executable = parent / "profile-harness"
+            executable.write_text("#!/bin/sh\n", encoding="utf-8")
+            executable.chmod(0o700)
+            log_dir = parent / "logs"
+            log_dir.mkdir(mode=0o700)
+            log = log_dir / "work.log"
+            log.write_text("", encoding="utf-8")
+            log.chmod(0o600)
+            profile_id = "work-" + hashlib.sha256(str(root.resolve()).encode()).hexdigest()[:8]
+            values = {
+                "__PROFILE_ID__": profile_id,
+                "__PROFILE_ROOT__": str(root.resolve()),
+                "__HARNESS_EXECUTABLE__": str(executable.resolve()),
+                "__LOG_PATH__": str(log.resolve()),
+            }
+            launchd = (ROOT / "examples/launchd.plist").read_text(encoding="utf-8")
+            for marker, value in values.items():
+                launchd = launchd.replace(marker, value)
+            launchd = launchd.replace("</dict>", "  <key>EnvironmentVariables</key><dict><key>BAD</key><string>1</string></dict>\n</dict>")
+            plist = parent / "bad.plist"
+            plist.write_text(launchd, encoding="utf-8")
+            plist.chmod(0o600)
+            launchd_report = diagnose(root, scheduler_artifacts=(plist,))
+            self.assertFalse(launchd_report.ok)
+            self.assertIn("unknown launchd key", launchd_report.format().lower())
+
+            units = []
+            for source_name, suffix in (("systemd.service", ".service"), ("systemd.timer", ".timer")):
+                content = (ROOT / "examples" / source_name).read_text(encoding="utf-8")
+                for marker, value in values.items():
+                    content = content.replace(marker, value)
+                if suffix == ".service":
+                    content = content.replace("ExecStart=", "ExecStartPre=/usr/bin/true\nEnvironment=BAD=1\nExecStart=")
+                target = parent / f"codex-profile-harness-{profile_id}{suffix}"
+                target.write_text(content, encoding="utf-8")
+                target.chmod(0o600)
+                units.append(target)
+            systemd_report = diagnose(root, scheduler_artifacts=tuple(units))
+            self.assertFalse(systemd_report.ok)
+            self.assertIn("unknown systemd", systemd_report.format().lower())
+
+    def test_doctor_allows_other_cron_jobs_but_rejects_harness_globs(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            parent = Path(temporary_directory).resolve()
+            root = parent / "work"
+            init_profile(root, "Work")
+            executable = parent / "profile-harness"
+            executable.write_text("#!/bin/sh\n", encoding="utf-8")
+            executable.chmod(0o700)
+            profile_id = "work-" + hashlib.sha256(str(root.resolve()).encode()).hexdigest()[:8]
+            cron = (ROOT / "examples/cron.example").read_text(encoding="utf-8")
+            for marker, value in {
+                "__PROFILE_ID__": profile_id,
+                "__PROFILE_ROOT__": str(root.resolve()),
+                "__HARNESS_EXECUTABLE__": str(executable.resolve()),
+            }.items():
+                cron = cron.replace(marker, value)
+            artifact = parent / "installed.crontab"
+            artifact.write_text("0 0 * * * $HOME/unrelated --glob '*'\n" + cron, encoding="utf-8")
+            artifact.chmod(0o600)
+            valid = diagnose(root, scheduler_artifacts=(artifact,))
+            self.assertTrue(valid.ok, valid.format())
+
+            for character in ("*", "?", "[x]", "{x}", "~", "$HOME", ";true", "'quote'"):
+                with self.subTest(character=character):
+                    artifact.write_text(
+                        ("0 0 * * * $HOME/unrelated --glob '*'\n" + cron).replace(
+                            str(executable.resolve()), str(executable.resolve()) + character
+                        ),
+                        encoding="utf-8",
+                    )
+                    invalid = diagnose(root, scheduler_artifacts=(artifact,))
+                    self.assertFalse(invalid.ok)
+                    self.assertIn("metacharacter", invalid.format().lower())
+
+    def test_doctor_rejects_nonexact_log_mode_owner_and_systemd_specifier(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            parent = Path(temporary_directory).resolve()
+            root = parent / "work"
+            init_profile(root, "Work")
+            executable = parent / "profile-harness"
+            executable.write_text("#!/bin/sh\n", encoding="utf-8")
+            executable.chmod(0o700)
+            log_dir = parent / "logs"
+            log_dir.mkdir(mode=0o700)
+            log = log_dir / "work.log"
+            log.write_text("", encoding="utf-8")
+            log.chmod(0o400)
+            profile_id = "work-" + hashlib.sha256(str(root.resolve()).encode()).hexdigest()[:8]
+            values = {
+                "__PROFILE_ID__": profile_id,
+                "__PROFILE_ROOT__": str(root.resolve()),
+                "__HARNESS_EXECUTABLE__": str(executable.resolve()),
+                "__LOG_PATH__": str(log.resolve()),
+            }
+            launchd = (ROOT / "examples/launchd.plist").read_text(encoding="utf-8")
+            for marker, value in values.items():
+                launchd = launchd.replace(marker, value)
+            plist = parent / "schedule.plist"
+            plist.write_text(launchd, encoding="utf-8")
+            plist.chmod(0o600)
+            log_report = diagnose(root, scheduler_artifacts=(plist,))
+            self.assertFalse(log_report.ok)
+            self.assertIn("mode 0600", log_report.format().lower())
+
+            log.chmod(0o600)
+            with mock.patch("profile_harness.doctor.os.getuid", return_value=os.getuid() + 1):
+                owner_report = diagnose(root, scheduler_artifacts=(plist,))
+            self.assertFalse(owner_report.ok)
+            self.assertIn("owned by the current user", owner_report.format().lower())
+
+            units = []
+            for source_name, suffix in (("systemd.service", ".service"), ("systemd.timer", ".timer")):
+                content = (ROOT / "examples" / source_name).read_text(encoding="utf-8")
+                for marker, value in values.items():
+                    content = content.replace(marker, value)
+                if suffix == ".service":
+                    content = content.replace("maintenance (", "maintenance %h (")
+                target = parent / f"codex-profile-harness-{profile_id}{suffix}"
+                target.write_text(content, encoding="utf-8")
+                target.chmod(0o600)
+                units.append(target)
+            specifier_report = diagnose(root, scheduler_artifacts=tuple(units))
+            self.assertFalse(specifier_report.ok)
+            self.assertIn("specifier", specifier_report.format().lower())
+
+            service = units[0]
+            content = (ROOT / "examples/systemd.service").read_text(encoding="utf-8")
+            for marker, value in values.items():
+                content = content.replace(marker, value)
+            content = content.replace(
+                f'ExecStart="{executable.resolve()}" maintain --profile "{root.resolve()}"',
+                f"ExecStart={executable.resolve()}  maintain --profile {root.resolve()}",
+            )
+            service.write_text(content, encoding="utf-8")
+            exact_report = diagnose(root, scheduler_artifacts=tuple(units))
+            self.assertFalse(exact_report.ok)
+            self.assertIn("exact execstart", exact_report.format().lower())
     def test_doctor_validates_control_outbox_contract(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory) / "profile"
