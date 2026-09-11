@@ -116,7 +116,10 @@ def _run_maintenance_locked(
             except BaseException:
                 if batch.path.exists():
                     try:
-                        apply_actions(profile_root, batch.batch_id, {"invalid": True})
+                        apply_actions(
+                            profile_root, batch.batch_id, {"invalid": True},
+                            config=config,
+                        )
                     except BaseException:
                         pass
                 raise

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import ast
 from datetime import datetime, timedelta, timezone
 import hashlib
+import inspect
 import json
 from pathlib import Path
 import stat
@@ -124,6 +126,44 @@ class MaintenanceTests(unittest.TestCase):
             self.assertEqual("approval_required", push_configs[0].improvement.mode)
             with self.assertRaises(ValueError):
                 run_maintenance(root, now=NOW + timedelta(minutes=1))
+
+    def test_model_failure_after_invalid_config_restores_claims_and_emits_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = self.make_profile(Path(temporary_directory))
+            for index in range(30):
+                self.add_receipt(root, index, NOW)
+
+            def invalidate_and_fail(*_args, **_kwargs):
+                (root / ".harness/config.toml").write_text(
+                    "invalid TOML = [", encoding="utf-8"
+                )
+                raise RuntimeError("injected model failure")
+
+            with mock.patch.object(
+                maintenance_module, "run_codex", side_effect=invalidate_and_fail
+            ):
+                with self.assertRaisesRegex(RuntimeError, "model failure"):
+                    run_maintenance(root, now=NOW)
+
+            self.assertEqual(30, len(list((root / ".harness/memory/inbox").glob("*.json"))))
+            self.assertFalse(list((root / ".harness/memory/processing").iterdir()))
+            self.assertFalse(list((root / ".harness/state/preparations").glob("*.json")))
+            self.assertEqual(1, ControlOutbox(root).status()["pending"])
+
+    def test_maintenance_internal_policy_calls_always_receive_config_snapshot(self) -> None:
+        tree = ast.parse(inspect.getsource(maintenance_module))
+        governed = {
+            "prepare_curation", "apply_actions", "checkpoint_profile",
+            "auto_push_checkpoint", "apply_proposal",
+        }
+        missing = []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            name = node.func.id if isinstance(node.func, ast.Name) else None
+            if name in governed and not any(item.arg == "config" for item in node.keywords):
+                missing.append((name, node.lineno))
+        self.assertEqual([], missing)
 
     def test_maintenance_push_failure_preserves_commit_and_later_run_retries(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
