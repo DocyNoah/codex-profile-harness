@@ -300,18 +300,26 @@ class ProposalStore:
         return matches[0]
 
     def _record_creation_unlocked(
-        self, manifest: dict[str, Any], json_path: Path, markdown_path: Path
+        self,
+        manifest: dict[str, Any],
+        json_path: Path,
+        markdown_path: Path,
+        *,
+        json_digest: str,
+        markdown_digest: str,
     ) -> dict[str, Any]:
         if self._creation_entries(manifest["proposal_id"]):
             raise ProposalError("proposal creation provenance already exists")
+        if _DIGEST.fullmatch(json_digest) is None or _DIGEST.fullmatch(markdown_digest) is None:
+            raise ProposalError("proposal creation digest is invalid")
         try:
             return append_entry(self._journal(), {
                 "event": "proposal_created",
                 "proposal_id": manifest["proposal_id"],
                 "json_path": str(json_path.relative_to(self.root)),
                 "markdown_path": str(markdown_path.relative_to(self.root)),
-                "json_digest": _file_digest(json_path),
-                "markdown_digest": _file_digest(markdown_path),
+                "json_digest": json_digest,
+                "markdown_digest": markdown_digest,
                 "created_at": manifest["created_at"],
             })
         except (OSError, ValueError) as error:
@@ -393,16 +401,37 @@ class ProposalStore:
             except ValueError as error:
                 raise ProposalError(str(error)) from error
             encoded = json.dumps(manifest, ensure_ascii=False, sort_keys=True, indent=2) + "\n"
+            rendered = render_markdown(manifest)
+            planned_json_digest = _buffer_digest(encoded.encode("utf-8"))
+            planned_markdown_digest = _buffer_digest(rendered.encode("utf-8"))
             json_created = False
             markdown_created = False
             try:
                 json_created = exclusive_write_text(json_path, encoded)
                 if not json_created:
                     raise ProposalError("immutable proposal already exists")
-                markdown_created = exclusive_write_text(markdown_path, render_markdown(manifest))
+                markdown_created = exclusive_write_text(markdown_path, rendered)
                 if not markdown_created:
                     raise ProposalError("immutable proposal rendering already exists")
-                self._record_creation_unlocked(manifest, json_path, markdown_path)
+                published_json = _read_bounded_regular(
+                    json_path, limit=MAX_MANIFEST_BYTES, label="published manifest"
+                )
+                published_markdown = _read_bounded_regular(
+                    markdown_path, limit=MAX_MARKDOWN_BYTES, label="published Markdown"
+                )
+                assert published_json is not None and published_markdown is not None
+                if (
+                    _buffer_digest(published_json) != planned_json_digest
+                    or _buffer_digest(published_markdown) != planned_markdown_digest
+                ):
+                    raise ProposalError("published proposal digest does not match planned artifacts")
+                self._record_creation_unlocked(
+                    manifest,
+                    json_path,
+                    markdown_path,
+                    json_digest=planned_json_digest,
+                    markdown_digest=planned_markdown_digest,
+                )
             except BaseException:
                 if json_created:
                     json_path.unlink(missing_ok=True)

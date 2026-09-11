@@ -160,6 +160,37 @@ class ProposalStoreTests(unittest.TestCase):
                 self.assertFalse(other.exists())
                 self.assertFalse((root / ".harness/improvements/lifecycle.jsonl").exists())
 
+    def test_create_rejects_artifacts_swapped_before_provenance_record(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = self.make_profile(Path(temporary_directory))
+            store = ProposalStore(root)
+            from profile_harness import proposals as proposals_module
+            original_write = proposals_module.exclusive_write_text
+
+            def write_then_swap(path: Path, content: str) -> bool:
+                created = original_write(path, content)
+                if created and path.suffix == ".md":
+                    json_path = path.with_suffix(".json")
+                    value = json.loads(json_path.read_text(encoding="utf-8"))
+                    value["rationale"] = "Coordinated content swapped after publication."
+                    json_path.write_text(
+                        json.dumps(value, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
+                        encoding="utf-8",
+                    )
+                    path.write_text(proposals_module.render_markdown(value), encoding="utf-8")
+                return created
+
+            with mock.patch.object(
+                proposals_module, "exclusive_write_text", side_effect=write_then_swap
+            ):
+                with self.assertRaisesRegex(ProposalError, "published proposal digest"):
+                    self.create_with_id(store, root, "f" * 32)
+
+            proposed = root / ".harness/improvements/proposed"
+            self.assertFalse((proposed / f"{'f' * 32}.json").exists())
+            self.assertFalse((proposed / f"{'f' * 32}.md").exists())
+            self.assertFalse((root / ".harness/improvements/lifecycle.jsonl").exists())
+
     def test_load_rejects_tampering_and_symlink_escape(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             parent = Path(temporary_directory)

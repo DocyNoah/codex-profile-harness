@@ -697,7 +697,11 @@ def _run_locked(
                     if crash_after_stage == "after_first_write" and len(created) == 1:
                         os._exit(91)
                 proposal_store._record_creation_unlocked(
-                    manifest, payloads[0][0], payloads[1][0]
+                    manifest,
+                    payloads[0][0],
+                    payloads[1][0],
+                    json_digest=proposal_digests[str(payloads[0][0].relative_to(root))],
+                    markdown_digest=proposal_digests[str(payloads[1][0].relative_to(root))],
                 )
             entry = append_entry(journal, {
                 "event": "improvement",
