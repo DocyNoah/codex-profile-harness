@@ -353,7 +353,7 @@ class CaptureCliTests(unittest.TestCase):
             command = hooks[event][0]["hooks"][0]
             self.assertEqual("command", command["type"])
             self.assertEqual(
-                'python3 "$PLUGIN_ROOT/bin/profile-harness" hook capture',
+                '"$PLUGIN_ROOT/bin/profile-harness" hook capture',
                 command["command"],
             )
             self.assertLessEqual(command["timeout"], 3)

@@ -1,4 +1,22 @@
-#!/usr/bin/env python3
+#!/bin/sh
+""":"
+# scripts/build_local_marketplace.py replaces this token with the validated
+# Python 3.11+ used to build the local installation.
+PYTHON_EXECUTABLE=@PROFILE_HARNESS_PYTHON@
+if [ "$PYTHON_EXECUTABLE" = "@PROFILE_HARNESS_PYTHON@" ]; then
+  PYTHON_EXECUTABLE=$(command -v python3 || true)
+fi
+if [ -z "$PYTHON_EXECUTABLE" ]; then
+  echo "profile-harness: Python 3.11 or newer is required" >&2
+  exit 78
+fi
+PYTHON_RUNTIME_CHECK=$("$PYTHON_EXECUTABLE" -I -S -c 'import sys; print("profile-harness-python-3.11+" if sys.version_info >= (3, 11) else "")' 2>/dev/null || true)
+if [ "$PYTHON_RUNTIME_CHECK" != "profile-harness-python-3.11+" ]; then
+  echo "profile-harness: Python 3.11 or newer is required" >&2
+  exit 78
+fi
+exec "$PYTHON_EXECUTABLE" "$0" "$@"
+:"""
 from __future__ import annotations
 
 import sys

@@ -47,6 +47,7 @@ def validate_manifest(path: Path) -> dict:
     allowed = {
         "id", "name", "version", "description", "skills", "apps", "mcpServers",
         "interface", "author", "homepage", "repository", "license", "keywords",
+        "hooks",
     }
     require(set(value) <= allowed, "plugin manifest contains unknown fields")
     name = value.get("name")
@@ -81,6 +82,7 @@ def validate_manifest(path: Path) -> dict:
         item = value.get(field)
         require(isinstance(item, str) and item.startswith("https://"), f"invalid {field}")
     require(value.get("license") == "MIT", "invalid plugin license")
+    require(value.get("hooks") == "./hooks/hooks.json", "invalid plugin hooks path")
     keywords = value.get("keywords")
     require(isinstance(keywords, list) and all(isinstance(item, str) and item.strip() for item in keywords), "invalid plugin keywords")
     return value
@@ -185,7 +187,7 @@ def validate_release_workflow(path: Path) -> None:
 def validate_source() -> None:
     manifest = validate_manifest(ROOT / ".codex-plugin/plugin.json")
     require(manifest.get("name") == "codex-profile-harness", "invalid plugin name")
-    require(manifest.get("version") == "0.4.0", "invalid plugin version")
+    require(manifest.get("version") == "0.4.1", "invalid plugin version")
     skill = validate_skill(ROOT / "skills/profile-harness/SKILL.md")
     require(skill["name"] == "profile-harness", "invalid skill name")
     validate_release_workflow(ROOT / ".github/workflows/release.yml")

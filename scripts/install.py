@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
-from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
@@ -31,15 +30,12 @@ from profile_harness.process import run_bounded_process  # noqa: E402
 
 PLUGIN_SELECTOR = f"{PLUGIN_NAME}@{MARKETPLACE_NAME}"
 _PLUGIN_PATH = Path("plugins") / PLUGIN_NAME
-_STAMP = re.compile(r"[0-9]{8}T[0-9]{6}Z")
-_BACKUP_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}")
 
 
 @dataclass(frozen=True)
 class InstallResult:
     marketplace_root: Path
     executable_path: Path
-    backup_path: Path | None
 
 
 @dataclass(frozen=True)
@@ -177,39 +173,6 @@ def _safe_destination(path: Path, label: str) -> Path:
     return value
 
 
-def _select_backup_id(
-    backup_id: str | None = None, timestamp: str | None = None
-) -> str:
-    """Return one bounded filename component; timestamp is a legacy test/API alias."""
-    if backup_id is not None and timestamp is not None:
-        raise ValueError("backup ID and timestamp cannot both be set")
-    if timestamp is not None:
-        if _STAMP.fullmatch(timestamp) is None:
-            raise ValueError("timestamp must use YYYYMMDDTHHMMSSZ")
-        return timestamp
-    value = (
-        backup_id
-        if backup_id is not None
-        else datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    )
-    if not isinstance(value, str) or _BACKUP_ID.fullmatch(value) is None:
-        raise ValueError(
-            "backup ID must be 1-64 ASCII letters, digits, underscores, or hyphens, "
-            "starting with a letter or digit"
-        )
-    return value
-
-
-def _backup_destination(marketplace: Path, backup_id: str) -> Path:
-    destination = _safe_destination(
-        marketplace.with_name(f"{marketplace.name}.previous.{backup_id}"),
-        "backup destination",
-    )
-    if destination.exists() or destination.is_symlink():
-        raise FileExistsError(f"backup already exists: {destination}")
-    return destination
-
-
 def _load_object(path: Path, label: str) -> dict:
     try:
         if path.is_symlink() or not path.is_file() or path.stat().st_size > 128 * 1024:
@@ -246,12 +209,13 @@ def _validate_existing_marketplace(root: Path) -> None:
         manifest.get("name") != PLUGIN_NAME
         or not isinstance(manifest.get("version"), str)
         or re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", manifest["version"]) is None
+        or manifest.get("hooks") != "./hooks/hooks.json"
         or not isinstance(author, dict)
         or author.get("name") != "Codex Profile Harness contributors"
     ):
         raise ValueError("existing target is not a Codex Profile Harness marketplace")
     hooks = _load_object(root / _PLUGIN_PATH / "hooks/hooks.json", "hooks")
-    expected_command = 'python3 "$PLUGIN_ROOT/bin/profile-harness" hook capture'
+    expected_command = '"$PLUGIN_ROOT/bin/profile-harness" hook capture'
     try:
         if set(hooks["hooks"]) != {"Stop", "SessionEnd"}:
             raise ValueError("unexpected hook events")
@@ -307,71 +271,56 @@ def _restore_codex(
         raise RuntimeError("Codex registration recovery did not restore prior state")
 
 
+def _require_fresh_codex_state(codex: CodexBoundary) -> CodexState:
+    state = codex.inspect()
+    if state.marketplace_source is not None or state.plugin_installed:
+        raise ValueError(
+            "existing Codex Harness registration found; uninstall it before a fresh install"
+        )
+    return state
+
+
 def install(
     source_root: Path,
     marketplace_root: Path,
     bin_home: Path,
     *,
     codex: CodexBoundary | None = None,
-    backup_id: str | None = None,
-    timestamp: str | None = None,
 ) -> InstallResult:
-    """Build, validate, replace recoverably, then register as the final step."""
+    """Build a fresh installation, then register it as the final step."""
     source = Path(source_root).expanduser().resolve(strict=True)
     marketplace = _safe_destination(Path(marketplace_root), "marketplace root")
     binaries = _safe_destination(Path(bin_home), "binary directory")
-    selected_backup_id = _select_backup_id(backup_id, timestamp)
-    existing = marketplace.exists()
-    if existing:
-        if not marketplace.is_dir():
-            raise ValueError("existing target is not a Codex Profile Harness marketplace")
-        _validate_existing_marketplace(marketplace)
-    planned_backup = (
-        _backup_destination(marketplace, selected_backup_id) if existing else None
-    )
+    if marketplace.exists() or marketplace.is_symlink():
+        raise FileExistsError(
+            "existing Harness installation found; uninstall it before a fresh install"
+        )
     executable = binaries / "profile-harness"
     if executable.exists() or executable.is_symlink():
-        if not existing or not executable.is_symlink():
-            raise ValueError("existing executable is not this Harness installation")
-        expected = marketplace / _PLUGIN_PATH / "bin/profile-harness"
-        if executable.resolve() != expected.resolve():
-            raise ValueError("existing executable is not this Harness installation")
+        raise FileExistsError(
+            "existing profile-harness executable found; uninstall it before a fresh install"
+        )
 
     boundary = codex or SubprocessCodexBoundary()
-    before = boundary.inspect()
-    if before.marketplace_source is not None:
-        if before.marketplace_source.resolve() != marketplace.resolve():
-            raise ValueError("Codex marketplace name is registered to another path")
-    if before.plugin_installed and before.marketplace_source is None:
-        raise ValueError("Codex Harness plugin state is inconsistent")
+    before = _require_fresh_codex_state(boundary)
 
     parent = marketplace.parent
     parent.mkdir(parents=True, exist_ok=True)
     staging_parent = Path(tempfile.mkdtemp(dir=parent, prefix=f".{marketplace.name}.install."))
     staged = staging_parent / "marketplace"
-    backup: Path | None = None
     discarded = staging_parent / "failed-installation"
-    had_link = executable.is_symlink()
     had_binary_directory = binaries.exists()
     installed_new = False
     try:
         build_local_marketplace(source, staged)
         _validate_existing_marketplace(staged)
-        if existing:
-            assert planned_backup is not None
-            backup = planned_backup
-            os.replace(marketplace, backup)
         os.replace(staged, marketplace)
         installed_new = True
         binaries.mkdir(parents=True, exist_ok=True)
         _replace_link(executable, marketplace / _PLUGIN_PATH / "bin/profile-harness")
 
-        # External registration is deliberately last. Upgrade removes/re-adds the
-        # plugin so Codex observes the new manifest; the marketplace path is stable.
-        if before.plugin_installed:
-            boundary.run(["codex", "plugin", "remove", PLUGIN_SELECTOR])
-        if before.marketplace_source is None:
-            boundary.run(["codex", "plugin", "marketplace", "add", str(marketplace)])
+        # External registration is deliberately last.
+        boundary.run(["codex", "plugin", "marketplace", "add", str(marketplace)])
         boundary.run(["codex", "plugin", "add", PLUGIN_SELECTOR])
         after = boundary.inspect()
         if (
@@ -380,16 +329,11 @@ def install(
             or not after.plugin_installed
         ):
             raise RuntimeError("Codex did not confirm the Harness registration")
-        return InstallResult(marketplace, executable, backup)
+        return InstallResult(marketplace, executable)
     except BaseException as primary:
         if installed_new and marketplace.exists():
             os.replace(marketplace, discarded)
-        if backup is not None and backup.exists() and not marketplace.exists():
-            os.replace(backup, marketplace)
-            backup = None
-        if had_link:
-            _replace_link(executable, marketplace / _PLUGIN_PATH / "bin/profile-harness")
-        elif executable.is_symlink():
+        if executable.is_symlink():
             executable.unlink()
         if not had_binary_directory and binaries.is_dir():
             try:
@@ -419,33 +363,27 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Install Codex Profile Harness locally")
     parser.add_argument("--marketplace-root", type=Path, default=default_marketplace)
     parser.add_argument("--bin-home", type=Path, default=default_bin)
-    parser.add_argument("--backup-id")
     parser.add_argument("--dry-run", action="store_true")
     arguments = parser.parse_args(argv)
     print(f"Plugin selector: {PLUGIN_SELECTOR}")
     try:
-        selected_backup_id = _select_backup_id(arguments.backup_id)
         preview_marketplace = _safe_destination(
             arguments.marketplace_root, "marketplace root"
         )
-        if preview_marketplace.exists():
-            if not preview_marketplace.is_dir():
-                raise ValueError(
-                    "existing target is not a Codex Profile Harness marketplace"
-                )
-            _validate_existing_marketplace(preview_marketplace)
-            preview_backup = _backup_destination(
-                preview_marketplace, selected_backup_id
+        if preview_marketplace.exists() or preview_marketplace.is_symlink():
+            raise FileExistsError(
+                "existing Harness installation found; uninstall it before a fresh install"
             )
-        else:
-            preview_backup = None
-    except (OSError, ValueError) as error:
+        preview_executable = _safe_destination(
+            arguments.bin_home, "binary directory"
+        ) / "profile-harness"
+        if preview_executable.exists() or preview_executable.is_symlink():
+            raise FileExistsError(
+                "existing profile-harness executable found; uninstall it before a fresh install"
+            )
+        _require_fresh_codex_state(SubprocessCodexBoundary())
+    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
         parser.error(str(error))
-    print(f"Backup ID: {selected_backup_id}")
-    print(
-        "Backup destination: "
-        + (str(preview_backup) if preview_backup is not None else "none (new install)")
-    )
     if arguments.dry_run:
         print(f"Would validate and build the reviewed marketplace at: {arguments.marketplace_root.expanduser()}")
         print(f"Would link profile-harness under: {arguments.bin_home.expanduser()}")
@@ -455,15 +393,13 @@ def main(argv: list[str] | None = None) -> int:
     try:
         result = install(
             SOURCE_ROOT, arguments.marketplace_root, arguments.bin_home,
-            backup_id=selected_backup_id,
         )
     except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
         parser.error(str(error))
     print(f"Installed marketplace: {result.marketplace_root}")
-    if result.backup_path is not None:
-        print(f"Previous installation retained at: {result.backup_path}")
     print(f"Executable: {result.executable_path}")
-    print("Next: inspect hooks/hooks.json, start a new Codex task, then approve the hook prompt.")
+    print("Next: in the Codex app, open Settings > Hooks, review Codex Profile Harness, then select Trust.")
+    print("Fallback: in the Codex CLI, open /hooks, review the command, then select Trust.")
     print("For profile scheduling and Harness Control, have the local Codex agent follow INSTALL_AGENT.md.")
     print("Create a profile with: profile-harness init PATH --name NAME")
     return 0

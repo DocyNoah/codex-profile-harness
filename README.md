@@ -9,9 +9,12 @@ keeps managed profile documents in automatic local Git history.
 ## Quick start
 
 Requirements: macOS or Linux, Python 3.11+, Git, and an installed/authenticated
-Codex CLI. Clone [this repository](https://github.com/DocyNoah/codex-profile-harness),
-then ask a local Codex agent: **“Read `INSTALL_AGENT.md`, show the installation
-preview, install this harness, and verify it.”** The repository deliberately
+Codex CLI. First create the directory that will be the profile, add that directory
+to the Codex app as a project, and open a new task in that project. Clone or
+download [this repository](https://github.com/DocyNoah/codex-profile-harness),
+then ask the local Codex agent: **“Read `<downloaded-path>/INSTALL_AGENT.md` and install the
+profile harness in this project directory. Show the preview first and verify the
+result.”** The repository deliberately
 does not promise a universal installer. The agent inspects the real machine,
 selects launchd or user systemd (cron only as fallback), and verifies actual
 scheduler evidence. The bundled installer is only an optional, bounded primitive
@@ -30,17 +33,21 @@ profile-harness dashboard
 ```
 
 The installer builds a fixed allowlist into a local marketplace, installs selector
-`codex-profile-harness@codex-profile-harness-local`, and never approves hooks.
-Start a new Codex task and approve the hook only after inspecting it. See
+`codex-profile-harness@codex-profile-harness-local`, and automatically registers
+the bundled hooks. It cannot select the security confirmation for the user. In
+the Codex app, open **Settings → Hooks**, select **Codex Profile Harness**, choose
+**Review**, inspect the displayed command, then select **Trust** (or **Trust all**
+for both bundled events). If the app UI is unavailable, use the CLI `/hooks`
+management screen as a fallback. See
 [INSTALL.md](INSTALL.md) for dry-run, manual installation, and recovery.
 
 The marketplace, plugin selector, and executable link are one **global shared
 installation**. Each profile adds a **per-profile attachment** consisting of its
 profile data, scheduler, and profile-identified Harness Control task/heartbeat.
 Additional profiles reuse the shared installation.
-Agent-assisted upgrades generate one safe backup ID and pass the same
-`--backup-id` to preview and execution, binding both to one collision-checked
-backup destination before shared state changes.
+In-place upgrades are not supported. To replace the shared version, detach its
+automations, remove only the shared installation, and install the new release
+fresh. Profile directories and their Git histories stay in place.
 
 ## How it works
 
@@ -178,10 +185,10 @@ scanner, or guarantee against a hostile local account. Codex hooks and transcrip
 formats can change. Scheduling requires one verified native scheduler or the
 documented cron fallback.
 
-For upgrade and uninstall commands, see [INSTALL.md](INSTALL.md). Default
+For clean replacement and uninstall commands, see [INSTALL.md](INSTALL.md). Default
 uninstall is a profile detach: it removes only that profile's scheduler and
 Control task while keeping its data and the shared installation. A global
-upgrade or global uninstall must inventory all attached profiles, schedulers,
+reinstall or global uninstall must inventory all attached profiles, schedulers,
 and Control tasks, pause every item, verify every item, and fail closed without
 mutating the shared installation when inventory is ambiguous. Global removal
 also requires explicit user confirmation if another profile remains. Rollback
@@ -192,7 +199,7 @@ and contributions follow [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Release verification
 
-Version 0.4.0 archives are reproducible and accompanied by a SHA-256 checksum.
+Version 0.4.1 archives are reproducible and accompanied by a SHA-256 checksum.
 After verifying the checksum, extract into a new directory and run the clean
 extraction validator:
 

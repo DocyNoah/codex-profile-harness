@@ -5,7 +5,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"$PLUGIN_ROOT/bin/profile-harness\" hook capture",
+            "command": "\"$PLUGIN_ROOT/bin/profile-harness\" hook capture",
             "timeout": 3
           }
         ]
@@ -16,7 +16,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"$PLUGIN_ROOT/bin/profile-harness\" hook capture",
+            "command": "\"$PLUGIN_ROOT/bin/profile-harness\" hook capture",
             "timeout": 3
           }
         ]

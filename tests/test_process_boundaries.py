@@ -318,7 +318,7 @@ elif args[:2] == ["plugin", "list"]:
             ):
                 module.install(
                     ROOT, parent / "marketplace", parent / "bin",
-                    codex=boundary, timestamp="20260911T160000Z",
+                    codex=boundary,
                 )
             self.assertLess(time.monotonic() - started, 3.0)
             pid = int(pid_path.read_text())
@@ -363,7 +363,7 @@ elif args[:2] == ["plugin", "list"]:
                     with self.assertRaisesRegex(Exception, expected) as raised:
                         module.install(
                             ROOT, parent / "marketplace", parent / "bin",
-                            codex=boundary, timestamp="20260911T170000Z",
+                            codex=boundary,
                         )
                     self.assertLess(time.monotonic() - started, 3.0)
                     self.assertFalse((parent / "marketplace").exists())

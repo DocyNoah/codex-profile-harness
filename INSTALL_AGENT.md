@@ -19,7 +19,8 @@ There are two independent scopes:
 
 Installing another profile normally adds only a per-profile attachment. Default
 uninstall means profile detach and must keep the shared installation. Global
-upgrade or global uninstall is a separate, explicitly named operation.
+clean reinstall or global uninstall is a separate, explicitly named operation.
+In-place upgrade and migration are not supported.
 
 ## 1. Inspect and define exact variables
 
@@ -55,12 +56,11 @@ executable target, not the installed symlink.
 
 ```sh
 RELEASE_ROOT='/canonical/release/root'
+PYTHON_EXECUTABLE='/stable/absolute/path/to/python3.11-or-newer'
 USER_HOME='/canonical/current-user-home'
 PROFILE_ROOT='/canonical/profile/root'
 PROFILE_NAME='Work'
-BACKUP_ID='20260911T120000Z-a1b2c3d4'
 MARKETPLACE_ROOT='/canonical/codex-profile-harness-marketplace'
-MARKETPLACE_BACKUP='/canonical/codex-profile-harness-marketplace.previous.20260911T120000Z-a1b2c3d4'
 BIN_LINK='/canonical/bin/profile-harness'
 HARNESS_EXECUTABLE='/canonical/marketplace/plugins/codex-profile-harness/bin/profile-harness'
 PLUGIN_SELECTOR='codex-profile-harness@codex-profile-harness-local'
@@ -98,37 +98,33 @@ record every original scheduler path and its unique backup path in `BACKUP_MAP`;
 this is the authoritative scheduler backup mapping. Never derive a rollback
 mapping after the mutation.
 
-Generate `BACKUP_ID` exactly once per operation, then freeze it as the displayed
-literal. It must satisfy the installer's 1-64 character ASCII
-`[A-Za-z0-9][A-Za-z0-9_-]{0,63}` contract. It cannot contain path separators,
-whitespace, dots, or control characters. Derive `MARKETPLACE_BACKUP` exactly as
-`MARKETPLACE_ROOT` plus `.previous.` plus that frozen ID.
-
 ## 2. Preview
 
 Show the user whether the requested scope is global shared installation,
-per-profile attachment, profile detach, global upgrade, or global uninstall.
-Show the variables above, plugin selector, hook command, scheduler kind,
-rendered four-element argv, 900-second cadence, every new/backup path, and whether
-this is install or upgrade. Show one profile-identified `Harness Control` task using
+per-profile attachment, profile detach, clean reinstall, or global uninstall.
+Validate `PYTHON_EXECUTABLE` by running it with `-I -c` and requiring
+`sys.version_info >= (3, 11)`. Preserve a stable absolute package-manager alias
+when available instead of resolving it to a versioned Cellar target. Show the
+variables above, plugin selector, hook command, scheduler kind,
+rendered four-element argv, 900-second cadence, and every new/backup path. Show
+one profile-identified `Harness Control` task using
 `gpt-5.6-luna` / `low` and one control-only 15-minute heartbeat. Run:
 
 ```sh
-python3 "$RELEASE_ROOT/scripts/install.py" --backup-id "$BACKUP_ID" --dry-run
+"$PYTHON_EXECUTABLE" "$RELEASE_ROOT/scripts/install.py" --dry-run
 ```
 
-Confirm its `Backup ID` is exactly `BACKUP_ID` and its `Backup destination` is
-exactly `MARKETPLACE_BACKUP` for an upgrade. This is the same backup destination
-that the real command must use. A collision or mismatch stops the operation.
-Proceed only within the displayed installation scope.
+The preview must report that no files or Codex settings changed. An existing
+marketplace, executable link, or Codex registration stops the operation; perform
+the clean-reinstall procedure below first. Proceed only within the displayed scope.
 
 ## 3. Install shared plugin, then attach the profile
 
-For a first installation or global upgrade, run the bounded global shared
+For a first installation or the install half of a clean reinstall, run the bounded global shared
 plugin/CLI primitive; it never installs a scheduler:
 
 ```sh
-python3 "$RELEASE_ROOT/scripts/install.py" --backup-id "$BACKUP_ID"
+"$PYTHON_EXECUTABLE" "$RELEASE_ROOT/scripts/install.py"
 ```
 
 If the inspected shared installation is already current, do not run the
@@ -147,8 +143,15 @@ and a real directory below `projects/`. Registration creates only
 not create or modify `AGENTS.md`, `STATUS.md`, `TASKS.md`, `DECISIONS.md`, or a
 decision directory inside the user's repository.
 
-Start a new Codex task and let the user inspect and approve the exact hook. Never
-use a hook-trust bypass.
+The plugin manifest registers its hooks automatically. Registration is not
+execution permission. Tell the user to open Codex app **Settings → Hooks**, select
+**Codex Profile Harness**, choose **Review**, inspect
+`"$PLUGIN_ROOT/bin/profile-harness" hook capture`, and select **Trust** or
+**Trust all**. Do not claim that an approval popup will appear. If the app screen
+is unavailable, direct the user to the CLI `/hooks` management screen as the
+fallback. Never select Trust on the user's behalf and never use a hook-trust
+bypass. After confirmation, start a new task and verify that a capture receipt is
+created for the profile.
 
 ## 4. Attach exactly one scheduler to this profile
 
@@ -341,98 +344,42 @@ Trigger one maintenance run and confirm its exit status. Confirm the Harness
 Control heartbeat receives top-level `[]` for an empty outbox. Documentation or
 an unrendered template is never installation evidence.
 
-## 7. Global upgrade and completed-upgrade rollback
+## 7. Clean reinstall only
 
-Global upgrade affects the shared executable used by all attached profiles.
-When upgrading from 0.2.x, legacy `automatic_apply = false` is compatible with
-`mode = "approval_required"` and should be made explicit. Reject
-`automatic_apply = true` until the user chooses `approval_required` or supplies
-the exact allowlist required by `auto_safe`. Legacy Markdown proposals are
-read-only: preserve them for audit, but never approve or apply them.
-First inventory all attached profiles, all schedulers, and all Harness Control
-tasks/heartbeats. Using the exact platform commands in section 4 and supported
-Codex app actions, pause every scheduler and every heartbeat. Verify every one is
-inactive, populate `BACKUP_MAP`, and copy every scheduler artifact to its mapped
-backup. If any item cannot be identified, paused, backed up, or verified, fail
-closed: do not mutate the shared installation.
+There is no in-place upgrade or migration. To install another Harness version,
+inventory every attached profile, scheduler, and Harness Control heartbeat.
+Pause every scheduler and heartbeat and verify all are inactive. If discovery or
+verification is ambiguous, fail closed and do not touch the shared installation.
 
-Before shared installation mutation, write the exact
-`MARKETPLACE_ROOT -> MARKETPLACE_BACKUP` row and every attachment backup row to
-`BACKUP_MAP`, flush it, set mode `0600`, and reread it successfully. If
-backup map recording fails, do not run the installer. Run preview and installation with
-the same frozen ID:
-
-```sh
-python3 "$RELEASE_ROOT/scripts/install.py" --backup-id "$BACKUP_ID" --dry-run
-python3 "$RELEASE_ROOT/scripts/install.py" --backup-id "$BACKUP_ID"
-```
-
-The first command must report the exact backup path recorded in `BACKUP_MAP`.
-The second must report that identical path as `Previous installation retained
-at`. The installer rejects an existing backup-path collision before mutation.
-If installation itself fails, it immediately restores the prior shared tree and
-Codex registrations and does not leave that backup path as a completed backup.
-If post-install output/path validation or any unavoidable post-install backup
-map recording fails, keep all automation paused and immediately restore using
-the exact backup path reported by the installer and the registration rollback
-commands below; never guess or generate a replacement path.
-
-For each inventory row, derive these unique paths and record the applicable
-original-to-backup pairs before copying. The crontab is shared state, so snapshot
-it once rather than once per profile:
-
-```sh
-PROFILE_BACKUP_DIR="${BACKUP_DIR}/profiles/${PROFILE_ID}"
-GLOBAL_PLIST_BACKUP="${PROFILE_BACKUP_DIR}/launchd.plist"
-GLOBAL_SERVICE_BACKUP="${PROFILE_BACKUP_DIR}/systemd.service"
-GLOBAL_TIMER_BACKUP="${PROFILE_BACKUP_DIR}/systemd.timer"
-GLOBAL_CONTROL_BACKUP="${PROFILE_BACKUP_DIR}/control-setup.md"
-GLOBAL_CRON_BACKUP="${BACKUP_DIR}/shared/crontab.before"
-mkdir -p "$PROFILE_BACKUP_DIR"
-chmod 0700 "$PROFILE_BACKUP_DIR"
-cp -p -- "$PLIST" "$GLOBAL_PLIST_BACKUP"
-cp -p -- "$SERVICE_PATH" "$GLOBAL_SERVICE_BACKUP"
-cp -p -- "$TIMER_PATH" "$GLOBAL_TIMER_BACKUP"
-```
-
-Run only the `cp` commands for that row's scheduler kind. Save the structurally
-rendered Control setup request and prior task/heartbeat identities and state at
-`GLOBAL_CONTROL_BACKUP`, mode `0600`. Save `crontab -l` exactly once at
-`GLOBAL_CRON_BACKUP`, mode `0600`, when any inventoried row uses cron. Record
-each copied pair and the one shared crontab pair in `BACKUP_MAP`.
-
-Only after that barrier, preview and run `scripts/install.py` from the new
-release. It moves the prior marketplace to the exact `MARKETPLACE_BACKUP`.
-Re-render and install each inventoried scheduler with the same profile identity,
-then run section 6 verification for every profile while all automation remains
-paused. Resume every previously active scheduler and heartbeat only after every
-profile passes; verify every resumed item and record the final state.
-
-If a completed upgrade must be rolled back, pause every inventoried scheduler
-and heartbeat and verify every one is inactive. Preserve the new tree as a
-separate failure artifact. Restore registration in this exact
-order; the stable verified `BIN_LINK` continues to point inside
-`MARKETPLACE_ROOT` after the directory swap:
+Do not detach or delete the paused per-profile schedulers or Control tasks.
+Unregister only the shared plugin and marketplace. Prove that `BIN_LINK` is the
+expected symlink and that `MARKETPLACE_ROOT` is the exact validated Harness
+marketplace rather than a profile or unrelated directory, then remove those two
+shared filesystem targets. Preserve every profile directory and its Git history.
+Confirm that the marketplace directory, `BIN_LINK`, plugin selector, and
+marketplace registration are all absent. Then use the new release as a first
+installation:
 
 ```sh
 codex plugin remove "$PLUGIN_SELECTOR"
 codex plugin marketplace remove "$MARKETPLACE_NAME"
-mv -- "$MARKETPLACE_ROOT" "${MARKETPLACE_ROOT}.failed-rollback"
-mv -- "$MARKETPLACE_BACKUP" "$MARKETPLACE_ROOT"
-codex plugin marketplace add "$MARKETPLACE_ROOT"
-codex plugin add "$PLUGIN_SELECTOR"
+rm -- "$BIN_LINK"
+rm -r -- "$MARKETPLACE_ROOT"
 ```
 
-For every row in `BACKUP_MAP`, restore its original scheduler path from its exact
-recorded backup using the platform rollback commands above. Run verification for
-every profile, then resume every scheduler and heartbeat that the inventory says
-was active. Verify every resumed item. If any check fails, all remaining items
-stay paused and the agent reports the partial state. Profiles and their Git
-histories are never moved or rewritten.
+Use the recursive removal only after the exact identity and path checks above;
+never derive or broaden either path. Then run:
 
-If no scheduler artifact existed before installation, scheduler rollback means
-running that platform's uninstall commands instead of reading a nonexistent
-backup. Never infer a backup path that was not recorded during preview.
+```sh
+"$PYTHON_EXECUTABLE" "$RELEASE_ROOT/scripts/install.py" --dry-run
+"$PYTHON_EXECUTABLE" "$RELEASE_ROOT/scripts/install.py"
+```
+
+Reinspect the registered hook command, run section 6 verification for every
+profile, and resume only the schedulers and heartbeats that were previously
+active. The recreated marketplace uses the same canonical executable location,
+so the paused scheduler artifacts remain valid. A failed fresh installation
+leaves automation paused and must not alter profile data.
 
 ## 8. Default uninstall: detach one profile
 

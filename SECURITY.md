@@ -31,7 +31,8 @@ documents; protect `.harness/` and backups as confidential.
 ## Hook trust
 
 Hooks execute local code with the user's permissions. Inspect the source and
-generated `hooks/hooks.json` before approval. The bundled hook invokes only the
+generated `hooks/hooks.json` in Codex app **Settings → Hooks → Review** before
+selecting **Trust** or **Trust all**. The bundled hook invokes only the
 capture command, durably publishes receipt/cursor evidence, and calls neither a
 model nor Git. The installer never approves or bypasses hook trust. A malicious
 source checkout or local account can replace code before execution; use a
@@ -85,12 +86,12 @@ racing a live owner. Git checkpoint failure does not invalidate a completed
 harness transaction; the failure is recorded for `doctor` and a later scheduled
 checkpoint.
 
-Run `profile-harness doctor` after install, upgrade, restore, crashes, or suspected
+Run `profile-harness doctor` after install, clean reinstall, restore, crashes, or suspected
 tampering. Do not edit receipts, journal entries, or transaction descriptors to
 silence a finding. Recover with the harness where safe or restore an independently
 verified backup.
 
-Version 0.4.0 release archives use deterministic order, timestamps, ownership,
+Version 0.4.1 release archives use deterministic order, timestamps, ownership,
 and permissions and ship a SHA-256 checksum. Reproducibility detects accidental
 packaging drift; it does not replace review of the source and hook. Validate a
 clean extraction before installation.

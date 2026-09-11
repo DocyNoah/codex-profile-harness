@@ -9,8 +9,11 @@ import io
 import os
 from pathlib import Path
 import re
+import shlex
 import shutil
 import stat
+import subprocess
+import sys
 import tarfile
 import tempfile
 
@@ -287,7 +290,52 @@ def _marketplace() -> dict:
     }
 
 
-def build_local_marketplace(source: Path, output: Path) -> Path:
+def _validated_python_executable(value: Path) -> Path:
+    try:
+        candidate = Path(value).expanduser()
+        if not candidate.is_absolute():
+            raise ValueError("Python executable must be an absolute path")
+        candidate = _absolute(candidate)
+        resolved = candidate.resolve(strict=True)
+        _validate_components(
+            resolved, label="Python executable", final_kind="file"
+        )
+        metadata = resolved.stat()
+        if not os.access(candidate, os.X_OK):
+            raise ValueError("Python executable is not executable")
+        if metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+            raise ValueError("Python executable must not be group- or world-writable")
+        completed = subprocess.run(
+            [
+                os.fspath(candidate),
+                "-I",
+                "-S",
+                "-c",
+                'import sys; print("profile-harness-python-3.11+" '
+                'if sys.version_info >= (3, 11) else "")',
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, RuntimeError, subprocess.SubprocessError, ValueError) as error:
+        raise ValueError("Python 3.11 or newer is required") from error
+    if (
+        completed.returncode != 0
+        or completed.stdout != b"profile-harness-python-3.11+\n"
+    ):
+        raise ValueError("Python 3.11 or newer is required")
+    return candidate
+
+
+def build_local_marketplace(
+    source: Path,
+    output: Path,
+    *,
+    python_executable: Path | None = None,
+) -> Path:
     """Copy only reviewed runtime files into a new local marketplace root."""
     source_root = _validate_components(
         source, label="marketplace source", final_kind="directory"
@@ -297,6 +345,9 @@ def build_local_marketplace(source: Path, output: Path) -> Path:
     )
     if output_root.exists():
         raise FileExistsError(f"marketplace output already exists: {output_root}")
+    runtime = _validated_python_executable(
+        Path(sys.executable) if python_executable is None else python_executable
+    )
     output_root.parent.mkdir(parents=True, exist_ok=True)
     temporary = Path(
         tempfile.mkdtemp(
@@ -311,6 +362,15 @@ def build_local_marketplace(source: Path, output: Path) -> Path:
             destination = plugin_root / relative
             destination.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(source_path, destination)
+        launcher = plugin_root / "bin/profile-harness"
+        launcher_text = launcher.read_text(encoding="utf-8")
+        token = "@PROFILE_HARNESS_PYTHON@"
+        if launcher_text.count(token) != 2:
+            raise ValueError("launcher runtime token is invalid")
+        launcher.write_text(
+            launcher_text.replace(token, shlex.quote(os.fspath(runtime)), 1),
+            encoding="utf-8",
+        )
         marketplace = temporary / ".agents/plugins/marketplace.json"
         marketplace.parent.mkdir(parents=True, exist_ok=True)
         marketplace.write_text(

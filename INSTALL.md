@@ -2,8 +2,10 @@
 
 ## Install
 
-Recommended: ask a local Codex agent to install this release after reading
-[INSTALL_AGENT.md](INSTALL_AGENT.md). The agent inspects the actual device,
+Recommended: first create the intended profile directory, add it to the Codex app
+as a project, and open a task in that project. Ask the local Codex agent to read
+[INSTALL_AGENT.md](INSTALL_AGENT.md) from the cloned or extracted release and
+install the profile harness in the current project directory. The agent inspects the actual device,
 previews every affected path, selects the native scheduler, and verifies the
 result. The package does not promise a universal installer; `scripts/install.py`
 is an optional shared-file primitive, not an environment-wide setup program.
@@ -29,27 +31,20 @@ From a cloned or extracted release, inspect `hooks/hooks.json`, preview the
 bounded plugin/CLI operation, then install:
 
 ```sh
-BACKUP_ID='20260911T120000Z-a1b2c3d4'
-python3 scripts/install.py --backup-id "$BACKUP_ID" --dry-run
-python3 scripts/install.py --backup-id "$BACKUP_ID"
+python3 scripts/install.py --dry-run
+python3 scripts/install.py
 export PATH="$HOME/.local/bin:$PATH"
 profile-harness --help
 ```
 
-Generate `BACKUP_ID` once and reuse it. For an upgrade, preview and execution
-must print/use the same exact `.previous.BACKUP_ID` destination. Unsafe IDs and
-an existing destination fail before mutation. Omitting the option generates a
-safe ID, but the agent-assisted flow always supplies it explicitly.
-
 Persist `$HOME/.local/bin` in the shell `PATH`. The noninteractive installer
-builds a staging marketplace from a fixed file allowlist, moves an existing
-marketplace to a timestamped `.previous.*` directory, registers marketplace
+builds a staging marketplace from a fixed file allowlist, registers marketplace
 `codex-profile-harness-local`, installs selector
 `codex-profile-harness@codex-profile-harness-local`, and atomically updates the
-executable symlink. It never bypasses hook trust, copies arbitrary source files,
-deletes a profile, or deletes the previous installation. On failure it restores
-the previous marketplace, executable link, and Codex registration state, then
-removes the failed generated tree.
+executable symlink. It refuses any existing Harness installation: remove the
+shared installation first, then install fresh. It never bypasses hook trust,
+copies arbitrary source files, or deletes a profile. On failure it removes the
+partial generated tree and restores the previously empty Codex registration state.
 Codex inspection, registration, and compensation are noninteractive and have
 bounded stdin, output, time, and descendant-process cleanup. A recovery failure
 is reported together with the original installation failure for manual repair.
@@ -78,14 +73,21 @@ templates, schemas, skill, and public documentation.
 
 ## Hook trust and transcript fallback
 
-The installed plugin supplies `PLUGIN_ROOT`; its lifecycle hook runs only:
+The plugin manifest automatically registers the bundled hooks when Codex installs
+the plugin. The installed plugin supplies `PLUGIN_ROOT`; each lifecycle hook runs
+only:
 
 ```sh
-python3 "$PLUGIN_ROOT/bin/profile-harness" hook capture
+"$PLUGIN_ROOT/bin/profile-harness" hook capture
 ```
 
-Start a new Codex task after installation. Approve only the inspected hook from
-the expected generated marketplace. Never use a hook-trust bypass. Capture reads
+Registration does not grant execution permission. In the Codex app, open
+**Settings → Hooks**, select **Codex Profile Harness**, choose **Review**, inspect
+the displayed command above, and then select **Trust** or **Trust all**. If that
+app screen is unavailable, open the CLI `/hooks` management screen, inspect the
+same command, and select **Trust** there. There is no automatic approval popup;
+never use a hook-trust bypass. Start a new task after this one-time confirmation.
+Capture reads
 only a bounded regular transcript below `CODEX_HOME`. Missing, malformed,
 oversized, changed, or unsafe transcript input falls back to bounded hook data,
 sets `capture_quality` to `partial`, and does not expose the rejected path. Codex
@@ -190,72 +192,17 @@ cd "$RESTORE_PARENT/work"
 profile-harness doctor
 ```
 
-## Upgrade
+## Replace the installed version
 
-This is a global upgrade because every attached profile uses the same executable.
-For an upgrade from 0.2.x, inspect each profile's `.harness/config.toml` first.
-Legacy `automatic_apply = false` is accepted as `mode = "approval_required"`;
-replace it explicitly when convenient. Legacy `automatic_apply = true` is
-rejected: choose `approval_required`, or deliberately configure `auto_safe` with
-an exact `automatic_paths` allowlist. Legacy Markdown-only proposals remain
-read-only and cannot be approved or applied; reject them or replace them with a
-new versioned JSON proposal. Never rewrite old journals merely to silence an
-upgrade finding.
-
-Inventory all attached profiles, all schedulers, and all Harness Control tasks
-and heartbeats. Save the profile inventory and exact scheduler backup mapping in
-a private `0700` backup directory with files mode `0600`. Pause every scheduler
-and heartbeat and verify every item is inactive. If discovery or verification is
-ambiguous, fail closed and do not mutate the shared installation.
-
-Before shared mutation, record and reread the exact marketplace and scheduler
-backup mappings. If recording fails, do not run the installer. Then pass the
-same once-generated `BACKUP_ID` to both commands from the newer release:
-
-```sh
-python3 scripts/install.py --backup-id "$BACKUP_ID" --dry-run
-python3 scripts/install.py --backup-id "$BACKUP_ID"
-```
-
-The old marketplace is retained at the identical previewed destination.
-Reinspect the hook and verify every profile and scheduler before resuming every
-item that was previously active. Installer failure restores the prior shared
-tree and registrations. If post-install path/map validation fails, keep all
-automation paused and immediately use the exact reported backup path for the
-completed-upgrade rollback below. Profiles remain untouched.
-
-## Completed-upgrade rollback
-
-Pause every inventoried scheduler and Harness Control heartbeat, verify every
-one, and set these variables to inspected canonical paths.
-`MARKETPLACE_BACKUP` is the `.previous.TIMESTAMP` tree retained by the successful
-upgrade.
-
-```sh
-MARKETPLACE_ROOT='/canonical/codex-profile-harness-marketplace'
-MARKETPLACE_BACKUP='/canonical/codex-profile-harness-marketplace.previous.TIMESTAMP'
-PLUGIN_SELECTOR='codex-profile-harness@codex-profile-harness-local'
-MARKETPLACE_NAME='codex-profile-harness-local'
-```
-
-Preserve the current tree separately and restore registration in this order:
-
-```sh
-codex plugin remove "$PLUGIN_SELECTOR"
-codex plugin marketplace remove "$MARKETPLACE_NAME"
-mv -- "$MARKETPLACE_ROOT" "${MARKETPLACE_ROOT}.failed-rollback"
-mv -- "$MARKETPLACE_BACKUP" "$MARKETPLACE_ROOT"
-codex plugin marketplace add "$MARKETPLACE_ROOT"
-codex plugin add "$PLUGIN_SELECTOR"
-```
-
-Restore every scheduler artifact from its recorded backup mapping, then run
-`doctor --scheduler-artifact` and one explicit `maintain --profile` for every
-profile. Resume every scheduler and Control heartbeat that was previously active
-only when all checks succeed, and verify every resumed item.
-The stable executable link still targets the same path inside
-`MARKETPLACE_ROOT`; verify that exact resolution before use. See
-`INSTALL_AGENT.md` for exact platform rollback commands.
+There is no in-place upgrade or migration command. Inventory and pause every
+profile scheduler and Harness Control heartbeat. Do not detach them. Unregister
+the shared plugin and marketplace, verify and remove only the shared executable
+link and exact validated Harness marketplace directory, then extract the new
+release into a clean directory and run its installer as a fresh install. The
+same canonical executable path is recreated, so paused scheduler artifacts stay
+valid. Verify the hook command, every profile with `doctor --scheduler-artifact`,
+and one explicit `maintain --profile` run before resuming previously active
+items. If any identity or verification is ambiguous, keep automation paused and stop.
 
 ## Uninstall
 
@@ -307,6 +254,7 @@ preserved; delete them only with a verified backup and an explicit decision.
 - `curation lease is live`: let the active run finish; do not remove its lock.
 - Missing Codex: capture/status/doctor still work, but due model runs require an
   installed and authenticated CLI.
-- Hook does not fire: confirm the plugin selector, start a new task, and approve
-  the inspected hook prompt.
+- Hook does not fire: open Codex app **Settings → Hooks**, confirm that **Codex
+  Profile Harness** is listed, choose **Review**, inspect the command, and select
+  **Trust**. Use the CLI `/hooks` management screen only if the app UI is unavailable.
 - Broken config: run `profile-harness doctor --profile "$PROFILE_ROOT"`.

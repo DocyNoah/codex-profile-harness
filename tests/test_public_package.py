@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import importlib.util
+import contextlib
+import io
 import json
 import os
 from pathlib import Path
@@ -12,6 +14,7 @@ import sys
 import tarfile
 import tempfile
 import unittest
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -83,7 +86,7 @@ class PublicPackageTests(unittest.TestCase):
 
     def run_cli(self, plugin: Path, *arguments: str, cwd: Path | None = None):
         return subprocess.run(
-            [sys.executable, str(plugin / "bin/profile-harness"), *arguments],
+            [str(plugin / "bin/profile-harness"), *arguments],
             cwd=cwd,
             text=True,
             capture_output=True,
@@ -93,7 +96,8 @@ class PublicPackageTests(unittest.TestCase):
 
     def test_release_metadata_and_selector_are_consistent(self) -> None:
         manifest = json.loads((ROOT / ".codex-plugin/plugin.json").read_text())
-        self.assertEqual("0.4.0", manifest["version"])
+        self.assertEqual("0.4.1", manifest["version"])
+        self.assertEqual("./hooks/hooks.json", manifest["hooks"])
         self.assertEqual("codex-profile-harness", manifest["name"])
         self.assertIn("MIT License", (ROOT / "LICENSE").read_text())
         self.assertIn(
@@ -117,7 +121,7 @@ class PublicPackageTests(unittest.TestCase):
             first, first_checksum = build_release_archive(ROOT, output / "one")
             second, second_checksum = build_release_archive(ROOT, output / "two")
 
-            self.assertEqual("codex-profile-harness-0.4.0.tar.gz", first.name)
+            self.assertEqual("codex-profile-harness-0.4.1.tar.gz", first.name)
             self.assertEqual(first.read_bytes(), second.read_bytes())
             self.assertEqual(first_checksum.read_text(), second_checksum.read_text())
             self.assertEqual(
@@ -131,14 +135,14 @@ class PublicPackageTests(unittest.TestCase):
                 members = archive.getmembers()
                 self.assertTrue(members)
                 self.assertTrue(all(
-                    member.name == "codex-profile-harness-0.4.0"
-                    or member.name.startswith("codex-profile-harness-0.4.0/")
+                    member.name == "codex-profile-harness-0.4.1"
+                    or member.name.startswith("codex-profile-harness-0.4.1/")
                     for member in members
                 ))
                 self.assertTrue(all(member.uid == member.gid == 0 for member in members))
                 self.assertTrue(all(member.mtime == 0 for member in members))
                 archive.extractall(extracted, filter="data")
-            release_root = extracted / "codex-profile-harness-0.4.0"
+            release_root = extracted / "codex-profile-harness-0.4.1"
             validated = subprocess.run(
                 [sys.executable, str(release_root / "scripts/validate_release.py"), str(release_root)],
                 text=True, capture_output=True, check=False,
@@ -209,7 +213,7 @@ class PublicPackageTests(unittest.TestCase):
             output = Path(temporary_directory)
             victim = output / "victim"
             victim.write_text("unchanged", encoding="utf-8")
-            predictable = output / ".codex-profile-harness-0.4.0.tar.gz.tmp"
+            predictable = output / ".codex-profile-harness-0.4.1.tar.gz.tmp"
             predictable.symlink_to(victim)
 
             archive, checksum = build_release_archive(ROOT, output)
@@ -290,7 +294,7 @@ class PublicPackageTests(unittest.TestCase):
         ):
             self.assertIn(command, agent)
         for phrase in (
-            "0.4.0", "automatic_apply = false", "approval_required",
+            "0.4.1", "automatic_apply = false", "approval_required",
             "automatic_apply = true", "legacy markdown", "read-only",
             "reproducible", "sha-256", "clean extraction",
         ):
@@ -314,6 +318,106 @@ class PublicPackageTests(unittest.TestCase):
                 self.assertTrue(forbidden_parts.isdisjoint(path.parts), relative)
                 self.assertNotIn(path.suffix, {".pyc", ".pyo"})
                 self.assertNotIn("credential", relative.lower())
+
+    def test_generated_launcher_pins_the_validated_build_interpreter(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            parent = Path(temporary_directory)
+            marketplace = parent / "marketplace"
+            build_local_marketplace(
+                ROOT,
+                marketplace,
+                python_executable=Path(sys.executable),
+            )
+            plugin = marketplace / "plugins/codex-profile-harness"
+            launcher = plugin / "bin/profile-harness"
+
+            self.assertIn(str(Path(sys.executable).absolute()), launcher.read_text())
+            completed = subprocess.run(
+                [str(launcher), "--help"],
+                cwd=plugin,
+                text=True,
+                capture_output=True,
+                check=False,
+                env={"PATH": "/usr/bin:/bin", "PYTHONDONTWRITEBYTECODE": "1"},
+            )
+
+            self.assertEqual(0, completed.returncode, completed.stderr)
+            self.assertIn("profile-harness", completed.stdout)
+
+    def test_marketplace_builder_rejects_an_incompatible_python_runtime(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            parent = Path(temporary_directory)
+            incompatible = parent / "python3"
+            incompatible.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+            incompatible.chmod(0o700)
+
+            with self.assertRaisesRegex(ValueError, "Python 3.11"):
+                build_local_marketplace(
+                    ROOT,
+                    parent / "marketplace",
+                    python_executable=incompatible,
+                )
+
+    def test_marketplace_builder_rejects_a_non_python_successful_executable(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            parent = Path(temporary_directory)
+            impostor = parent / "python3"
+            impostor.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            impostor.chmod(0o700)
+
+            with self.assertRaisesRegex(ValueError, "Python 3.11"):
+                build_local_marketplace(
+                    ROOT,
+                    parent / "marketplace",
+                    python_executable=impostor,
+                )
+
+    def test_generated_launcher_quotes_a_runtime_path_with_shell_metacharacters(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            parent = Path(temporary_directory)
+            runtime = parent / "python path's runtime"
+            runtime.write_text(
+                f"#!/bin/sh\nexec {shlex.quote(str(Path(sys.executable).absolute()))} \"$@\"\n",
+                encoding="utf-8",
+            )
+            runtime.chmod(0o700)
+            marketplace = parent / "marketplace"
+            build_local_marketplace(
+                ROOT,
+                marketplace,
+                python_executable=runtime,
+            )
+            launcher = marketplace / "plugins/codex-profile-harness/bin/profile-harness"
+
+            completed = subprocess.run(
+                [str(launcher), "--help"],
+                cwd=parent,
+                text=True,
+                capture_output=True,
+                check=False,
+                env={"PATH": "/usr/bin:/bin", "PYTHONDONTWRITEBYTECODE": "1"},
+            )
+
+            self.assertEqual(0, completed.returncode, completed.stderr)
+
+    def test_source_launcher_rejects_an_unverified_path_python(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            parent = Path(temporary_directory)
+            impostor = parent / "python3"
+            impostor.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            impostor.chmod(0o700)
+
+            completed = subprocess.run(
+                [str(ROOT / "bin/profile-harness"), "--help"],
+                cwd=ROOT,
+                text=True,
+                capture_output=True,
+                check=False,
+                env={"PATH": str(parent)},
+            )
+
+            self.assertEqual(78, completed.returncode)
+            self.assertIn("Python 3.11 or newer", completed.stderr)
 
     def test_generated_cli_init_capture_fallback_maintain_dashboard_doctor_and_git(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -377,7 +481,7 @@ class PublicPackageTests(unittest.TestCase):
             "proposal_only", "approval_required", "auto_safe",
             "auto_push", "exact upstream", "agent-assisted", "launchd", "systemd",
             "control poll --json", "claim_token", "backup",
-            "upgrade", "uninstall", "hook trust", "disk loss",
+            "clean reinstall", "uninstall", "hook trust", "disk loss",
             "process group", "bounded stdout/stderr", "stdin from `/dev/null`",
         )
         for phrase in required:
@@ -427,7 +531,7 @@ class PublicPackageTests(unittest.TestCase):
             self.assertTrue(all((plugin / relative).is_file() for relative in required))
 
         contract = (ROOT / "INSTALL_AGENT.md").read_text(encoding="utf-8").lower()
-        for phase in ("inspect", "preview", "install", "verify", "upgrade", "rollback", "uninstall"):
+        for phase in ("inspect", "preview", "install", "verify", "clean reinstall", "uninstall"):
             self.assertIn(phase, contract)
         self.assertIn("agent", contract)
         self.assertIn("doctor --scheduler-artifact", contract)
@@ -455,11 +559,11 @@ class PublicPackageTests(unittest.TestCase):
         self.assertIn("examples/launchd.plist", manual)
         self.assertIn("examples/systemd.timer", manual)
         self.assertIn("templates/automations/harness-control.md", manual)
-        self.assertIn("## Completed-upgrade rollback", manual)
+        self.assertIn("## Replace the installed version", manual)
         self.assertIn('codex plugin remove "$PLUGIN_SELECTOR"', manual)
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
         self.assertIn("INSTALL_AGENT.md", readme)
-        self.assertIn("ask a local Codex agent", readme)
+        self.assertIn("ask the local Codex agent", readme)
 
     def test_scheduler_templates_are_argv_only_bounded_and_profile_specific(self) -> None:
         launchd = plistlib.loads((ROOT / "examples/launchd.plist").read_bytes())
@@ -529,7 +633,7 @@ class PublicPackageTests(unittest.TestCase):
             self.assertIn(phrase, combined, phrase)
         self.assertIn("default uninstall", docs["INSTALL_AGENT.md"])
         self.assertIn("global uninstall", docs["INSTALL_AGENT.md"])
-        self.assertIn("global upgrade", docs["INSTALL_AGENT.md"])
+        self.assertIn("clean reinstall", docs["INSTALL_AGENT.md"])
         self.assertIn("profile inventory", docs["INSTALL_AGENT.md"])
         self.assertIn("scheduler backup", docs["INSTALL_AGENT.md"])
         self.assertIn("control task identity", docs["INSTALL_AGENT.md"])
@@ -565,34 +669,85 @@ class PublicPackageTests(unittest.TestCase):
             self.assertEqual("no_op", json.loads(result.stdout)["curation"]["status"])
 
     def test_installer_dry_run_is_non_mutating_and_prints_selector(self) -> None:
+        module = self.load_script("profile_harness_installer_dry_run", "install.py")
         with tempfile.TemporaryDirectory() as temporary_directory:
             parent = Path(temporary_directory).resolve()
             marketplace = parent / "marketplace"
             bin_home = parent / "bin"
-            completed = subprocess.run(
-                [
-                    sys.executable, str(ROOT / "scripts/install.py"),
+            output = io.StringIO()
+            boundary = self.memory_boundary(module)
+            with (
+                mock.patch.object(
+                    module, "SubprocessCodexBoundary", return_value=boundary
+                ),
+                contextlib.redirect_stdout(output),
+            ):
+                result = module.main([
                     "--marketplace-root", str(marketplace),
                     "--bin-home", str(bin_home), "--dry-run",
-                ],
-                cwd=ROOT,
-                text=True,
-                capture_output=True,
-                check=False,
-            )
-            self.assertEqual(0, completed.returncode, completed.stderr)
+                ])
+            self.assertEqual(0, result)
             self.assertFalse(marketplace.exists())
             self.assertFalse(bin_home.exists())
             self.assertIn(
                 "codex-profile-harness@codex-profile-harness-local",
-                completed.stdout,
+                output.getvalue(),
             )
-            self.assertNotIn("dangerously-bypass", completed.stdout)
-            self.assertIn("INSTALL_AGENT.md", completed.stdout)
-            self.assertIn("does not install a scheduler", completed.stdout)
+            self.assertNotIn("dangerously-bypass", output.getvalue())
+            self.assertIn("INSTALL_AGENT.md", output.getvalue())
+            self.assertIn("does not install a scheduler", output.getvalue())
 
-    def test_explicit_backup_id_binds_preview_and_upgrade_destination(self) -> None:
-        module = self.load_script("profile_harness_installer_bound_backup", "install.py")
+    def test_installer_dry_run_rejects_stale_codex_registration(self) -> None:
+        module = self.load_script("profile_harness_installer_stale_preview", "install.py")
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            parent = Path(temporary_directory).resolve()
+            boundary = self.memory_boundary(
+                module,
+                marketplace_source=parent / "old-marketplace",
+                plugin_installed=True,
+            )
+            stderr = io.StringIO()
+            with (
+                mock.patch.object(
+                    module, "SubprocessCodexBoundary", return_value=boundary
+                ),
+                contextlib.redirect_stderr(stderr),
+                self.assertRaises(SystemExit) as raised,
+            ):
+                module.main([
+                    "--marketplace-root", str(parent / "marketplace"),
+                    "--bin-home", str(parent / "bin"), "--dry-run",
+                ])
+            self.assertEqual(2, raised.exception.code)
+            self.assertIn("uninstall it before a fresh install", stderr.getvalue())
+
+    def test_installer_dry_run_reports_codex_inspection_failure_without_traceback(self) -> None:
+        module = self.load_script("profile_harness_installer_failed_preview", "install.py")
+
+        class FailedBoundary:
+            def inspect(self):
+                raise RuntimeError("Codex returned invalid plugin state")
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            parent = Path(temporary_directory).resolve()
+            stderr = io.StringIO()
+            with (
+                mock.patch.object(
+                    module, "SubprocessCodexBoundary", return_value=FailedBoundary()
+                ),
+                contextlib.redirect_stderr(stderr),
+                self.assertRaises(SystemExit) as raised,
+            ):
+                module.main([
+                    "--marketplace-root", str(parent / "marketplace"),
+                    "--bin-home", str(parent / "bin"), "--dry-run",
+                ])
+            self.assertEqual(2, raised.exception.code)
+            self.assertIn("Codex returned invalid plugin state", stderr.getvalue())
+            self.assertNotIn("Traceback", stderr.getvalue())
+
+    def test_installer_rejects_an_existing_installation_without_mutation(self) -> None:
+        module = self.load_script("profile_harness_installer_fresh_only", "install.py")
         with tempfile.TemporaryDirectory() as directory:
             parent = Path(directory).resolve()
             marketplace = parent / "marketplace"
@@ -601,64 +756,15 @@ class PublicPackageTests(unittest.TestCase):
             executable = marketplace / "plugins/codex-profile-harness/bin/profile-harness"
             bin_home.mkdir()
             (bin_home / "profile-harness").symlink_to(executable)
-            backup_id = "agent-20260911t120000z"
-            expected = parent / f"marketplace.previous.{backup_id}"
-
-            preview = subprocess.run(
-                [
-                    sys.executable, str(ROOT / "scripts/install.py"),
-                    "--marketplace-root", str(marketplace), "--bin-home", str(bin_home),
-                    "--backup-id", backup_id, "--dry-run",
-                ],
-                text=True, capture_output=True, check=False,
-            )
-            self.assertEqual(0, preview.returncode, preview.stderr)
-            self.assertIn(f"Backup destination: {expected}", preview.stdout)
-            self.assertFalse(expected.exists())
-
             boundary = self.memory_boundary(
                 module, marketplace_source=marketplace, plugin_installed=True
             )
-            result = module.install(
-                ROOT, marketplace, bin_home, codex=boundary, backup_id=backup_id
-            )
-            self.assertEqual(expected, result.backup_path)
-            self.assertTrue(expected.is_dir())
-
-    def test_backup_id_rejects_unsafe_values_and_collision_before_mutation(self) -> None:
-        module = self.load_script("profile_harness_installer_backup_guard", "install.py")
-        for value in ("", "../escape", "slash/value", "space value", "bad\nvalue", "x" * 65):
-            with self.subTest(value=value), tempfile.TemporaryDirectory() as directory:
-                parent = Path(directory).resolve()
-                marketplace = parent / "marketplace"
-                build_local_marketplace(ROOT, marketplace)
-                boundary = self.memory_boundary(
-                    module, marketplace_source=marketplace, plugin_installed=True
-                )
-                with self.assertRaisesRegex(ValueError, "backup ID"):
-                    module.install(
-                        ROOT, marketplace, parent / "bin", codex=boundary,
-                        backup_id=value,
-                    )
-                self.assertTrue(marketplace.is_dir())
-                self.assertEqual([], boundary.commands)
-
-        with tempfile.TemporaryDirectory() as directory:
-            parent = Path(directory).resolve()
-            marketplace = parent / "marketplace"
-            build_local_marketplace(ROOT, marketplace)
-            (marketplace / "old-marker").write_text("old")
-            collision = parent / "marketplace.previous.fixed-backup"
-            collision.mkdir()
-            boundary = self.memory_boundary(
-                module, marketplace_source=marketplace, plugin_installed=True
-            )
-            with self.assertRaisesRegex(FileExistsError, "backup already exists"):
+            with self.assertRaisesRegex(FileExistsError, "uninstall.*fresh install"):
                 module.install(
-                    ROOT, marketplace, parent / "bin", codex=boundary,
-                    backup_id="fixed-backup",
+                    ROOT, marketplace, bin_home, codex=boundary,
                 )
-            self.assertEqual("old", (marketplace / "old-marker").read_text())
+            self.assertTrue(marketplace.is_dir())
+            self.assertTrue((bin_home / "profile-harness").is_symlink())
             self.assertEqual([], boundary.commands)
 
     def test_installer_rejects_symlinked_marketplace_and_bin_ancestors_preflight(self) -> None:
@@ -685,7 +791,7 @@ class PublicPackageTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "symlink ancestor"):
                 module.install(
                     ROOT, alias / "marketplace", parent / "bin",
-                    codex=boundary, backup_id="safe-id",
+                    codex=boundary,
                 )
             self.assertFalse(boundary.called)
             self.assertEqual([], list(real.iterdir()))
@@ -694,13 +800,13 @@ class PublicPackageTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "symlink ancestor"):
                 module.install(
                     ROOT, parent / "marketplace", alias / "bin",
-                    codex=boundary, backup_id="safe-id",
+                    codex=boundary,
                 )
             self.assertFalse(boundary.called)
             self.assertFalse((parent / "marketplace").exists())
             self.assertEqual([], list(real.iterdir()))
 
-    def test_safe_destination_rejects_bad_ancestors_and_guards_backup_path(self) -> None:
+    def test_safe_destination_rejects_bad_ancestors(self) -> None:
         module = self.load_script("profile_harness_installer_path_guard", "install.py")
         with tempfile.TemporaryDirectory() as directory:
             parent = Path(directory).resolve()
@@ -711,50 +817,29 @@ class PublicPackageTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "control character"):
                 module._safe_destination(parent / "bad\npath", "test target")
 
-            real = parent / "real"
-            real.mkdir()
-            alias = parent / "alias"
-            alias.symlink_to(real, target_is_directory=True)
-            with self.assertRaisesRegex(ValueError, "symlink ancestor"):
-                module._backup_destination(alias / "marketplace", "safe-id")
-
-    def test_agent_backup_contract_prepares_mapping_before_shared_mutation(self) -> None:
+    def test_agent_install_contract_requires_clean_reinstallation(self) -> None:
         contract = (ROOT / "INSTALL_AGENT.md").read_text(encoding="utf-8").lower()
         for phrase in (
-            "backup_id", "--backup-id \"$backup_id\"", "same backup destination",
-            "before shared installation mutation", "backup map recording fails",
-            "do not run the installer", "exact backup path reported by the installer",
-            "immediately restore", "collision",
+            "in-place upgrade", "uninstall", "fresh install",
         ):
             self.assertIn(phrase, contract, phrase)
 
-    def test_installer_uses_injectable_codex_boundary_and_recoverable_upgrade(self) -> None:
+    def test_installer_uses_injectable_codex_boundary_for_fresh_install(self) -> None:
         module = self.load_script("profile_harness_installer", "install.py")
         with tempfile.TemporaryDirectory() as temporary_directory:
             parent = Path(temporary_directory).resolve()
             marketplace = parent / "marketplace"
             bin_home = parent / "bin"
-            build_local_marketplace(ROOT, marketplace)
-            (marketplace / "old-marker").write_text("old")
-            old_binary = marketplace / "plugins/codex-profile-harness/bin/profile-harness"
-            bin_home.mkdir()
-            (bin_home / "profile-harness").symlink_to(old_binary)
-            boundary = self.memory_boundary(
-                module,
-                marketplace_source=marketplace,
-                plugin_installed=True,
-            )
+            boundary = self.memory_boundary(module)
 
             result = module.install(
                 ROOT,
                 marketplace,
                 bin_home,
                 codex=boundary,
-                timestamp="20260911T120000Z",
             )
             self.assertTrue((marketplace / "plugins/codex-profile-harness").is_dir())
-            self.assertTrue(result.backup_path.is_dir())
-            self.assertTrue((result.backup_path / "old-marker").is_file())
+
             executable = bin_home / "profile-harness"
             self.assertTrue(executable.is_symlink())
             self.assertEqual(
@@ -764,47 +849,11 @@ class PublicPackageTests(unittest.TestCase):
             self.assertTrue(boundary.plugin_installed)
             self.assertEqual(marketplace.resolve(), boundary.marketplace_source.resolve())
             self.assertEqual(
-                [("codex", "plugin", "remove", module.PLUGIN_SELECTOR),
+                [("codex", "plugin", "marketplace", "add", str(marketplace)),
                  ("codex", "plugin", "add", module.PLUGIN_SELECTOR)],
                 boundary.commands,
             )
             self.assertNotIn("dangerously-bypass", " ".join(sum(boundary.commands, ())))
-
-    def test_installer_restores_previous_marketplace_when_codex_fails(self) -> None:
-        module = self.load_script("profile_harness_installer_failure", "install.py")
-        with tempfile.TemporaryDirectory() as temporary_directory:
-            parent = Path(temporary_directory).resolve()
-            marketplace = parent / "marketplace"
-            build_local_marketplace(ROOT, marketplace)
-            (marketplace / "old-marker").write_text("old")
-            bin_home = parent / "bin"
-            bin_home.mkdir()
-            executable = bin_home / "profile-harness"
-            executable.symlink_to(
-                marketplace / "plugins/codex-profile-harness/bin/profile-harness"
-            )
-            boundary = self.memory_boundary(
-                module,
-                marketplace_source=marketplace,
-                plugin_installed=True,
-                fail_on=("codex", "plugin", "add", module.PLUGIN_SELECTOR),
-            )
-
-            with self.assertRaises(subprocess.CalledProcessError):
-                module.install(
-                    ROOT,
-                    marketplace,
-                    bin_home,
-                    codex=boundary,
-                    backup_id="failed-upgrade",
-                )
-            self.assertEqual("old", (marketplace / "old-marker").read_text())
-            self.assertEqual(
-                (marketplace / "plugins/codex-profile-harness/bin/profile-harness").resolve(),
-                executable.resolve(),
-            )
-            self.assertTrue(boundary.plugin_installed)
-            self.assertFalse((parent / "marketplace.previous.failed-upgrade").exists())
 
     def test_new_install_failure_restores_files_and_codex_state(self) -> None:
         module = self.load_script("profile_harness_installer_new_failure", "install.py")
@@ -819,7 +868,6 @@ class PublicPackageTests(unittest.TestCase):
             with self.assertRaises(subprocess.CalledProcessError):
                 module.install(
                     ROOT, marketplace, executable.parent, codex=boundary,
-                    timestamp="20260911T140000Z",
                 )
             self.assertFalse(marketplace.exists())
             self.assertFalse(executable.exists())
@@ -841,7 +889,7 @@ class PublicPackageTests(unittest.TestCase):
                 else:
                     (target / "keep.txt").write_text("keep")
                 boundary = self.memory_boundary(module)
-                with self.assertRaisesRegex(ValueError, "Harness marketplace"):
+                with self.assertRaisesRegex(FileExistsError, "uninstall.*fresh install"):
                     module.install(ROOT, target, parent / "bin", codex=boundary)
                 self.assertTrue(target.is_dir())
                 self.assertFalse((parent / "bin").exists())
@@ -861,7 +909,7 @@ class PublicPackageTests(unittest.TestCase):
                 value["name"] = "another-product"
                 identity.write_text(json.dumps(value))
                 boundary = self.memory_boundary(module)
-                with self.assertRaisesRegex(ValueError, "Harness marketplace"):
+                with self.assertRaisesRegex(FileExistsError, "uninstall.*fresh install"):
                     module.install(ROOT, target, parent / "bin", codex=boundary)
                 self.assertEqual([], boundary.commands)
 
@@ -877,7 +925,6 @@ class PublicPackageTests(unittest.TestCase):
             with self.assertRaises(subprocess.CalledProcessError):
                 module.install(
                     ROOT, target, parent / "bin", codex=boundary,
-                    timestamp="20260911T150000Z",
                 )
             self.assertIsNone(boundary.marketplace_source)
             self.assertFalse(boundary.plugin_installed)

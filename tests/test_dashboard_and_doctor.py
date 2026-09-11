@@ -694,6 +694,11 @@ class DoctorTests(unittest.TestCase):
                     "codex-profile-harness",
                 ),
                 (
+                    ".codex-plugin/plugin.json",
+                    lambda value: value.update({"hooks": "./wrong-hooks.json"}),
+                    "manifest hooks",
+                ),
+                (
                     "hooks/hooks.json",
                     lambda value: value["hooks"]["Stop"][0]["hooks"][0].update(
                         {"command": "python3 unsafe.py"}

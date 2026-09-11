@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.4.1 - 2026-09-12
+
+- Bind generated launchers to the validated Python 3.11+ used during installation,
+  so launchd and Codex hooks do not fall back to macOS Python 3.9.
+- Register plugin hooks explicitly and invoke the generated launcher directly.
+- Replace the nonexistent approval-popup instructions with the Codex app
+  `Settings → Hooks → Review → Trust` flow and CLI `/hooks` fallback.
+- Clarify that users create a profile folder, add it as a Codex project, and ask
+  the agent to install into that specific project directory.
+- Remove in-place upgrade support; replacement now means uninstalling only the
+  shared installation and installing the new release fresh while preserving profiles.
+
 ## 0.4.0 - 2026-09-12
 
 - Move repository status, tasks, and decisions into profile-owned

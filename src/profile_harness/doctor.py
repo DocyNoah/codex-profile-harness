@@ -108,7 +108,7 @@ PROFILE_LAYOUT_DIRECTORIES = tuple(
     value for value in PROFILE_DIRECTORIES if not value.startswith(".harness/")
 )
 PLUGIN_NAME = "codex-profile-harness"
-HOOK_COMMAND = 'python3 "$PLUGIN_ROOT/bin/profile-harness" hook capture'
+HOOK_COMMAND = '"$PLUGIN_ROOT/bin/profile-harness" hook capture'
 SCHEDULER_INTERVAL_SECONDS = 900
 SCHEDULER_PLACEHOLDERS = (
     "__PROFILE_ROOT__",
@@ -237,6 +237,8 @@ def _validate_manifest(value: object) -> None:
         )
     ):
         raise ValueError("interface.defaultPrompt must contain 1 to 3 short prompts")
+    if value.get("hooks") != "./hooks/hooks.json":
+        raise ValueError("manifest hooks must reference ./hooks/hooks.json")
 
 
 def _validate_hooks(value: object) -> None:
