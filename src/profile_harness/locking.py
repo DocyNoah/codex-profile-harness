@@ -20,6 +20,10 @@ from .fs import atomic_write_text, ensure_safe_directory, require_safe_path
 class LeaseBusyError(RuntimeError):
     """A live curation lease is already owned."""
 
+    def __init__(self, message: str, *, owner: dict[str, Any] | None = None) -> None:
+        super().__init__(message)
+        self.owner = dict(owner) if isinstance(owner, dict) else {}
+
 
 _LOCAL_LEASES = threading.local()
 
@@ -115,8 +119,12 @@ class ProfileLease:
                 metadata = self._existing_metadata()
             except ValueError:
                 metadata = {}
-            owner = json.dumps(metadata.get("owner", {}), sort_keys=True)
-            raise LeaseBusyError(f"curation lease is live: {owner}") from error
+            raw_owner = metadata.get("owner", {})
+            owner = raw_owner if isinstance(raw_owner, dict) else {}
+            owner_text = json.dumps(owner, sort_keys=True)
+            raise LeaseBusyError(
+                f"curation lease is live: {owner_text}", owner=owner
+            ) from error
         try:
             require_safe_path(self.root, self.path, directory=True)
             try:

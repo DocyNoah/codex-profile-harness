@@ -96,6 +96,7 @@ _MAX_OUTPUT = 16_384
 _MAX_APPLICATION_LIFECYCLE_BYTES = 2 * 1024 * 1024
 _TIMEOUT = 10
 _GUARD_TIMEOUT = 0.5
+_CHECKPOINT_LEASE_OPERATION = "profile-git-checkpoint"
 _MAX_MANAGED_FILES = 2_000
 _MAX_PATH_CHARS = 4_096
 _DISABLED_HOOKS = ".harness/state/profile-git-disabled-hooks"
@@ -880,13 +881,27 @@ def checkpoint_profile(
             stale_timeout = 300.0
         lease = None
         if not profile_lease_held(profile_root):
-            lease = ProfileLease(profile_root, stale_timeout=stale_timeout)
-            deadline = time.monotonic() + _GUARD_TIMEOUT
+            lease = ProfileLease(
+                profile_root,
+                owner={
+                    "pid": os.getpid(),
+                    "operation": _CHECKPOINT_LEASE_OPERATION,
+                },
+                stale_timeout=stale_timeout,
+            )
+            started = time.monotonic()
+            ordinary_deadline = started + _GUARD_TIMEOUT
+            checkpoint_deadline = started + _TIMEOUT
             while True:
                 try:
                     lease.acquire()
                     break
-                except LeaseBusyError:
+                except LeaseBusyError as error:
+                    deadline = (
+                        checkpoint_deadline
+                        if error.owner.get("operation") == _CHECKPOINT_LEASE_OPERATION
+                        else ordinary_deadline
+                    )
                     if time.monotonic() >= deadline:
                         raise
                     time.sleep(0.01)

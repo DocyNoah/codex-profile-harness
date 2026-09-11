@@ -1024,6 +1024,55 @@ class ProfileGitTests(unittest.TestCase):
             self.assertEqual(1, sum(bool(payload["committed"]) for payload in payloads))
             self.assertEqual(2, int(git(profile, "rev-list", "--count", "HEAD").stdout))
 
+    def test_checkpoint_waits_for_a_slow_checkpoint_owner(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            parent = Path(temporary_directory)
+            profile = parent / "profile"
+            ready = parent / "ready"
+            init_profile(profile, "Work")
+            (profile / "MEMORY.md").write_text("one shared change\n", encoding="utf-8")
+            holder_script = (
+                "import json,sys,time\n"
+                "from pathlib import Path\n"
+                "sys.path.insert(0, sys.argv[1])\n"
+                "import profile_harness.profile_git as profile_git\n"
+                "root=Path(sys.argv[2]);ready=Path(sys.argv[3])\n"
+                "original=profile_git._checkpoint_locked\n"
+                "def delayed(*args, **kwargs):\n"
+                "    ready.write_text('ready')\n"
+                "    time.sleep(0.8)\n"
+                "    return original(*args, **kwargs)\n"
+                "profile_git._checkpoint_locked=delayed\n"
+                "result=profile_git.checkpoint_profile(root, profile_git.CHECKPOINT_SUBJECT)\n"
+                "print(json.dumps(result.as_json_object()))\n"
+                "raise SystemExit(0 if result.error is None else 1)\n"
+            )
+            holder = subprocess.Popen(
+                [
+                    sys.executable, "-c", holder_script, str(ROOT / "src"),
+                    str(profile), str(ready),
+                ],
+                text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            try:
+                deadline = time.monotonic() + 3
+                while not ready.exists() and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                self.assertTrue(ready.exists())
+
+                result = checkpoint_profile(profile, CHECKPOINT_SUBJECT)
+                stdout, stderr = holder.communicate(timeout=5)
+
+                self.assertEqual(0, holder.returncode, stderr)
+                self.assertTrue(json.loads(stdout)["committed"])
+                self.assertFalse(result.committed)
+                self.assertIsNone(result.error)
+                self.assertEqual(2, int(git(profile, "rev-list", "--count", "HEAD").stdout))
+            finally:
+                if holder.poll() is None:
+                    holder.terminate()
+                    holder.wait(timeout=2)
+
     def test_initialization_keeps_git_init_and_first_commit_in_one_guard_section(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             profile = Path(temporary_directory) / "profile"
