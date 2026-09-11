@@ -21,16 +21,19 @@ from profile_harness.config import init_profile, register_repo  # noqa: E402
 from profile_harness.capture import capture_event  # noqa: E402
 from profile_harness.dashboard import generate_dashboard  # noqa: E402
 from profile_harness.doctor import diagnose  # noqa: E402
+from profile_harness.control import ControlOutbox  # noqa: E402
 from profile_harness.profile_git import (  # noqa: E402
     CHECKPOINT_SUBJECT,
     CheckpointResult,
     CURATION_SUBJECT,
     INITIALIZE_SUBJECT,
     REGISTRY_SUBJECT,
+    auto_push_checkpoint,
     checkpoint_profile,
     inspect_profile_git,
     profile_git_log,
     push_profile,
+    retry_auto_push,
     tracked_forbidden_paths,
 )
 import profile_harness.profile_git as profile_git_module  # noqa: E402
@@ -51,14 +54,18 @@ def subjects(root: Path) -> list[str]:
 
 
 class ProfileGitTests(unittest.TestCase):
-    def _configure_push(self, profile: Path, upstream: str, *, acknowledged: bool = True) -> None:
+    def _configure_push(
+        self, profile: Path, upstream: str, *, acknowledged: bool = True,
+        allow_local: bool = True,
+    ) -> None:
         config = profile / ".harness/config.toml"
         config.write_text(
             config.read_text(encoding="utf-8")
             + "\n[git]\n"
             + "auto_push = true\n"
             + f"upstream = {json.dumps(upstream)}\n"
-            + f"private_data_acknowledged = {'true' if acknowledged else 'false'}\n",
+            + f"private_data_acknowledged = {'true' if acknowledged else 'false'}\n"
+            + f"allow_local_file_remote = {'true' if allow_local else 'false'}\n",
             encoding="utf-8",
         )
 
@@ -71,7 +78,7 @@ class ProfileGitTests(unittest.TestCase):
             remote.mkdir()
             git(remote, "init", "--bare")
             branch = git(profile, "symbolic-ref", "--short", "HEAD").stdout.strip()
-            git(profile, "remote", "add", "origin", remote.as_uri())
+            git(profile, "remote", "add", "origin", remote.resolve().as_uri())
             git(profile, "config", f"branch.{branch}.remote", "origin")
             git(profile, "config", f"branch.{branch}.merge", f"refs/heads/{branch}")
             self._configure_push(profile, f"origin/{branch}")
@@ -89,9 +96,24 @@ class ProfileGitTests(unittest.TestCase):
                 diagnose(profile).format(),
             )
 
-            result = push_profile(profile, checkpoint.commit_sha)
+            original_git = profile_git_module._git
+            push_arguments: list[tuple[str, ...]] = []
+
+            def observe_push(root: Path, *arguments: str, **kwargs):
+                if arguments[:1] == ("push",):
+                    push_arguments.append(arguments)
+                return original_git(root, *arguments, **kwargs)
+
+            with mock.patch.object(profile_git_module, "_git", side_effect=observe_push):
+                result = auto_push_checkpoint(profile, checkpoint)
 
             self.assertTrue(result.pushed, result.error)
+            self.assertEqual(1, len(push_arguments))
+            self.assertIn("--no-follow-tags", push_arguments[0])
+            self.assertFalse(any(item == "--force" or item.startswith("+") for item in push_arguments[0]))
+            self.assertIn(
+                f"{checkpoint.commit_sha}:refs/heads/{branch}", push_arguments[0]
+            )
             self.assertEqual(checkpoint.commit_sha, git(remote, "rev-parse", f"refs/heads/{branch}").stdout.strip())
 
     def test_push_refuses_opt_out_missing_ack_detached_and_wrong_commit(self) -> None:
@@ -104,7 +126,7 @@ class ProfileGitTests(unittest.TestCase):
                 remote.mkdir()
                 git(remote, "init", "--bare")
                 branch = git(profile, "symbolic-ref", "--short", "HEAD").stdout.strip()
-                git(profile, "remote", "add", "origin", remote.as_uri())
+                git(profile, "remote", "add", "origin", remote.resolve().as_uri())
                 git(profile, "config", f"branch.{branch}.remote", "origin")
                 git(profile, "config", f"branch.{branch}.merge", f"refs/heads/{branch}")
                 if case != "opt_out":
@@ -146,7 +168,7 @@ class ProfileGitTests(unittest.TestCase):
                 if dangerous:
                     self.assertIn("helpers", result.error)
 
-    def test_push_subprocess_is_noninteractive_bounded_and_never_forces(self) -> None:
+    def test_push_subprocess_environment_is_noninteractive_and_bounded(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             parent = Path(temporary_directory)
             profile = parent / "profile"
@@ -168,7 +190,6 @@ class ProfileGitTests(unittest.TestCase):
                     check=False, literal_pathspecs=False, push_mode=True,
                 )
             observed = json.loads(record.read_text(encoding="utf-8"))
-            self.assertFalse(any(argument == "--force" or argument.startswith("+") for argument in observed["argv"]))
             self.assertEqual("0", observed["env"]["GIT_TERMINAL_PROMPT"])
             self.assertEqual("Never", observed["env"]["GCM_INTERACTIVE"])
             self.assertEqual("", observed["env"]["GIT_ASKPASS"])
@@ -185,7 +206,7 @@ class ProfileGitTests(unittest.TestCase):
             init_profile(profile, "Work")
             git(remote, "init", "--bare")
             branch = git(profile, "symbolic-ref", "--short", "HEAD").stdout.strip()
-            git(profile, "remote", "add", "origin", remote.as_uri())
+            git(profile, "remote", "add", "origin", remote.resolve().as_uri())
             git(profile, "remote", "set-url", "--add", "--push", "origin", "ext::false")
             git(profile, "config", f"branch.{branch}.remote", "origin")
             git(profile, "config", f"branch.{branch}.merge", f"refs/heads/{branch}")
@@ -194,7 +215,7 @@ class ProfileGitTests(unittest.TestCase):
             result = push_profile(profile, git(profile, "rev-parse", "HEAD").stdout.strip())
 
             self.assertFalse(result.pushed)
-            self.assertIn("unsafe", result.error)
+            self.assertIn("helpers", result.error)
 
     def test_push_refuses_non_fast_forward_without_rewriting_remote(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -206,13 +227,14 @@ class ProfileGitTests(unittest.TestCase):
             remote.mkdir()
             git(remote, "init", "--bare")
             branch = git(profile, "symbolic-ref", "--short", "HEAD").stdout.strip()
-            git(profile, "remote", "add", "origin", remote.as_uri())
+            git(profile, "remote", "add", "origin", remote.resolve().as_uri())
             git(profile, "config", f"branch.{branch}.remote", "origin")
             git(profile, "config", f"branch.{branch}.merge", f"refs/heads/{branch}")
             self._configure_push(profile, f"origin/{branch}")
-            first = git(profile, "rev-parse", "HEAD").stdout.strip()
-            self.assertTrue(push_profile(profile, first).pushed)
-            git(parent, "clone", remote.as_uri(), str(other))
+            initial = checkpoint_profile(profile, CHECKPOINT_SUBJECT)
+            first = initial.commit_sha
+            self.assertTrue(auto_push_checkpoint(profile, initial).pushed)
+            git(parent, "clone", remote.resolve().as_uri(), str(other))
             git(other, "checkout", "-b", branch, f"origin/{branch}")
             (other / "foreign").write_text("remote\n", encoding="utf-8")
             git(other, "add", "foreign")
@@ -227,6 +249,178 @@ class ProfileGitTests(unittest.TestCase):
             self.assertFalse(result.pushed)
             self.assertIn("fast-forward", result.error.lower())
             self.assertEqual(remote_before, git(remote, "rev-parse", f"refs/heads/{branch}").stdout.strip())
+
+    def test_push_rejects_push_options_userinfo_and_dirty_managed_state(self) -> None:
+        cases = ("push.followTags", "remote.origin.push", "remote.origin.receivepack")
+        for key in cases:
+            with self.subTest(key=key), tempfile.TemporaryDirectory() as temporary_directory:
+                profile = Path(temporary_directory) / "profile"
+                init_profile(profile, "Work")
+                branch = git(profile, "symbolic-ref", "--short", "HEAD").stdout.strip()
+                git(profile, "remote", "add", "origin", "https://example.invalid/repo")
+                git(profile, "config", f"branch.{branch}.remote", "origin")
+                git(profile, "config", f"branch.{branch}.merge", f"refs/heads/{branch}")
+                git(profile, "config", key, "true" if key == "push.followTags" else "unsafe")
+                self._configure_push(profile, f"origin/{branch}", allow_local=False)
+                result = push_profile(profile, git(profile, "rev-parse", "HEAD").stdout.strip())
+                self.assertFalse(result.pushed)
+                self.assertIn("helpers", result.error)
+
+        for url in ("https://user@example.invalid/repo", "ssh://user@example.invalid/repo"):
+            with self.subTest(url=url), tempfile.TemporaryDirectory() as temporary_directory:
+                profile = Path(temporary_directory) / "profile"
+                init_profile(profile, "Work")
+                branch = git(profile, "symbolic-ref", "--short", "HEAD").stdout.strip()
+                git(profile, "remote", "add", "origin", url)
+                git(profile, "config", f"branch.{branch}.remote", "origin")
+                git(profile, "config", f"branch.{branch}.merge", f"refs/heads/{branch}")
+                self._configure_push(profile, f"origin/{branch}", allow_local=False)
+                result = push_profile(profile, git(profile, "rev-parse", "HEAD").stdout.strip())
+                self.assertFalse(result.pushed)
+                self.assertNotIn("user@", result.error)
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            parent = Path(temporary_directory)
+            profile = parent / "profile"
+            remote = parent / "remote.git"
+            remote.mkdir()
+            init_profile(profile, "Work")
+            git(remote, "init", "--bare")
+            branch = git(profile, "symbolic-ref", "--short", "HEAD").stdout.strip()
+            git(profile, "remote", "add", "origin", remote.resolve().as_uri())
+            git(profile, "config", f"branch.{branch}.remote", "origin")
+            git(profile, "config", f"branch.{branch}.merge", f"refs/heads/{branch}")
+            self._configure_push(profile, f"origin/{branch}")
+            checkpoint = checkpoint_profile(profile, CHECKPOINT_SUBJECT)
+            (profile / "MEMORY.md").write_text("dirty\n", encoding="utf-8")
+            result = auto_push_checkpoint(profile, checkpoint)
+            self.assertFalse(result.pushed)
+            self.assertIn("dirty", result.error)
+
+    def test_file_remote_is_default_denied_and_symlink_remote_is_denied_when_opted_in(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            parent = Path(temporary_directory)
+            remote = parent / "remote.git"
+            remote.mkdir()
+            git(remote, "init", "--bare")
+            link = parent / "remote-link.git"
+            link.symlink_to(remote, target_is_directory=True)
+            for url, allow_local in ((remote.resolve().as_uri(), False), (link.as_uri(), True)):
+                with self.subTest(url=url, allow_local=allow_local):
+                    profile = parent / ("profile-default" if not allow_local else "profile-link")
+                    init_profile(profile, "Work")
+                    branch = git(profile, "symbolic-ref", "--short", "HEAD").stdout.strip()
+                    git(profile, "remote", "add", "origin", url)
+                    git(profile, "config", f"branch.{branch}.remote", "origin")
+                    git(profile, "config", f"branch.{branch}.merge", f"refs/heads/{branch}")
+                    self._configure_push(profile, f"origin/{branch}", allow_local=allow_local)
+                    result = push_profile(profile, git(profile, "rev-parse", "HEAD").stdout.strip())
+                    self.assertFalse(result.pushed)
+                    self.assertIn("local file", result.error)
+
+    def test_opted_in_file_remote_rejects_receive_hooks_commands_and_unsafe_permissions(self) -> None:
+        for unsafe_kind in ("hook", "receive_config", "permissions"):
+            with self.subTest(unsafe_kind=unsafe_kind), tempfile.TemporaryDirectory() as temporary_directory:
+                parent = Path(temporary_directory)
+                profile = parent / "profile"
+                remote = parent / "remote.git"
+                remote.mkdir()
+                init_profile(profile, "Work")
+                git(remote, "init", "--bare")
+                if unsafe_kind == "hook":
+                    hook = remote / "hooks/pre-receive"
+                    hook.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+                    hook.chmod(0o755)
+                elif unsafe_kind == "receive_config":
+                    git(remote, "config", "receive.procReceiveRefs", "refs/for")
+                else:
+                    remote.chmod(0o777)
+                branch = git(profile, "symbolic-ref", "--short", "HEAD").stdout.strip()
+                git(profile, "remote", "add", "origin", remote.resolve().as_uri())
+                git(profile, "config", f"branch.{branch}.remote", "origin")
+                git(profile, "config", f"branch.{branch}.merge", f"refs/heads/{branch}")
+                self._configure_push(profile, f"origin/{branch}")
+                result = push_profile(profile, git(profile, "rev-parse", "HEAD").stdout.strip())
+                self.assertFalse(result.pushed)
+                self.assertIn("local file remote", result.error)
+
+    def test_push_changes_only_target_branch_and_never_follows_tags(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            parent = Path(temporary_directory)
+            profile = parent / "profile"
+            remote = parent / "remote.git"
+            remote.mkdir()
+            init_profile(profile, "Work")
+            git(remote, "init", "--bare")
+            branch = git(profile, "symbolic-ref", "--short", "HEAD").stdout.strip()
+            git(profile, "remote", "add", "origin", remote.resolve().as_uri())
+            git(profile, "config", f"branch.{branch}.remote", "origin")
+            git(profile, "config", f"branch.{branch}.merge", f"refs/heads/{branch}")
+            self._configure_push(profile, f"origin/{branch}")
+            checkpoint = checkpoint_profile(profile, CHECKPOINT_SUBJECT)
+            git(profile, "tag", "local-only")
+            result = auto_push_checkpoint(profile, checkpoint)
+            self.assertTrue(result.pushed, result.error)
+            refs = git(remote, "for-each-ref", "--format=%(refname)").stdout.splitlines()
+            self.assertEqual([f"refs/heads/{branch}"], refs)
+
+    def test_remote_mutation_during_validation_fails_closed_while_using_literal_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            parent = Path(temporary_directory)
+            profile = parent / "profile"
+            first = parent / "first.git"
+            second = parent / "second.git"
+            first.mkdir(); second.mkdir()
+            init_profile(profile, "Work")
+            git(first, "init", "--bare"); git(second, "init", "--bare")
+            branch = git(profile, "symbolic-ref", "--short", "HEAD").stdout.strip()
+            git(profile, "remote", "add", "origin", first.resolve().as_uri())
+            git(profile, "config", f"branch.{branch}.remote", "origin")
+            git(profile, "config", f"branch.{branch}.merge", f"refs/heads/{branch}")
+            self._configure_push(profile, f"origin/{branch}")
+            checkpoint = checkpoint_profile(profile, CHECKPOINT_SUBJECT)
+            original_git = profile_git_module._git
+            mutated = False
+
+            def mutate_between_validation_and_push(root: Path, *arguments: str, **kwargs):
+                nonlocal mutated
+                if not mutated and arguments[:1] == ("push",):
+                    mutated = True
+                    git(profile, "remote", "set-url", "origin", second.resolve().as_uri())
+                return original_git(root, *arguments, **kwargs)
+
+            with mock.patch.object(profile_git_module, "_git", side_effect=mutate_between_validation_and_push):
+                result = auto_push_checkpoint(profile, checkpoint)
+            self.assertFalse(result.pushed)
+            self.assertIn("changed", result.error)
+            self.assertNotEqual(0, git(second, "show-ref", "--verify", f"refs/heads/{branch}", check=False).returncode)
+
+    def test_explicit_retry_uses_only_the_durable_failed_checkpoint(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            parent = Path(temporary_directory)
+            profile = parent / "profile"
+            remote = parent / "remote.git"
+            remote.mkdir()
+            init_profile(profile, "Work")
+            git(remote, "init", "--bare")
+            branch = git(profile, "symbolic-ref", "--short", "HEAD").stdout.strip()
+            git(profile, "remote", "add", "origin", "ext::false")
+            git(profile, "config", f"branch.{branch}.remote", "origin")
+            git(profile, "config", f"branch.{branch}.merge", f"refs/heads/{branch}")
+            self._configure_push(profile, f"origin/{branch}")
+            checkpoint = checkpoint_profile(profile, CHECKPOINT_SUBJECT)
+            failed = auto_push_checkpoint(profile, checkpoint)
+            self.assertFalse(failed.pushed)
+            git(profile, "remote", "set-url", "origin", remote.resolve().as_uri())
+
+            retried = retry_auto_push(profile)
+
+            self.assertTrue(retried.pushed, retried.error)
+            self.assertEqual(
+                checkpoint.commit_sha,
+                git(remote, "rev-parse", f"refs/heads/{branch}").stdout.strip(),
+            )
+            self.assertEqual(0, ControlOutbox(profile).status()["pending"])
 
     def test_hook_capture_never_invokes_slow_git_and_finishes_inside_envelope(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

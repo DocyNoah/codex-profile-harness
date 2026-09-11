@@ -62,7 +62,7 @@ class MaintenanceTests(unittest.TestCase):
             config = root / ".harness/config.toml"
             config.write_text(
                 config.read_text(encoding="utf-8")
-                + f'\n[git]\nauto_push = true\nupstream = "origin/{branch}"\nprivate_data_acknowledged = true\n',
+                + f'\n[git]\nauto_push = true\nupstream = "origin/{branch}"\nprivate_data_acknowledged = true\nallow_local_file_remote = true\n',
                 encoding="utf-8",
             )
             (root / "MEMORY.md").write_text("durable locally\n", encoding="utf-8")
@@ -74,23 +74,74 @@ class MaintenanceTests(unittest.TestCase):
             ).stdout.strip()
 
             self.assertFalse(failed["push"]["pushed"])
+            self.assertEqual("durable locally\n", subprocess.run(
+                ["git", "-C", str(root), "show", f"{committed}:MEMORY.md"],
+                text=True, capture_output=True, check=True,
+            ).stdout)
             self.assertEqual(1, ControlOutbox(root).status()["pending"])
+            (root / "MEMORY.md").write_text("second failed push\n", encoding="utf-8")
             failed_again = run_maintenance(root, now=NOW + timedelta(minutes=5))
             self.assertFalse(failed_again["push"]["pushed"])
+            self.assertNotEqual(
+                committed,
+                subprocess.run(
+                    ["git", "-C", str(root), "rev-parse", "HEAD"], text=True,
+                    capture_output=True, check=True,
+                ).stdout.strip(),
+            )
             self.assertEqual(1, ControlOutbox(root).status()["total"])
-            subprocess.run(["git", "-C", str(root), "remote", "set-url", "origin", remote.as_uri()], check=True)
+            subprocess.run(["git", "-C", str(root), "remote", "set-url", "origin", remote.resolve().as_uri()], check=True)
+            (root / "MEMORY.md").write_text("later successful checkpoint\n", encoding="utf-8")
 
             retried = run_maintenance(root, now=NOW + timedelta(minutes=15))
+            retried_commit = subprocess.run(
+                ["git", "-C", str(root), "rev-parse", "HEAD"], text=True,
+                capture_output=True, check=True,
+            ).stdout.strip()
 
             self.assertTrue(retried["push"]["pushed"])
             self.assertEqual(
-                committed,
+                retried_commit,
                 subprocess.run(
                     ["git", "-C", str(remote), "rev-parse", f"refs/heads/{branch}"],
                     text=True, capture_output=True, check=True,
                 ).stdout.strip(),
             )
             self.assertEqual(0, ControlOutbox(root).status()["pending"])
+
+    def test_failed_checkpoint_never_pushes_uncommitted_managed_bytes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            parent = Path(temporary_directory)
+            root = self.make_profile(parent)
+            remote = parent / "remote.git"
+            remote.mkdir()
+            subprocess.run(["git", "-C", str(remote), "init", "--bare"], check=True, capture_output=True)
+            branch = subprocess.run(
+                ["git", "-C", str(root), "symbolic-ref", "--short", "HEAD"],
+                text=True, capture_output=True, check=True,
+            ).stdout.strip()
+            subprocess.run(["git", "-C", str(root), "remote", "add", "origin", remote.resolve().as_uri()], check=True)
+            subprocess.run(["git", "-C", str(root), "config", f"branch.{branch}.remote", "origin"], check=True)
+            subprocess.run(["git", "-C", str(root), "config", f"branch.{branch}.merge", f"refs/heads/{branch}"], check=True)
+            config = root / ".harness/config.toml"
+            config.write_text(
+                config.read_text(encoding="utf-8")
+                + f'\n[git]\nauto_push = true\nupstream = "origin/{branch}"\nprivate_data_acknowledged = true\nallow_local_file_remote = true\n',
+                encoding="utf-8",
+            )
+            (root / "MEMORY.md").write_text("must not push\n", encoding="utf-8")
+
+            with self.fail_commit_subject(CHECKPOINT_SUBJECT):
+                with self.assertRaises(ProfileGitError):
+                    run_maintenance(root, now=NOW)
+
+            self.assertNotEqual(
+                0,
+                subprocess.run(
+                    ["git", "-C", str(remote), "show-ref", "--verify", f"refs/heads/{branch}"],
+                    capture_output=True,
+                ).returncode,
+            )
 
     def add_receipt(self, root: Path, index: int, captured_at: datetime) -> None:
         receipt_id = f"receipt-{index:02d}"
@@ -198,6 +249,7 @@ class MaintenanceTests(unittest.TestCase):
             self.assertFalse(config.git.auto_push)
             self.assertIsNone(config.git.upstream)
             self.assertFalse(config.git.private_data_acknowledged)
+            self.assertFalse(config.git.allow_local_file_remote)
             self.assertTrue(config.improvement.enabled)
             self.assertEqual("gpt-6-astra", config.improvement.model)
             self.assertEqual("high", config.improvement.reasoning_effort)
@@ -948,6 +1000,7 @@ class MaintenanceTests(unittest.TestCase):
             ).stdout.splitlines()
             self.assertEqual(
                 [
+                    "harness: checkpoint profile documents",
                     "harness: propose profile improvement",
                     "harness: curate profile memory",
                     "harness: checkpoint profile documents",

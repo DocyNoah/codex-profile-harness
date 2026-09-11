@@ -683,9 +683,13 @@ def apply_proposal(
         fail_after_writes=fail_after_writes,
         crash_after_checkpoint=crash_after_checkpoint,
     )
-    from .profile_git import auto_push_profile
+    from .profile_git import auto_push_checkpoint, checkpoint_profile
 
-    pushed = auto_push_profile(Path(root).resolve())
-    if pushed.commit_sha is not None or pushed.error is not None:
-        result["push"] = pushed.as_json_object()
+    profile_root = Path(root).resolve()
+    if load_profile_config(profile_root).git.auto_push:
+        checkpoint = checkpoint_profile(profile_root, APPLICATION_SUBJECT)
+        pushed = auto_push_checkpoint(profile_root, checkpoint)
+        result["push_checkpoint_sha"] = checkpoint.commit_sha
+        if pushed.commit_sha is not None or pushed.error is not None:
+            result["push"] = pushed.as_json_object()
     return result

@@ -105,6 +105,8 @@ def _run_maintenance_locked(
                 "status": "performed", "reason": due.curation_reason,
                 "batch_id": applied.batch_id, "receipt_count": len(batch.receipt_ids),
                 "changed_paths": [str(path) for path in applied.changed_paths],
+                "checkpoint_sha": applied.checkpoint_sha,
+                "checkpoint_error": applied.checkpoint_error,
             }
     improvement = _run_improvement_locked(profile_root, now=current, force=False)
     return {
@@ -113,12 +115,13 @@ def _run_maintenance_locked(
     }
 
 
-def _checkpoint_preflight(profile_root: Path, subject: str) -> None:
+def _checkpoint_preflight(profile_root: Path, subject: str):
     from .profile_git import ProfileGitError, checkpoint_profile
 
     result = checkpoint_profile(profile_root, subject)
     if result.error is not None:
         raise ProfileGitError(f"profile Git preflight failed: {result.error}")
+    return result
 
 
 def run_maintenance(root: Path, *, now: datetime | None = None) -> dict[str, Any]:
@@ -126,9 +129,21 @@ def run_maintenance(root: Path, *, now: datetime | None = None) -> dict[str, Any
     profile_root = Path(root).resolve()
     try:
         result = _run_maintenance(profile_root, now=now)
-        from .profile_git import auto_push_profile
+        from .profile_git import CheckpointResult, PushResult, auto_push_checkpoint
 
-        pushed = auto_push_profile(profile_root)
+        prior_push = result.pop("_push_result", None)
+        raw_checkpoint = result.pop("_push_checkpoint")
+        checkpoint = CheckpointResult(
+            bool(raw_checkpoint.get("committed")),
+            raw_checkpoint.get("commit_sha"),
+            tuple(raw_checkpoint.get("changed_paths", ())),
+            raw_checkpoint.get("error"),
+        )
+        pushed = (
+            PushResult(**prior_push)
+            if prior_push is not None
+            else auto_push_checkpoint(profile_root, checkpoint)
+        )
         if pushed.commit_sha is not None or pushed.error is not None:
             result["push"] = pushed.as_json_object()
         return result
@@ -173,11 +188,40 @@ def _run_maintenance(root: Path, *, now: datetime | None = None) -> dict[str, An
             )
             or CHECKPOINT_SUBJECT
         )
-        _checkpoint_preflight(profile_root, subject)
+        preflight_checkpoint = _checkpoint_preflight(profile_root, subject)
         config = load_profile_config(profile_root)
         current = _utc_now(now)
         result = _run_maintenance_locked(profile_root, config, current)
     result["control"] = _route_new_proposals(profile_root, result.get("improvement", {}), config)
+    from .profile_git import CHECKPOINT_SUBJECT, CheckpointResult, checkpoint_profile
+
+    route_checkpoint = (
+        checkpoint_profile(profile_root, CHECKPOINT_SUBJECT)
+        if result["control"] else CheckpointResult(False)
+    )
+    routed_pushes = [item["push"] for item in result["control"] if "push" in item]
+    candidates = (
+        route_checkpoint,
+        CheckpointResult(
+            result.get("improvement", {}).get("checkpoint_sha") is not None,
+            result.get("improvement", {}).get("checkpoint_sha"),
+            error=result.get("improvement", {}).get("checkpoint_error"),
+        ),
+        CheckpointResult(
+            result.get("curation", {}).get("checkpoint_sha") is not None,
+            result.get("curation", {}).get("checkpoint_sha"),
+            error=result.get("curation", {}).get("checkpoint_error"),
+        ),
+        preflight_checkpoint,
+    )
+    selected = (
+        CheckpointResult(False)
+        if routed_pushes and not route_checkpoint.committed
+        else next((item for item in candidates if item.committed), route_checkpoint)
+    )
+    if routed_pushes and not route_checkpoint.committed:
+        result["_push_result"] = routed_pushes[-1]
+    result["_push_checkpoint"] = selected.as_json_object()
     return result
 
 
@@ -214,7 +258,10 @@ def _route_new_proposals(
                 )
                 results.append({"proposal_id": candidate.stem, "status": "failed", "event_id": event["event_id"]})
             else:
-                results.append({"proposal_id": candidate.stem, "status": applied["status"]})
+                routed = {"proposal_id": candidate.stem, "status": applied["status"]}
+                if "push" in applied:
+                    routed["push"] = applied["push"]
+                results.append(routed)
             continue
         if manifest["status"] == "proposed":
             manifest = store.transition(candidate.stem, "proposed", "notified", "queued for Harness Control")

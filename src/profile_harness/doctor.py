@@ -909,11 +909,11 @@ def diagnose(
             findings.append(Finding("WARN", "git", "no remote is configured; local Git does not protect against disk loss"))
         if profile_config is not None and profile_config.git.auto_push:
             try:
-                branch, remote = validate_push_configuration(profile_root)
+                push = validate_push_configuration(profile_root)
             except (OSError, ValueError, RuntimeError) as error:
                 findings.append(Finding("ERROR", "git push", str(error)))
             else:
-                findings.append(Finding("OK", "git push", f"enabled for exact upstream {remote}/{branch}"))
+                findings.append(Finding("OK", "git push", f"enabled for exact upstream {push.upstream}"))
         if not any(item.subject == "git" and item.severity == "ERROR" for item in findings):
             findings.append(Finding("OK", "git", "local profile repository is readable"))
     checkpoint_failure = profile_root / ".harness/state/profile-git-failure.json"

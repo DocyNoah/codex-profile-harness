@@ -34,13 +34,13 @@ from .control import ControlOutbox, MAX_POLL_BYTES
 from .proposals import MAX_MANIFEST_BYTES, ProposalStore
 from .runner import run_codex
 from .profile_git import (
-    auto_push_profile,
+    CheckpointResult,
+    auto_push_checkpoint,
     CHECKPOINT_SUBJECT,
     checkpoint_profile,
-    current_profile_commit,
     inspect_profile_git,
     profile_git_log,
-    push_profile,
+    retry_auto_push,
 )
 
 
@@ -179,6 +179,7 @@ def _curation_settings(root: Path) -> tuple[str, float, float, str, str]:
 def _curate(arguments: argparse.Namespace) -> int:
     root = find_profile_root(Path.cwd())
     command, timeout, stale_timeout, model, reasoning_effort = _curation_settings(root)
+    checkpoint = CheckpointResult(False)
     with ProfileLease(root, stale_timeout=stale_timeout):
         recover_transactions(root)
         apply_batch_id = None
@@ -208,15 +209,17 @@ def _curate(arguments: argparse.Namespace) -> int:
                 "batch_id": applied.batch_id,
                 "changed_paths": [str(path) for path in applied.changed_paths],
             }
+            checkpoint = CheckpointResult(
+                applied.checkpoint_sha is not None,
+                applied.checkpoint_sha,
+                error=applied.checkpoint_error,
+            )
         else:
             if arguments.batch_id is not None:
                 raise ValueError("--batch is only valid with --apply")
             batch = prepare_curation(root, arguments.limit)
             if not batch.receipt_ids:
                 output = {"status": "no_op", "receipt_ids": []}
-                pushed = auto_push_profile(root)
-                if pushed.commit_sha is not None or pushed.error is not None:
-                    output["push"] = pushed.as_json_object()
                 print(json.dumps(output, sort_keys=True))
                 return 0
             result_path = batch.path / "result.json"
@@ -245,9 +248,15 @@ def _curate(arguments: argparse.Namespace) -> int:
                 "batch_id": applied.batch_id,
                 "changed_paths": [str(path) for path in applied.changed_paths],
             }
-    pushed = auto_push_profile(root)
-    if pushed.commit_sha is not None or pushed.error is not None:
-        output["push"] = pushed.as_json_object()
+            checkpoint = CheckpointResult(
+                applied.checkpoint_sha is not None,
+                applied.checkpoint_sha,
+                error=applied.checkpoint_error,
+            )
+    if checkpoint.committed or checkpoint.error is not None:
+        pushed = auto_push_checkpoint(root, checkpoint)
+        if pushed.commit_sha is not None or pushed.error is not None:
+            output["push"] = pushed.as_json_object()
     print(json.dumps(output, ensure_ascii=False, sort_keys=True))
     return 0
 
@@ -305,10 +314,14 @@ def main(argv: list[str] | None = None) -> int:
                 return 0 if status.initialized else 1
             if arguments.git_command == "checkpoint":
                 result = checkpoint_profile(root, CHECKPOINT_SUBJECT)
-                print(json.dumps(result.as_json_object(), ensure_ascii=False, sort_keys=True))
+                output = result.as_json_object()
+                pushed = auto_push_checkpoint(root, result)
+                if pushed.commit_sha is not None or pushed.error is not None:
+                    output["push"] = pushed.as_json_object()
+                print(json.dumps(output, ensure_ascii=False, sort_keys=True))
                 return 0 if result.error is None else 1
             if arguments.git_command == "push":
-                result = push_profile(root, current_profile_commit(root))
+                result = retry_auto_push(root)
                 print(json.dumps(result.as_json_object(), ensure_ascii=False, sort_keys=True))
                 return 0 if result.pushed else 1
             entries = profile_git_log(root, arguments.limit)

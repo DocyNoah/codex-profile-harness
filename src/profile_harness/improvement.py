@@ -730,7 +730,9 @@ def _run_locked(
             from .profile_git import IMPROVEMENT_SUBJECT, checkpoint_profile
 
             cleanup_runtime_files()
-            checkpoint_profile(root, IMPROVEMENT_SUBJECT)
+            checkpoint = checkpoint_profile(root, IMPROVEMENT_SUBJECT)
+            output["checkpoint_sha"] = checkpoint.commit_sha if checkpoint.committed else None
+            output["checkpoint_error"] = checkpoint.error
             return output
         except BaseException:
             if descriptor.exists():
@@ -753,9 +755,14 @@ def run_improvement(
             profile_root, now=current, force=force,
             fail_after_writes=fail_after_writes, crash_after_stage=crash_after_stage,
         )
-    from .profile_git import auto_push_profile
+    from .profile_git import CheckpointResult, auto_push_checkpoint
 
-    pushed = auto_push_profile(profile_root)
+    checkpoint = CheckpointResult(
+        result.get("checkpoint_sha") is not None,
+        result.get("checkpoint_sha"),
+        error=result.get("checkpoint_error"),
+    )
+    pushed = auto_push_checkpoint(profile_root, checkpoint)
     if pushed.commit_sha is not None or pushed.error is not None:
         result["push"] = pushed.as_json_object()
     return result

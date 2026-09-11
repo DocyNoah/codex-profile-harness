@@ -71,6 +71,8 @@ class ApplyResult:
     batch_id: str
     changed_paths: tuple[Path, ...]
     journal_entry: dict[str, Any]
+    checkpoint_sha: str | None = None
+    checkpoint_error: str | None = None
 
 
 LEGACY_CURATION_JOURNAL_REQUIRED_FIELDS = frozenset({
@@ -1562,10 +1564,14 @@ def apply_actions(
             _durable_replace(source, destination)
         _durable_rmtree(batch_path)
         _durable_unlink(transaction_path)
-        applied = ApplyResult(batch_id, tuple(dict.fromkeys(changed)), journal_entry)
         from .profile_git import CURATION_SUBJECT, checkpoint_profile
 
-        checkpoint_profile(profile.root, CURATION_SUBJECT)
+        checkpoint = checkpoint_profile(profile.root, CURATION_SUBJECT)
+        applied = ApplyResult(
+            batch_id, tuple(dict.fromkeys(changed)), journal_entry,
+            checkpoint.commit_sha if checkpoint.committed else None,
+            checkpoint.error,
+        )
         return applied
     except BaseException:
         if transaction is not None and transaction_path.exists():

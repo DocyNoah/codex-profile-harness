@@ -15,7 +15,7 @@ import subprocess
 import threading
 import time
 from typing import Any, BinaryIO
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 from .fs import atomic_write_text, ensure_safe_directory, require_safe_path
 
@@ -120,6 +120,14 @@ class PushResult:
 
     def as_json_object(self) -> dict[str, Any]:
         return asdict(self)
+
+
+@dataclass(frozen=True)
+class PushSnapshot:
+    branch: str
+    remote: str
+    upstream: str
+    url: str
 
 
 @dataclass(frozen=True)
@@ -634,7 +642,7 @@ def _one_local_config(root: Path, key: str) -> str | None:
 def _validate_push_repository_config(root: Path) -> None:
     result = _git(
         root, "config", "--local", "--name-only", "--get-regexp",
-        r"^(core\.hookspath|core\.sshcommand|filter\.|credential\.|url\.|remote\..*\.(receivepack|uploadpack|vcs|proxy)|protocol\.)",
+        r"^(core\.hookspath|core\.sshcommand|filter\.|credential\.|url\.|push\.|remote\..*\.(push|receivepack|uploadpack|vcs|proxy)|protocol\.)",
         check=False, read_only=True,
     )
     if result.returncode not in {0, 1}:
@@ -647,20 +655,64 @@ def _validate_push_repository_config(root: Path) -> None:
         raise ProfileGitError("repository Git filters are not allowed for automatic push")
 
 
-def _validate_remote_url(url: str) -> None:
+def _validate_local_file_remote(url: str) -> str:
+    parsed = urlsplit(url)
+    raw_path = Path(unquote(parsed.path))
+    if parsed.netloc or not raw_path.is_absolute():
+        raise ProfileGitError("local file remote is not canonical")
+    current = Path(raw_path.anchor)
+    for part in raw_path.parts[1:]:
+        current = current / part
+        try:
+            metadata = current.lstat()
+        except OSError as error:
+            raise ProfileGitError("local file remote is unavailable") from error
+        if current.is_symlink():
+            raise ProfileGitError("local file remote contains a symlink")
+    canonical = raw_path.resolve()
+    if canonical != raw_path or canonical.as_uri() != url:
+        raise ProfileGitError("local file remote is not canonical")
+    metadata = canonical.stat()
+    if metadata.st_uid != os.getuid() or metadata.st_mode & 0o022:
+        raise ProfileGitError("local file remote ownership or permissions are unsafe")
+    config_path = canonical / "config"
+    if config_path.is_symlink() or not config_path.is_file() or config_path.stat().st_size > _MAX_OUTPUT:
+        raise ProfileGitError("local file remote is not a bounded bare repository")
+    config_text = config_path.read_text(encoding="utf-8")
+    if re.search(r"(?im)^\s*bare\s*=\s*true\s*$", config_text) is None:
+        raise ProfileGitError("local file remote is not bare")
+    if re.search(
+        r"(?im)^\s*(?:\[(?:receive|uploadpack|filter|credential|include|url)\b|(?:hooksPath|sshCommand|receivepack|uploadpack|procReceiveRefs|helper|process|command|path)\s*=)",
+        config_text,
+    ):
+        raise ProfileGitError("local file remote contains command-like configuration")
+    hooks = canonical / "hooks"
+    if hooks.is_symlink() or not hooks.is_dir():
+        raise ProfileGitError("local file remote hooks directory is unsafe")
+    for hook in hooks.iterdir():
+        if hook.is_symlink() or (hook.is_file() and not hook.name.endswith(".sample")):
+            raise ProfileGitError("local file remote has an active receive hook")
+    return canonical.as_uri()
+
+
+def _validate_remote_url(url: str, *, allow_local_file_remote: bool) -> str:
     if not url or "\n" in url or "\0" in url or "\\" in url or "::" in url:
         raise ProfileGitError("remote URL is unsafe")
-    if re.fullmatch(r"(?:[^/@:\s]+@)?[^/:\s]+:[^:\s][^\s]*", url):
-        return
+    if "://" not in url and re.fullmatch(r"(?:[^/@:\s]+@)?[^/:\s]+:[^:\s][^\s]*", url):
+        return url
     parsed = urlsplit(url)
     if parsed.scheme in {"https", "ssh"} and parsed.netloc and parsed.path:
-        return
-    if parsed.scheme == "file" and not parsed.netloc and Path(parsed.path).is_absolute():
-        return
+        if parsed.username is not None or parsed.password is not None:
+            raise ProfileGitError("remote URL user information is not allowed")
+        return url
+    if parsed.scheme == "file":
+        if not allow_local_file_remote:
+            raise ProfileGitError("local file remotes require explicit local-only opt-in")
+        return _validate_local_file_remote(url)
     raise ProfileGitError("remote URL scheme is unsupported or ambiguous")
 
 
-def validate_push_configuration(root: Path) -> tuple[str, str]:
+def validate_push_configuration(root: Path) -> PushSnapshot:
     """Validate configured automatic-push policy without contacting a remote."""
     from .config import load_profile_config
 
@@ -690,8 +742,30 @@ def validate_push_configuration(root: Path) -> tuple[str, str]:
     ).stdout.splitlines()
     if len(urls) != 1:
         raise ProfileGitError("configured remote URL is missing or ambiguous")
-    _validate_remote_url(urls[0])
-    return branch, remote
+    url = _validate_remote_url(
+        urls[0], allow_local_file_remote=config.allow_local_file_remote
+    )
+    return PushSnapshot(branch, remote, config.upstream, url)
+
+
+def _remote_inventory(root: Path, url: str) -> dict[str, str]:
+    try:
+        result = _git(
+            root, "ls-remote", "--refs", url,
+            literal_pathspecs=False, read_only=True, push_mode=True,
+        )
+    except ProfileGitError as error:
+        raise ProfileGitError("cannot read bounded remote reference inventory") from error
+    inventory: dict[str, str] = {}
+    for line in result.stdout.splitlines():
+        fields = line.split()
+        if len(fields) != 2 or re.fullmatch(r"[a-f0-9]{40,64}", fields[0]) is None:
+            raise ProfileGitError("remote reference inventory is invalid")
+        reference = fields[1]
+        if reference in inventory:
+            raise ProfileGitError("remote reference inventory is ambiguous")
+        inventory[reference] = fields[0]
+    return inventory
 
 
 def push_profile(root: Path, commit_sha: str | None) -> PushResult:
@@ -707,30 +781,26 @@ def push_profile(root: Path, commit_sha: str | None) -> PushResult:
             raise ProfileGitError("private profile data acknowledgement is required")
         if config.upstream is None:
             raise ProfileGitError("automatic push upstream is missing")
-        branch, remote = validate_push_configuration(profile_root)
+        snapshot = validate_push_configuration(profile_root)
+        if _dirty_paths(profile_root):
+            raise ProfileGitError("managed profile state is dirty")
+        if validate_pending_checkpoint(profile_root) is not None:
+            raise ProfileGitError("a failed checkpoint is pending")
         if not isinstance(commit_sha, str) or re.fullmatch(r"[a-f0-9]{40,64}", commit_sha) is None:
             raise ProfileGitError("push commit identity is invalid")
         head = current_profile_commit(profile_root)
         branch_sha = _git(
-            profile_root, "rev-parse", "--verify", f"refs/heads/{branch}",
+            profile_root, "rev-parse", "--verify", f"refs/heads/{snapshot.branch}",
             read_only=True,
         ).stdout.strip()
         if commit_sha != head or commit_sha != branch_sha:
             raise ProfileGitError("push commit is not the exact attached branch HEAD")
-        remote_ref = f"refs/heads/{branch}"
-        advertised = _git(
-            profile_root, "ls-remote", "--heads", remote, remote_ref,
-            literal_pathspecs=False, read_only=True, push_mode=True,
-        ).stdout.splitlines()
-        if len(advertised) > 1:
-            raise ProfileGitError("remote branch advertisement is ambiguous")
-        if advertised:
-            fields = advertised[0].split()
-            if len(fields) != 2 or fields[1] != remote_ref or re.fullmatch(r"[a-f0-9]{40,64}", fields[0]) is None:
-                raise ProfileGitError("remote branch advertisement is invalid")
-            remote_sha = fields[0]
+        remote_ref = f"refs/heads/{snapshot.branch}"
+        before = _remote_inventory(profile_root, snapshot.url)
+        remote_sha = before.get(remote_ref)
+        if remote_sha is not None:
             fetched = _git(
-                profile_root, "fetch", "--no-tags", "--no-write-fetch-head", remote, remote_ref,
+                profile_root, "fetch", "--no-tags", "--no-write-fetch-head", snapshot.url, remote_ref,
                 check=False, literal_pathspecs=False, push_mode=True,
             )
             if fetched.returncode != 0:
@@ -741,20 +811,30 @@ def push_profile(root: Path, commit_sha: str | None) -> PushResult:
             )
             if fast_forward.returncode != 0:
                 raise ProfileGitError("remote update is not a fast-forward")
+        if validate_push_configuration(profile_root) != snapshot:
+            raise ProfileGitError("push configuration changed during validation")
         pushed = _git(
-            profile_root, "push", "--porcelain", "--no-verify", "--no-recurse-submodules",
-            remote, f"{commit_sha}:{remote_ref}",
+            profile_root, "push", "--porcelain", "--no-verify", "--no-follow-tags",
+            "--no-recurse-submodules", snapshot.url, f"{commit_sha}:{remote_ref}",
             literal_pathspecs=False, push_mode=True,
+            check=False,
         )
         if pushed.returncode != 0:
-            raise ProfileGitError("automatic push was rejected: " + (pushed.stderr or pushed.stdout).strip())
-        return PushResult(True, commit_sha, config.upstream)
+            raise ProfileGitError("automatic push was rejected without storing remote output")
+        after = _remote_inventory(profile_root, snapshot.url)
+        expected = dict(before)
+        expected[remote_ref] = commit_sha
+        if after != expected:
+            raise ProfileGitError("remote reference inventory changed unexpectedly")
+        if validate_push_configuration(profile_root) != snapshot:
+            raise ProfileGitError("push configuration changed before success confirmation")
+        return PushResult(True, commit_sha, snapshot.upstream)
     except (OSError, ValueError, ProfileGitError) as error:
         return PushResult(False, commit_sha, error=str(error))
 
 
-def _auto_push_unlocked(root: Path) -> PushResult:
-    """Attempt configured push while the caller holds the profile lease."""
+def _push_checkpoint_unlocked(root: Path, checkpoint: CheckpointResult) -> PushResult:
+    """Push one proven checkpoint while the caller holds the profile lease."""
     from .config import load_profile_config
     from .control import ControlOutbox
 
@@ -762,25 +842,19 @@ def _auto_push_unlocked(root: Path) -> PushResult:
     config = load_profile_config(profile_root)
     if not config.git.auto_push:
         return PushResult(False)
-    try:
-        commit_sha = current_profile_commit(profile_root)
-    except (OSError, ValueError, ProfileGitError) as error:
-        return PushResult(False, error=str(error))
+    if checkpoint.error is not None or not checkpoint.committed or checkpoint.commit_sha is None:
+        return PushResult(False, error="a successful exact checkpoint is required for push")
+    commit_sha = checkpoint.commit_sha
     result = push_profile(profile_root, commit_sha)
     diagnostic = require_safe_path(
         profile_root, profile_root / _PUSH_FAILURE_PATH, directory=False
     )
-    dedupe_key = f"git-push-failure:{commit_sha}"
+    upstream_key = config.git.upstream or "missing"
+    dedupe_key = f"git-push-failure:{upstream_key}"
     outbox = ControlOutbox(profile_root)
     if result.pushed:
         try:
-            previous_commit = None
-            if diagnostic.is_file() and not diagnostic.is_symlink():
-                previous = json.loads(diagnostic.read_text(encoding="utf-8"))
-                previous_commit = previous.get("commit_sha") if isinstance(previous, dict) else None
             outbox._resolve_dedupe_unlocked(dedupe_key)
-            if isinstance(previous_commit, str):
-                outbox._resolve_dedupe_unlocked(f"git-push-failure:{previous_commit}")
             diagnostic.unlink(missing_ok=True)
         except (OSError, ValueError):
             pass
@@ -790,7 +864,7 @@ def _auto_push_unlocked(root: Path) -> PushResult:
         "commit_sha": commit_sha,
         "upstream": config.git.upstream,
         "error": (result.error or "automatic push failed")[:4000],
-        "retry": "next successful checkpoint or explicit push",
+        "retry": "next successful checkpoint or explicit durable retry",
         "failed_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
     }
     try:
@@ -804,8 +878,8 @@ def _auto_push_unlocked(root: Path) -> PushResult:
     return result
 
 
-def auto_push_profile(root: Path) -> PushResult:
-    """Safely retry the configured exact HEAD push under the profile lease."""
+def auto_push_checkpoint(root: Path, checkpoint: CheckpointResult) -> PushResult:
+    """Push only a successful exact checkpoint under the profile lease."""
     from .config import load_profile_config
     from .locking import ProfileLease
 
@@ -817,8 +891,38 @@ def auto_push_profile(root: Path) -> PushResult:
         with ProfileLease(
             profile_root, stale_timeout=config.curation.stale_timeout_seconds
         ):
-            return _auto_push_unlocked(profile_root)
+            return _push_checkpoint_unlocked(profile_root, checkpoint)
     except (OSError, ValueError, RuntimeError, ProfileGitError) as error:
+        return PushResult(False, error=str(error))
+
+
+def retry_auto_push(root: Path) -> PushResult:
+    """Retry only the exact checkpoint recorded by a prior durable push failure."""
+    from .config import load_profile_config
+    from .locking import ProfileLease
+
+    profile_root = Path(root).resolve()
+    try:
+        config = load_profile_config(profile_root)
+        if not config.git.auto_push:
+            return PushResult(False, error="automatic push is disabled")
+        with ProfileLease(profile_root, stale_timeout=config.curation.stale_timeout_seconds):
+            diagnostic = require_safe_path(
+                profile_root, profile_root / _PUSH_FAILURE_PATH, directory=False
+            )
+            if diagnostic.is_symlink() or not diagnostic.is_file() or diagnostic.stat().st_size > _MAX_OUTPUT:
+                return PushResult(False, error="no durable automatic push retry is pending")
+            value = json.loads(diagnostic.read_text(encoding="utf-8"))
+            if (
+                not isinstance(value, dict)
+                or value.get("version") != 1
+                or value.get("upstream") != config.git.upstream
+                or not isinstance(value.get("commit_sha"), str)
+            ):
+                raise ProfileGitError("automatic push retry state is invalid")
+            checkpoint = CheckpointResult(True, value["commit_sha"])
+            return _push_checkpoint_unlocked(profile_root, checkpoint)
+    except (OSError, ValueError, RuntimeError, ProfileGitError, json.JSONDecodeError) as error:
         return PushResult(False, error=str(error))
 
 
