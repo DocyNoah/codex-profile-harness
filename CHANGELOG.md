@@ -2,11 +2,15 @@
 
 ## 0.4.1 - 2026-09-12
 
+- Replace the operator-heavy README with a concise user guide and a complete
+  agent-install request that names the source repository.
+- Require installation-time profile onboarding so `IDENTITY.md`, `USER.md`, and
+  `CONTEXT.md` do not remain untouched templates.
 - Bind generated launchers to the validated Python 3.11+ used during installation,
   so launchd and Codex hooks do not fall back to macOS Python 3.9.
 - Register plugin hooks explicitly and invoke the generated launcher directly.
-- Replace the nonexistent approval-popup instructions with the Codex app
-  `Settings → Hooks → Review → Trust` flow and CLI `/hooks` fallback.
+- Correct Codex app hook instructions to the current per-hook Trust controls and
+  retain the CLI `/hooks` fallback.
 - Clarify that users create a profile folder, add it as a Codex project, and ask
   the agent to install into that specific project directory.
 - Remove in-place upgrade support; replacement now means uninstalling only the

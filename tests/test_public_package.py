@@ -563,7 +563,66 @@ class PublicPackageTests(unittest.TestCase):
         self.assertIn('codex plugin remove "$PLUGIN_SELECTOR"', manual)
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
         self.assertIn("INSTALL_AGENT.md", readme)
-        self.assertIn("ask the local Codex agent", readme)
+        self.assertIn("Ask Codex to install it", readme)
+
+    def test_readme_is_user_facing_and_install_contract_handles_onboarding(self) -> None:
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        lowered = readme.lower()
+        for phrase in (
+            "https://github.com/DocyNoah/codex-profile-harness",
+            "INSTALL_AGENT.md",
+            "IDENTITY.md",
+            "USER.md",
+            "CONTEXT.md",
+            "MEMORY.md",
+            "project-context/",
+            "projects/",
+            ".harness/memory/inbox/",
+            ".harness/memory/semantic/",
+            ".harness/memory/procedural/",
+            "From Plugins",
+            "Stop",
+            "SessionEnd",
+            "Command",
+            "Trust",
+        ):
+            self.assertIn(phrase, readme, phrase)
+        for implementation_detail in (
+            "python3 scripts/install.py",
+            "profile-harness init",
+            "profile-harness register-repo",
+            "[curation]",
+            "[improvement]",
+            "Trust all",
+            "choose **Review**",
+            "api/",
+            "web/",
+        ):
+            self.assertNotIn(implementation_detail, readme, implementation_detail)
+        self.assertLessEqual(len(readme.splitlines()), 150)
+
+        contract = (ROOT / "INSTALL_AGENT.md").read_text(encoding="utf-8")
+        normalized_contract = " ".join(contract.split())
+        for phrase in (
+            "profile onboarding",
+            "IDENTITY.md",
+            "USER.md",
+            "CONTEXT.md",
+            "must not remain the untouched template",
+            "do not invent",
+            "From Plugins",
+            "Stop",
+            "SessionEnd",
+            "inspect each hook's **Command**",
+            "select **Trust**",
+        ):
+            self.assertIn(phrase.casefold(), normalized_contract.casefold(), phrase)
+        self.assertNotIn("choose **Review**", contract)
+        self.assertNotIn("Trust all", contract)
+        for name in ("README.md", "INSTALL.md", "INSTALL_AGENT.md", "SECURITY.md"):
+            document = (ROOT / name).read_text(encoding="utf-8")
+            self.assertNotIn("Trust all", document, name)
+            self.assertNotIn("Hooks → Review", document, name)
 
     def test_scheduler_templates_are_argv_only_bounded_and_profile_specific(self) -> None:
         launchd = plistlib.loads((ROOT / "examples/launchd.plist").read_bytes())
@@ -640,12 +699,7 @@ class PublicPackageTests(unittest.TestCase):
 
     def test_readme_describes_current_trigger_policy_and_agent_installation(self) -> None:
         readme = (ROOT / "README.md").read_text(encoding="utf-8").lower()
-        for phrase in (
-            "30", "4 hours", "24 hours", "10", "three distinct curations",
-            "proposal_only", "approval_required", "auto_safe",
-            "launchd", "systemd", "cron", "agent-assisted",
-            "auto_push", "opt-in", "exact upstream",
-        ):
+        for phrase in ("30", "4 hours", "24 hours", "10", "three distinct curations"):
             self.assertIn(phrase, readme, phrase)
         for stale in (
             "after **72 hours**", "it only writes proposals",
@@ -943,17 +997,17 @@ class PublicPackageTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 validator.validate_skill(skill)
 
-    def test_readme_config_example_matches_minimal_generated_config(self) -> None:
+    def test_operations_guide_config_example_matches_minimal_generated_config(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             _, plugin = self.build(Path(directory))
             profile = Path(directory) / "profile"
             self.assertEqual(0, self.run_cli(plugin, "init", str(profile), "--name", "Work").returncode)
             generated = (profile / ".harness/config.toml").read_text()
             self.assertNotIn("model", generated)
-        readme = (ROOT / "README.md").read_text()
-        self.assertIn("built-in defaults", readme)
-        self.assertIn("[curation]", readme)
-        self.assertIn('model = "gpt-5.6-sol"', readme)
+        operations = (ROOT / "INSTALL.md").read_text()
+        self.assertIn("built-in defaults", operations)
+        self.assertIn("[curation]", operations)
+        self.assertIn('model = "gpt-5.6-sol"', operations)
 
     def test_ci_covers_oldest_and_current_supported_python(self) -> None:
         workflow = (ROOT / ".github/workflows/ci.yml").read_text()

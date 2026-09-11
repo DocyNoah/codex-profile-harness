@@ -31,12 +31,13 @@ documents; protect `.harness/` and backups as confidential.
 ## Hook trust
 
 Hooks execute local code with the user's permissions. Inspect the source and
-generated `hooks/hooks.json` in Codex app **Settings → Hooks → Review** before
-selecting **Trust** or **Trust all**. The bundled hook invokes only the
-capture command, durably publishes receipt/cursor evidence, and calls neither a
-model nor Git. The installer never approves or bypasses hook trust. A malicious
-source checkout or local account can replace code before execution; use a
-reviewed release and normal filesystem protections.
+generated `hooks/hooks.json`, then open Codex app **Settings → Hooks**. Under
+**From Plugins**, select **Codex Profile Harness**, inspect the **Command** for
+both **Stop** and **SessionEnd**, and select **Trust** next to each hook. The
+bundled hook invokes only the capture command, durably publishes receipt/cursor
+evidence, and calls neither a model nor Git. The installer never approves or
+bypasses hook trust. A malicious source checkout or local account can replace
+code before execution; use a reviewed release and normal filesystem protections.
 
 ## Installation and managed Git paths
 

@@ -25,7 +25,10 @@ In-place upgrade and migration are not supported.
 ## 1. Inspect and define exact variables
 
 Confirm macOS or Linux, Python 3.11+, Git, an authenticated Codex CLI, and the
-target canonical profile directory. Inspect `.codex-plugin/plugin.json`,
+target canonical profile directory. Before mutation, ask for the profile display
+name and the onboarding information described in section 3 unless the user
+already supplied it. Do not substitute an example value for `PROFILE_NAME`.
+Inspect `.codex-plugin/plugin.json`,
 `hooks/hooks.json`, all existing Harness registrations, the executable link,
 the profile, scheduler artifacts, cron markers, and Harness Control tasks.
 Before any mutation, run and inspect these public capability checks:
@@ -59,7 +62,7 @@ RELEASE_ROOT='/canonical/release/root'
 PYTHON_EXECUTABLE='/stable/absolute/path/to/python3.11-or-newer'
 USER_HOME='/canonical/current-user-home'
 PROFILE_ROOT='/canonical/profile/root'
-PROFILE_NAME='Work'
+PROFILE_NAME='agent-confirmed-profile-name'
 MARKETPLACE_ROOT='/canonical/codex-profile-harness-marketplace'
 BIN_LINK='/canonical/bin/profile-harness'
 HARNESS_EXECUTABLE='/canonical/marketplace/plugins/codex-profile-harness/bin/profile-harness'
@@ -143,15 +146,40 @@ and a real directory below `projects/`. Registration creates only
 not create or modify `AGENTS.md`, `STATUS.md`, `TASKS.md`, `DECISIONS.md`, or a
 decision directory inside the user's repository.
 
+### Profile onboarding
+
+Inspect `IDENTITY.md`, `USER.md`, and `CONTEXT.md` immediately after profile
+initialization. For a new profile, these files must not remain the untouched
+template. Ask the user only for missing information needed to establish:
+
+- the profile's purpose, role, responsibilities, and boundaries in `IDENTITY.md`;
+- stable user preferences, working style, and explicit constraints in `USER.md`;
+- current profile-wide goals and durable background in `CONTEXT.md`.
+
+Do not invent answers or infer durable preferences from silence. Show a concise
+draft or summary before writing. If any file already contains user-authored
+content, preserve it and propose only the changes needed for the requested setup.
+If the user postpones onboarding, report that the profile setup is incomplete and
+do not claim that the installation is complete.
+
+`MEMORY.md` is an index for curated memory, not the memory body. Keep its initial
+index role; later capture writes evidence to `.harness/memory/inbox/`, and
+curation writes knowledge under `.harness/memory/semantic/` and
+`.harness/memory/procedural/`. Routine curation does not populate `IDENTITY.md`,
+`USER.md`, or `CONTEXT.md`. After onboarding, checkpoint the managed profile
+documents using the Harness CLI from `PROFILE_ROOT` and show the result.
+
 The plugin manifest registers its hooks automatically. Registration is not
-execution permission. Tell the user to open Codex app **Settings → Hooks**, select
-**Codex Profile Harness**, choose **Review**, inspect
-`"$PLUGIN_ROOT/bin/profile-harness" hook capture`, and select **Trust** or
-**Trust all**. Do not claim that an approval popup will appear. If the app screen
-is unavailable, direct the user to the CLI `/hooks` management screen as the
-fallback. Never select Trust on the user's behalf and never use a hook-trust
-bypass. After confirmation, start a new task and verify that a capture receipt is
-created for the profile.
+execution permission. Tell the user to open Codex app **Settings → Hooks**, find
+**From Plugins**, and select **Codex Profile Harness**. In its details, open the
+**Stop** and **SessionEnd** hooks, inspect each hook's **Command**, and confirm it
+is `"$PLUGIN_ROOT/bin/profile-harness" hook capture`. Then select **Trust** next
+to each hook and make sure its switch is enabled. Do not describe a Review button
+or claim that an approval popup will appear. If the app screen is unavailable,
+direct the user to the CLI `/hooks` management screen as the fallback. Never
+select Trust on the user's behalf and never use a hook-trust bypass. After
+confirmation, start a new task and verify that a capture receipt is created for
+the profile.
 
 ## 4. Attach exactly one scheduler to this profile
 
@@ -342,7 +370,10 @@ crontab -l
 
 Trigger one maintenance run and confirm its exit status. Confirm the Harness
 Control heartbeat receives top-level `[]` for an empty outbox. Documentation or
-an unrendered template is never installation evidence.
+an unrendered template is never installation evidence. Confirm that
+`IDENTITY.md`, `USER.md`, and `CONTEXT.md` contain the user-approved onboarding
+content rather than untouched template instructions, and that their managed Git
+checkpoint is clean. Confirm that `MEMORY.md` still describes its index role.
 
 ## 7. Clean reinstall only
 

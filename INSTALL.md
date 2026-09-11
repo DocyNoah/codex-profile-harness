@@ -82,11 +82,13 @@ only:
 ```
 
 Registration does not grant execution permission. In the Codex app, open
-**Settings → Hooks**, select **Codex Profile Harness**, choose **Review**, inspect
-the displayed command above, and then select **Trust** or **Trust all**. If that
-app screen is unavailable, open the CLI `/hooks` management screen, inspect the
-same command, and select **Trust** there. There is no automatic approval popup;
-never use a hook-trust bypass. Start a new task after this one-time confirmation.
+**Settings → Hooks**, find **From Plugins**, and select **Codex Profile Harness**.
+Open the **Stop** and **SessionEnd** hooks, inspect each **Command**, and confirm
+that it matches the command above. Select **Trust** next to each hook and make
+sure its switch is enabled. If that app screen is unavailable, open the CLI
+`/hooks` management screen, inspect the same commands, and select **Trust** there.
+There is no Review button or automatic approval popup; never use a hook-trust
+bypass. Start a new task after this one-time confirmation.
 Capture reads
 only a bounded regular transcript below `CODEX_HOME`. Missing, malformed,
 oversized, changed, or unsafe transcript input falls back to bounded hook data,
@@ -96,11 +98,12 @@ hook payload and transcript formats are not guaranteed APIs.
 ## First profile and repositories
 
 ```sh
-PROFILE_ROOT="$HOME/codex-profiles/work"
-profile-harness init "$PROFILE_ROOT" --name "Work"
-mkdir -p "$PROFILE_ROOT/projects/api" "$PROFILE_ROOT/projects/web"
-profile-harness register-repo "$PROFILE_ROOT" api "$PROFILE_ROOT/projects/api"
-profile-harness register-repo "$PROFILE_ROOT" web "$PROFILE_ROOT/projects/web"
+PROFILE_ROOT="/absolute/path/to/the/profile"
+PROFILE_NAME="agent-confirmed-profile-name"
+REPOSITORY_ID="agent-confirmed-repository-id"
+REPOSITORY_ROOT="$PROFILE_ROOT/projects/$REPOSITORY_ID"
+profile-harness init "$PROFILE_ROOT" --name "$PROFILE_NAME"
+profile-harness register-repo "$PROFILE_ROOT" "$REPOSITORY_ID" "$REPOSITORY_ROOT"
 cd "$PROFILE_ROOT"
 profile-harness doctor --check-codex
 profile-harness git status
@@ -110,6 +113,20 @@ Initialization preserves existing user files and creates automatic local Git
 history. Registration accepts only real directories below `projects/`, creates
 their harness documents under `project-context/<repo-id>/`, and never writes
 harness files into the registered repository.
+
+### Profile onboarding
+
+Initialization creates conservative templates; it does not know the profile's
+identity or the user's preferences. For a new profile, ask the user for the
+profile's purpose, responsibilities, boundaries, stable working preferences,
+constraints, current goals, and durable background. Use only those answers to
+initialize `IDENTITY.md`, `USER.md`, and `CONTEXT.md`. Preserve existing content,
+do not invent missing facts, and checkpoint the user-approved result.
+
+Routine curation does not fill those three files. Captured evidence enters
+`.harness/memory/inbox/`; curated knowledge is written under
+`.harness/memory/semantic/` and `.harness/memory/procedural/`. `MEMORY.md` remains
+a human-readable index to that curated memory rather than the memory body itself.
 
 ## Scheduling and models
 
@@ -133,6 +150,31 @@ runs with `gpt-6-astra` / `high` after a 24 hours cooldown and either 10 new
 curations or one validated improvement signal repeated across three curations.
 Not-due runs consume no model token; due work consumes tokens. Approval is the
 default; proposal-only and explicitly allowlisted `auto_safe` modes are available.
+These are built-in defaults; a new profile's minimal configuration does not
+repeat them. Add explicit overrides only when needed:
+
+```toml
+[curation]
+model = "gpt-5.6-sol"
+reasoning_effort = "medium"
+maintenance_receipt_threshold = 30
+maintenance_max_receipts = 30
+maintenance_max_age_seconds = 14400
+
+[improvement]
+model = "gpt-6-astra"
+reasoning_effort = "high"
+cooldown_seconds = 86400
+high_threshold = 10
+mode = "approval_required"
+automatic_paths = []
+automatic_max_changed_bytes = 64000
+reminder_seconds = 86400
+
+[git]
+auto_push = false
+private_data_acknowledged = false
+```
 
 Maintenance scheduling is separate from the Codex control heartbeat. Give the
 rendered [templates/automations/harness-control.md](templates/automations/harness-control.md)
@@ -175,8 +217,8 @@ Pause scheduling, then back up the whole profile. This includes private evidence
 profile `.git` history, and nested repositories:
 
 ```sh
-PROFILE_ROOT="$HOME/codex-profiles/work"
-BACKUP_FILE="$HOME/codex-profile-work-backup.tar.gz"
+PROFILE_ROOT="/absolute/path/to/the/profile"
+BACKUP_FILE="/absolute/path/to/a/private/profile-backup.tar.gz"
 tar -czf "$BACKUP_FILE" -C "$(dirname "$PROFILE_ROOT")" "$(basename "$PROFILE_ROOT")"
 tar -tzf "$BACKUP_FILE"
 ```
@@ -188,7 +230,7 @@ alone can be lost with the disk. Restore into an empty parent and validate:
 RESTORE_PARENT="$HOME/restored-codex-profiles"
 mkdir -p "$RESTORE_PARENT"
 tar -xzf "$BACKUP_FILE" -C "$RESTORE_PARENT"
-cd "$RESTORE_PARENT/work"
+cd "$RESTORE_PARENT/$(basename "$PROFILE_ROOT")"
 profile-harness doctor
 ```
 
@@ -254,7 +296,8 @@ preserved; delete them only with a verified backup and an explicit decision.
 - `curation lease is live`: let the active run finish; do not remove its lock.
 - Missing Codex: capture/status/doctor still work, but due model runs require an
   installed and authenticated CLI.
-- Hook does not fire: open Codex app **Settings → Hooks**, confirm that **Codex
-  Profile Harness** is listed, choose **Review**, inspect the command, and select
-  **Trust**. Use the CLI `/hooks` management screen only if the app UI is unavailable.
+- Hook does not fire: open Codex app **Settings → Hooks**, find **From Plugins**,
+  select **Codex Profile Harness**, inspect the **Command** for both **Stop** and
+  **SessionEnd**, select **Trust** next to each, and make sure both switches are
+  enabled. Use the CLI `/hooks` screen only if the app UI is unavailable.
 - Broken config: run `profile-harness doctor --profile "$PROFILE_ROOT"`.

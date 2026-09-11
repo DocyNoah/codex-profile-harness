@@ -1,210 +1,122 @@
 # Codex Profile Harness
 
-Codex Profile Harness turns one Codex project into one durable **profile**:
-profile-wide identity and memory live at the project root, while any number of
-real Git repositories live below `projects/`. It captures bounded conversation
-evidence, curates useful memory when due, proposes harness improvements, and
-keeps managed profile documents in automatic local Git history.
+Codex Profile Harness turns one Codex project into a durable working profile.
+The profile keeps its own role, user preferences, context, memory, and status for
+multiple Git repositories without adding harness files to those repositories.
 
-## Quick start
+## Why use it?
 
-Requirements: macOS or Linux, Python 3.11+, Git, and an installed/authenticated
-Codex CLI. First create the directory that will be the profile, add that directory
-to the Codex app as a project, and open a new task in that project. Clone or
-download [this repository](https://github.com/DocyNoah/codex-profile-harness),
-then ask the local Codex agent: **“Read `<downloaded-path>/INSTALL_AGENT.md` and install the
-profile harness in this project directory. Show the preview first and verify the
-result.”** The repository deliberately
-does not promise a universal installer. The agent inspects the real machine,
-selects launchd or user systemd (cron only as fallback), and verifies actual
-scheduler evidence. The bundled installer is only an optional, bounded primitive
-for the shared plugin/CLI files. For a manual plugin/CLI install, inspect
-`hooks/hooks.json`, then run:
+- Keep different Codex profiles separate, such as development, marketing, and research.
+- Resume work with durable profile context instead of explaining everything again.
+- Track each repository's current status, unfinished work, and decisions outside its codebase.
+- Capture conversations, curate useful memory, and surface reviewable improvement proposals.
+- Keep profile-owned documents in automatic local Git history.
 
-```sh
-python3 scripts/install.py
-export PATH="$HOME/.local/bin:$PATH"
-profile-harness init "$HOME/codex-profiles/work" --name "Work"
-mkdir -p "$HOME/codex-profiles/work/projects/api"
-profile-harness register-repo "$HOME/codex-profiles/work" api "$HOME/codex-profiles/work/projects/api"
-cd "$HOME/codex-profiles/work"
-profile-harness doctor --check-codex
-profile-harness dashboard
-```
+## Ask Codex to install it
 
-The installer builds a fixed allowlist into a local marketplace, installs selector
-`codex-profile-harness@codex-profile-harness-local`, and automatically registers
-the bundled hooks. It cannot select the security confirmation for the user. In
-the Codex app, open **Settings → Hooks**, select **Codex Profile Harness**, choose
-**Review**, inspect the displayed command, then select **Trust** (or **Trust all**
-for both bundled events). If the app UI is unavailable, use the CLI `/hooks`
-management screen as a fallback. See
-[INSTALL.md](INSTALL.md) for dry-run, manual installation, and recovery.
+1. Create an empty folder for the profile.
+2. Add that folder to the Codex app as a project and open a new task in it.
+3. Send this request:
 
-The marketplace, plugin selector, and executable link are one **global shared
-installation**. Each profile adds a **per-profile attachment** consisting of its
-profile data, scheduler, and profile-identified Harness Control task/heartbeat.
-Additional profiles reuse the shared installation.
-In-place upgrades are not supported. To replace the shared version, detach its
-automations, remove only the shared installation, and install the new release
-fresh. Profile directories and their Git histories stay in place.
+> Install Codex Profile Harness from
+> https://github.com/DocyNoah/codex-profile-harness into the current Codex
+> project. Read `INSTALL_AGENT.md` from that repository first and follow it for
+> installation, configuration, and verification. Before changing anything, ask
+> me for the profile's name, purpose, role, working preferences, and current
+> context; use my answers to initialize `IDENTITY.md`, `USER.md`, and
+> `CONTEXT.md`. Tell me only about steps that I must perform myself, using the
+> exact screen and button names.
 
-## How it works
+This agent-assisted installation handles commands, platform-specific scheduling,
+plugin registration, and verification. Advanced manual installation and recovery
+details are in [INSTALL.md](INSTALL.md).
+
+### Enable the hooks in the Codex app
+
+The plugin registers its hooks, but Codex requires you to trust each new or changed
+hook before it can run. When the installation agent asks you to do so:
+
+1. Open **Settings** (`⌘,` on macOS) and select **Hooks**.
+2. Under **From Plugins**, select **Codex Profile Harness**.
+3. Open the **Stop** and **SessionEnd** hooks and inspect each **Command**.
+4. Select **Trust** next to each hook and make sure both switches are enabled.
+
+There is no automatic approval popup. If the app screen is unavailable, use the
+CLI `/hooks` screen as a fallback. Codex documents the trust requirement in the
+[official hooks documentation](https://developers.openai.com/codex/hooks).
+
+## What the profile contains
+
+The bracketed rows below describe contents; they are not literal folder names.
 
 ```text
-profile/                         one Codex project and profile
-├── IDENTITY.md USER.md          stable profile identity and user context
-├── CONTEXT.md MEMORY.md         profile context and curated summary
-├── PROJECTS.toml                registered nested repositories
-├── DASHBOARD.md                 generated status view (ignored)
-├── project-context/             profile-owned, automatically checkpointed
-│   ├── api/
-│   │   ├── STATUS.md            current API state
-│   │   ├── TASKS.md             unfinished API work
-│   │   ├── DECISIONS.md         compact active-decision index
-│   │   └── decisions/           individual decision records
-│   └── web/
-├── .harness/                    config, captured evidence, curated memory,
-│                                journals, proposals, and runtime state
-└── projects/
-    ├── api/                     ordinary repository; no harness files added
-    └── web/                     ordinary repository; no harness files added
+[profile folder]/
+├── AGENTS.md                 instructions Codex follows in this profile
+├── IDENTITY.md               the profile's role, responsibilities, and boundaries
+├── USER.md                   your stable preferences and working style
+├── CONTEXT.md                current profile-wide goals and background
+├── MEMORY.md                 index for curated long-term memory
+├── PROJECTS.toml             registered repositories
+├── DASHBOARD.md              generated overview
+│
+├── project-context/
+│   └── [one folder per registered repository]
+│       ├── STATUS.md         current state
+│       ├── TASKS.md          unfinished work
+│       ├── DECISIONS.md      active decision index
+│       └── decisions/        decision history
+│
+├── projects/
+│   └── [your Git repositories]
+│
+└── .harness/                 automatic memory, evidence, proposals, and runtime state
 ```
 
-- **Captured** data is model-free, immutable, redacted evidence from lifecycle
-  hooks. When a supported transcript delta is unavailable or unsafe, capture
-  falls back to the bounded last assistant message and marks quality `partial`.
-  Hooks durably publish only the receipt and transcript cursor; they do not wait
-  for Git.
-- **Curated** data is a model-produced, schema-bounded reconciliation of missed,
-  duplicate, or conflicting state. Normal work updates the corresponding
-  `project-context/<repo-id>/STATUS.md` and `TASKS.md` directly and naturally.
-- **Improved** data is a versioned, reviewable proposal under
-  `.harness/improvements/proposed/`. `proposal_only` retains it locally,
-  `approval_required` proactively routes it to Harness Control, and `auto_safe`
-  applies only exact user-allowlisted targets that pass deterministic limits.
+Normally, you work in `projects/` and read or update the Markdown files through
+Codex. Do not edit `.harness/` unless you are diagnosing the harness.
 
-The transcript file format and Codex hook payload are host implementation details,
-not guaranteed public APIs. Unsafe or changed formats degrade to safe fallback.
+## Set up and maintain the profile
 
-## Models, schedule, and token use
+`IDENTITY.md`, `USER.md`, and `CONTEXT.md` are not filled by routine curation.
+The installation agent initializes them from your answers. You can edit them
+directly later or ask Codex, for example:
 
-Agent-assisted installation uses a macOS launchd or Linux user-systemd timer by
-default, with [cron](examples/cron.example) only as a fallback. Every **15
-minutes**, `profile-harness maintain --profile PATH` first performs model-free
-due checks:
+> Update this profile's identity, user preferences, and current context. Ask me
+> about anything that is unclear, then show me what changed.
 
-- Curation uses `gpt-5.6-sol` at `medium` only when at least **30** valid receipts
-  exist or the oldest valid receipt is at least **4 hours** old; at most 30 are
-  processed per run.
-- Improvement uses `gpt-6-astra` at `high`. It requires a **24 hours** cooldown
-  and then runs when either at least **10** new curations exist or the same
-  validated signal appears in **three distinct curations**.
+Captured evidence waits in `.harness/memory/inbox/`. Curated knowledge is stored
+under `.harness/memory/semantic/` and `.harness/memory/procedural/`; `MEMORY.md`
+is their human-readable index rather than the memory body itself. During normal
+repository work, Codex updates the matching `project-context/` documents naturally.
+Scheduled curation only repairs missed, duplicate, or conflicting state.
 
-One dedicated `Harness Control` Codex task uses `gpt-5.6-luna` at `low`. Its
-separate 15-minute heartbeat polls the local outbox, stays quiet for `[]`, and
-asks before applying or acknowledging anything.
+## Everyday use
 
-Empty and not-due runs use no model tokens. Due curation and improvement consume
-Codex model tokens in proportion to bounded evidence and curated state. A new
-profile writes only its name and config format version; the values above are
-built-in defaults. Add explicit override tables to `.harness/config.toml` when
-needed, for example:
+- Open the profile project in Codex and work normally in any repository below `projects/`.
+- Ask Codex to register a repository when you add one.
+- Open `DASHBOARD.md` for a generated overview.
+- When Harness Control presents an improvement, review and approve or reject it in that task.
+- Ask Codex to “check the profile harness” if capture, memory, or scheduling looks wrong.
 
-```toml
-version = 1
-name = "Work"
+## Automation at a glance
 
-[curation]
-model = "gpt-5.6-sol"
-reasoning_effort = "medium"
-maintenance_receipt_threshold = 30
-maintenance_max_receipts = 30
-maintenance_max_age_seconds = 14400
+- Conversation capture runs through Codex lifecycle hooks without a model.
+- Curation uses `gpt-5.6-sol` at `medium` after 30 receipts or when the oldest
+  receipt is 4 hours old.
+- Improvement uses `gpt-6-astra` at `high` after a 24 hours cooldown and either
+  10 new curations or the same signal across three distinct curations.
+- Harness Control uses `gpt-5.6-luna` at `low` and checks every 15 minutes. It
+  stays quiet when there is nothing actionable.
 
-[improvement]
-model = "gpt-6-astra"
-reasoning_effort = "high"
-cooldown_seconds = 86400
-high_threshold = 10
-mode = "approval_required" # or proposal_only / auto_safe
-automatic_paths = []       # exact allowlist required by auto_safe
-automatic_max_changed_bytes = 64000
-reminder_seconds = 86400
+Not-due runs use no model tokens. Improvements require approval by default;
+bounded automatic application is opt-in.
 
-[git]
-auto_push = false
-private_data_acknowledged = false
-# upstream = "origin/main"
-```
+## Privacy and limitations
 
-Unknown, invalid, non-finite, or unsafe configuration values are rejected.
+Profile data and automatic Git history are local by default. Captured text can
+still contain confidential information, and local Git does not protect against
+disk loss. Automatic push is disabled unless explicitly configured.
 
-## Local Git, status, and backup
-
-Initialization creates a Git repository for profile-owned documents. The harness
-stages only code-owned managed paths—including registered `project-context/`
-documents—uses deterministic commit messages, ignores runtime evidence and nested
-`projects/`, and records failures for `doctor`.
-`auto_push` is opt-in only: it requires a privacy acknowledgement and exact
-upstream, then rejects detached or non-fast-forward state, interactive auth,
-unsafe transports/configuration, and force pushes. Repository histories remain
-independent.
-Configuration names one exact upstream as `remote/branch`.
-Each scheduled `maintain` run acquires the profile lease with the built-in safe
-stale timeout and first validates pending checkpoint metadata without running
-Git or recovery. It then recovers abandoned curation/improvement WAL with their
-automatic checkpoints suppressed and commits the resulting safe managed state
-once. Subject priority is: the previously validated pending subject, the
-recovery subject when any WAL was recovered, then the generic subject. Only a
-successful checkpoint proceeds to config/time validation, due checks, or model
-work. A later curation or improvement failure waits for the next run.
-
-```sh
-profile-harness maintain
-profile-harness dashboard
-profile-harness doctor
-profile-harness git status
-profile-harness git log
-```
-
-Local history is not disk-loss protection. Back up the whole profile—including
-`.git`, `.harness`, and nested repositories—to protected independent storage.
-See [INSTALL.md](INSTALL.md#backup-and-restore).
-
-## Privacy, limits, and removal
-
-Captured text can contain confidential material even after redaction. Evidence and
-backups stay local but must be protected. Transcript reads are contained below
-`CODEX_HOME`, fixed paths reject symlinks, model output has narrow write targets,
-and Git push remains disabled unless explicitly configured. See
-[SECURITY.md](SECURITY.md).
-
-This is a local harness, not a background service, cloud sync system, secret
-scanner, or guarantee against a hostile local account. Codex hooks and transcript
-formats can change. Scheduling requires one verified native scheduler or the
-documented cron fallback.
-
-For clean replacement and uninstall commands, see [INSTALL.md](INSTALL.md). Default
-uninstall is a profile detach: it removes only that profile's scheduler and
-Control task while keeping its data and the shared installation. A global
-reinstall or global uninstall must inventory all attached profiles, schedulers,
-and Control tasks, pause every item, verify every item, and fail closed without
-mutating the shared installation when inventory is ambiguous. Global removal
-also requires explicit user confirmation if another profile remains. Rollback
-and recovery resume every attachment that was active before the operation.
-Profiles and their local history are preserved. Released under
-the [MIT License](LICENSE); changes are listed in [CHANGELOG.md](CHANGELOG.md),
-and contributions follow [CONTRIBUTING.md](CONTRIBUTING.md).
-
-## Release verification
-
-Version 0.4.1 archives are reproducible and accompanied by a SHA-256 checksum.
-After verifying the checksum, extract into a new directory and run the clean
-extraction validator:
-
-```sh
-python3 scripts/validate_release.py .
-```
-
-Release archives are built with `python3 scripts/build_release.py --output dist`.
+See [SECURITY.md](SECURITY.md) for boundaries, [INSTALL.md](INSTALL.md) for
+operations and removal, and [CHANGELOG.md](CHANGELOG.md) for release history.
+Released under the [MIT License](LICENSE).
