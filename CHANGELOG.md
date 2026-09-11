@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.4 - 2026-09-11
+
+- Stabilize the hostile Git environment regression test on macOS by comparing
+  security-relevant repository invariants instead of treating a benign
+  background object repack as external mutation.
+
 ## 0.3.3 - 2026-09-11
 
 - Bind GitHub CLI publication to the workflow repository explicitly so release

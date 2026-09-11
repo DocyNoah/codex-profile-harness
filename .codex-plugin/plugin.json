@@ -1,6 +1,6 @@
 {
   "name": "codex-profile-harness",
-  "version": "0.3.3",
+  "version": "0.3.4",
   "description": "Durable profile memory, approval-controlled self-improvement, and repository routing for Codex.",
   "author": {
     "name": "Codex Profile Harness contributors"
