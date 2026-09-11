@@ -21,6 +21,9 @@ executable symlink. It never bypasses hook trust, copies arbitrary source files,
 deletes a profile, or deletes the previous installation. On failure it restores
 the previous marketplace, executable link, and Codex registration state, then
 removes the failed generated tree.
+Codex inspection, registration, and compensation are noninteractive and have
+bounded stdin, output, time, and descendant-process cleanup. A recovery failure
+is reported together with the original installation failure for manual repair.
 
 Custom destinations are explicit:
 

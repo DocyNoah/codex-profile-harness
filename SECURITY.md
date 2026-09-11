@@ -14,6 +14,10 @@
 - Curation uses `gpt-5.6-sol` at `medium`; improvement uses `gpt-6-astra` at
   `high`. Model calls consume tokens only when due. Outputs are schema/size
   bounded, and `codex exec` runs with a read-only sandbox.
+- Model and installer subprocesses run noninteractively in fresh POSIX sessions.
+  Their stdin/output/time are bounded; timeout, interruption, or output overflow
+  sends TERM and then KILL to the complete process group and closes/reaps the
+  direct child before rollback or lock release.
 - Improvement is proposal-only. Applying a proposal requires user approval.
   Identity, user policy, context, and mandatory instructions are outside model
   write targets.
@@ -37,6 +41,10 @@ The marketplace builder copies a fixed allowlist and refuses to follow packaged
 symlinks or overwrite output. It excludes Git data, tests, caches, scratch,
 profiles, credentials, and arbitrary untracked files. The installer stages that
 artifact and retains a recoverable previous installation.
+Installer Codex inspection and registration use stdin from `/dev/null` and
+bounded stdout/stderr, timeout, and a reduced noninteractive environment.
+Registration is last; a failure restores both filesystem and confirmed Codex
+state, while a failed compensation is reported separately from the primary error.
 
 Automatic profile Git stages only code-owned managed paths: profile documents,
 registry/config, curated semantic/procedural memory, journals, and improvement

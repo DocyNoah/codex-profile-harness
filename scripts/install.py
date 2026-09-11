@@ -25,6 +25,7 @@ from profile_harness.packaging import (  # noqa: E402
     PLUGIN_NAME,
     build_local_marketplace,
 )
+from profile_harness.process import run_bounded_process  # noqa: E402
 
 
 PLUGIN_SELECTOR = f"{PLUGIN_NAME}@{MARKETPLACE_NAME}"
@@ -53,10 +54,51 @@ class CodexBoundary(Protocol):
 class SubprocessCodexBoundary:
     """Explicit, non-shelling boundary around supported Codex plugin commands."""
 
-    def _json(self, command: list[str]) -> dict:
-        completed = subprocess.run(
-            command, check=True, text=True, capture_output=True
+    def __init__(
+        self,
+        *,
+        command: str = "codex",
+        timeout: float = 15.0,
+        max_output_bytes: int = 256 * 1024,
+    ) -> None:
+        self.command = command
+        self.timeout = timeout
+        self.max_output_bytes = max_output_bytes
+
+    def _environment(self) -> dict[str, str]:
+        allowed = {
+            "HOME", "PATH", "CODEX_HOME", "XDG_CONFIG_HOME", "XDG_CACHE_HOME",
+            "XDG_DATA_HOME", "TMPDIR", "LANG", "LC_ALL", "LC_CTYPE",
+        }
+        environment = {
+            key: value
+            for key, value in os.environ.items()
+            if key in allowed and len(value) <= 4096
+        }
+        environment.setdefault("PATH", os.defpath)
+        environment.update({
+            "GIT_TERMINAL_PROMPT": "0",
+            "GIT_ASKPASS": "",
+            "SSH_ASKPASS": "",
+            "PAGER": "cat",
+            "GIT_PAGER": "cat",
+            "NO_COLOR": "1",
+            "CI": "1",
+        })
+        return environment
+
+    def _execute(self, command: list[str]):
+        if not command or command[0] != "codex":
+            raise ValueError("Codex boundary accepts only codex commands")
+        return run_bounded_process(
+            [self.command, *command[1:]],
+            environment=self._environment(),
+            timeout=self.timeout,
+            max_output_bytes=self.max_output_bytes,
         )
+
+    def _json(self, command: list[str]) -> dict:
+        completed = self._execute(command)
         try:
             value = json.loads(completed.stdout)
         except json.JSONDecodeError as error:
@@ -99,7 +141,7 @@ class SubprocessCodexBoundary:
         return CodexState(source, plugin_installed)
 
     def run(self, command: list[str]) -> None:
-        subprocess.run(command, check=True)
+        self._execute(command)
 
 
 def _safe_destination(path: Path, label: str) -> Path:
@@ -299,7 +341,11 @@ def install(
         try:
             _restore_codex(boundary, before, marketplace)
         except BaseException as recovery:
-            raise RuntimeError(f"installation failed and Codex recovery failed: {recovery}") from primary
+            raise RuntimeError(
+                "installation failed "
+                f"({type(primary).__name__}: {primary}) and Codex recovery failed "
+                f"({type(recovery).__name__}: {recovery})"
+            ) from primary
         raise
     finally:
         shutil.rmtree(staging_parent, ignore_errors=True)

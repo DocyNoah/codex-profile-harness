@@ -41,6 +41,7 @@ PACKAGED_FILES = (
     "src/profile_harness/maintenance.py",
     "src/profile_harness/improvement.py",
     "src/profile_harness/packaging.py",
+    "src/profile_harness/process.py",
     "src/profile_harness/profile_git.py",
     "src/profile_harness/receipt.py",
     "src/profile_harness/runner.py",

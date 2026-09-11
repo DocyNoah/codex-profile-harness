@@ -181,6 +181,7 @@ class PublicPackageTests(unittest.TestCase):
             "codex_home", "transcript", "fallback", "managed paths",
             "no automatic push", "proposal-only", "token", "backup",
             "upgrade", "uninstall", "hook trust", "disk loss",
+            "process group", "bounded stdout/stderr", "stdin from `/dev/null`",
         )
         for phrase in required:
             self.assertIn(phrase, combined, phrase)

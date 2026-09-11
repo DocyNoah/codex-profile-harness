@@ -4,12 +4,13 @@ from __future__ import annotations
 
 from pathlib import Path
 import os
-import subprocess
 
 from .config import PLUGIN_ROOT
+from .process import run_bounded_process
 
 
 RESULT_SCHEMA = PLUGIN_ROOT / "schemas/curation-result.schema.json"
+MAX_CODEX_OUTPUT_BYTES = 1024 * 1024
 
 
 def run_codex(
@@ -43,14 +44,13 @@ def run_codex(
         str(output),
         "-",
     ]
-    subprocess.run(
+    run_bounded_process(
         arguments,
         cwd=root,
-        input=prompt,
-        text=True,
-        check=True,
+        input_bytes=prompt.encode("utf-8"),
         timeout=timeout,
-        env={**os.environ, "PROFILE_HARNESS_CURATOR": "1"},
+        max_output_bytes=MAX_CODEX_OUTPUT_BYTES,
+        environment={**os.environ, "PROFILE_HARNESS_CURATOR": "1"},
     )
     if not output.is_file():
         raise RuntimeError("codex completed without producing the result file")
