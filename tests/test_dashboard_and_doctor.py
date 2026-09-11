@@ -53,16 +53,18 @@ class DashboardTests(unittest.TestCase):
             register_repo(root, "api", api)
             register_repo(root, "web", web)
 
-            (api / "STATUS.md").write_text(
+            api_context = root / "project-context/api"
+            web_context = root / "project-context/web"
+            (api_context / "STATUS.md").write_text(
                 "# Status\n\nAPI healthy.\n", encoding="utf-8"
             )
-            (api / "TASKS.md").write_text(
+            (api_context / "TASKS.md").write_text(
                 "# Tasks\n\n- [ ] Ship API.\n", encoding="utf-8"
             )
-            (api / "DECISIONS.md").write_text(
+            (api_context / "DECISIONS.md").write_text(
                 "# Active Decisions\n\n- Use SQLite.\n", encoding="utf-8"
             )
-            (web / "STATUS.md").write_text(
+            (web_context / "STATUS.md").write_text(
                 "# Status\n\nWeb paused.\n", encoding="utf-8"
             )
             (api / "PRIVATE.md").write_text("DO NOT INCLUDE", encoding="utf-8")
@@ -70,8 +72,8 @@ class DashboardTests(unittest.TestCase):
                 "UNREGISTERED", encoding="utf-8"
             )
             source_paths = tuple(
-                repository / name
-                for repository in (api, web)
+                context / name
+                for context in (api_context, web_context)
                 for name in ("STATUS.md", "TASKS.md", "DECISIONS.md")
             )
             before = {path: path.read_bytes() for path in source_paths}
@@ -84,7 +86,7 @@ class DashboardTests(unittest.TestCase):
             self.assertIn("Ship API.", content)
             self.assertIn("Use SQLite.", content)
             self.assertIn("Web paused.", content)
-            self.assertIn("projects/api/STATUS.md", content)
+            self.assertIn("project-context/api/STATUS.md", content)
             self.assertIn("generated index", content.lower())
             self.assertNotIn("DO NOT INCLUDE", content)
             self.assertNotIn("UNREGISTERED", content)
@@ -98,7 +100,9 @@ class DashboardTests(unittest.TestCase):
             api = root / "projects/api"
             api.mkdir()
             register_repo(root, "api", api)
-            (api / "STATUS.md").write_text("# Status\n\nReady.\n", encoding="utf-8")
+            (root / "project-context/api/STATUS.md").write_text(
+                "# Status\n\nReady.\n", encoding="utf-8"
+            )
 
             result = subprocess.run(
                 [sys.executable, str(ROOT / "bin/profile-harness"), "dashboard"],

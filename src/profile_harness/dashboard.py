@@ -1,4 +1,4 @@
-"""Generated profile dashboard built from repository-owned indexes."""
+"""Generated profile dashboard built from profile-owned project indexes."""
 
 from __future__ import annotations
 
@@ -20,18 +20,18 @@ INDEXES = (
 MAX_SUMMARY_CHARS = 240
 
 
-def _safe_repository(root: Path, repository: Path) -> Path:
-    projects = (root / "projects").resolve()
-    resolved = repository.resolve()
+def _safe_context(root: Path, context: Path) -> Path:
+    contexts = (root / "project-context").resolve()
+    resolved = context.resolve()
     try:
-        relative = resolved.relative_to(projects)
+        relative = resolved.relative_to(contexts)
     except ValueError as error:
         raise ValueError(
-            "registered repository is outside the profile projects directory"
+            "registered project context is outside the profile context directory"
         ) from error
-    if relative == Path(".") or repository.is_symlink():
+    if relative == Path(".") or context.is_symlink():
         raise ValueError(
-            "registered repository is outside the profile projects directory"
+            "registered project context is outside the profile context directory"
         )
     return resolved
 
@@ -57,7 +57,7 @@ def generate_dashboard(root: Path) -> Path:
     lines = [
         "# Profile Dashboard",
         "",
-        "This is a generated index. Edit each repository's source indexes, "
+        "This is a generated index. Edit each profile-owned project context, "
         "not this file.",
     ]
     git = inspect_profile_git(profile.root)
@@ -89,10 +89,10 @@ def generate_dashboard(root: Path) -> Path:
     if not profile.repositories:
         lines.extend(("", "No repositories are registered yet."))
     for registered in profile.repositories:
-        repository = _safe_repository(profile.root, registered.path)
+        context = _safe_context(profile.root, registered.context_path)
         lines.extend(("", f"## {registered.name}", ""))
         for label, filename in INDEXES:
-            source = repository / filename
+            source = context / filename
             require_safe_path(profile.root, source, directory=False)
             try:
                 relative = source.relative_to(profile.root).as_posix()

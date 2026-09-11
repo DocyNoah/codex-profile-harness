@@ -185,7 +185,7 @@ def validate_release_workflow(path: Path) -> None:
 def validate_source() -> None:
     manifest = validate_manifest(ROOT / ".codex-plugin/plugin.json")
     require(manifest.get("name") == "codex-profile-harness", "invalid plugin name")
-    require(manifest.get("version") == "0.3.4", "invalid plugin version")
+    require(manifest.get("version") == "0.4.0", "invalid plugin version")
     skill = validate_skill(ROOT / "skills/profile-harness/SKILL.md")
     require(skill["name"] == "profile-harness", "invalid skill name")
     validate_release_workflow(ROOT / ".github/workflows/release.yml")

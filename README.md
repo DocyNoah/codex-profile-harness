@@ -50,14 +50,18 @@ profile/                         one Codex project and profile
 ├── CONTEXT.md MEMORY.md         profile context and curated summary
 ├── PROJECTS.toml                registered nested repositories
 ├── DASHBOARD.md                 generated status view (ignored)
+├── project-context/             profile-owned, automatically checkpointed
+│   ├── api/
+│   │   ├── STATUS.md            current API state
+│   │   ├── TASKS.md             unfinished API work
+│   │   ├── DECISIONS.md         compact active-decision index
+│   │   └── decisions/           individual decision records
+│   └── web/
 ├── .harness/                    config, captured evidence, curated memory,
 │                                journals, proposals, and runtime state
 └── projects/
-    ├── api/                     ordinary repository
-    │   ├── STATUS.md            current state, updated by the working agent
-    │   ├── TASKS.md             unfinished work, updated by the working agent
-    │   └── DECISIONS.md         compact index; details may be archived
-    └── web/
+    ├── api/                     ordinary repository; no harness files added
+    └── web/                     ordinary repository; no harness files added
 ```
 
 - **Captured** data is model-free, immutable, redacted evidence from lifecycle
@@ -66,8 +70,8 @@ profile/                         one Codex project and profile
   Hooks durably publish only the receipt and transcript cursor; they do not wait
   for Git.
 - **Curated** data is a model-produced, schema-bounded reconciliation of missed,
-  duplicate, or conflicting state. Normal work should update repository
-  `STATUS.md` and `TASKS.md` directly and naturally.
+  duplicate, or conflicting state. Normal work updates the corresponding
+  `project-context/<repo-id>/STATUS.md` and `TASKS.md` directly and naturally.
 - **Improved** data is a versioned, reviewable proposal under
   `.harness/improvements/proposed/`. `proposal_only` retains it locally,
   `approval_required` proactively routes it to Harness Control, and `auto_safe`
@@ -132,8 +136,9 @@ Unknown, invalid, non-finite, or unsafe configuration values are rejected.
 ## Local Git, status, and backup
 
 Initialization creates a Git repository for profile-owned documents. The harness
-stages only code-owned managed paths, uses deterministic commit messages, ignores
-runtime evidence and nested `projects/`, and records failures for `doctor`.
+stages only code-owned managed paths—including registered `project-context/`
+documents—uses deterministic commit messages, ignores runtime evidence and nested
+`projects/`, and records failures for `doctor`.
 `auto_push` is opt-in only: it requires a privacy acknowledgement and exact
 upstream, then rejects detached or non-fast-forward state, interactive auth,
 unsafe transports/configuration, and force pushes. Repository histories remain
@@ -187,7 +192,7 @@ and contributions follow [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Release verification
 
-Version 0.3.4 archives are reproducible and accompanied by a SHA-256 checksum.
+Version 0.4.0 archives are reproducible and accompanied by a SHA-256 checksum.
 After verifying the checksum, extract into a new directory and run the clean
 extraction validator:
 

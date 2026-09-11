@@ -9,14 +9,16 @@ A Codex project is one profile. Repositories nested below `projects/` are not
 separate Codex projects; select them through the registrations in
 `PROJECTS.toml`.
 
-Keep profile-wide memory under `.harness/memory/`. Keep repository status,
-tasks, and decisions in that repository's `STATUS.md`, `TASKS.md`, and
-`DECISIONS.md`. Never treat generated `DASHBOARD.md` as a source of truth.
+Keep profile-wide memory under `.harness/memory/`. Keep repository-specific
+status, tasks, and decisions under the matching
+`project-context/<repo-id>/`. Do not create or update harness documents inside
+the nested code repository. Never treat generated `DASHBOARD.md` as a source of
+truth.
 
-The working agent updates repository `STATUS.md` and `TASKS.md` naturally while
-doing the user's work. Curation only reconciles missed, duplicate, or conflicting
-state from captured evidence; it is not a second project-management workflow.
-Preserve the authority boundaries in the profile and repository `AGENTS.md` files.
+The working agent updates `project-context/<repo-id>/STATUS.md` and `TASKS.md`
+naturally while doing the user's work. Curation only reconciles missed,
+duplicate, or conflicting state from captured evidence; it is not a second
+project-management workflow. The profile `AGENTS.md` governs this separation.
 
 Improvement defaults to `approval_required`, where explicit user approval is
 required before application. `proposal_only` (proposal-only mode) retains proposals;

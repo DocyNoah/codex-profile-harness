@@ -141,6 +141,12 @@ Initialize only a missing profile; preserve existing user files and Git history:
 "$HARNESS_EXECUTABLE" init "$PROFILE_ROOT" --name "$PROFILE_NAME"
 ```
 
+For each repository the user asks to register, require a lowercase portable ID
+and a real directory below `projects/`. Registration creates only
+`project-context/<repo-id>/` in the profile Git repository. Verify that it does
+not create or modify `AGENTS.md`, `STATUS.md`, `TASKS.md`, `DECISIONS.md`, or a
+decision directory inside the user's repository.
+
 Start a new Codex task and let the user inspect and approve the exact hook. Never
 use a hook-trust bypass.
 

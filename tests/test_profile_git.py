@@ -1273,6 +1273,56 @@ class ProfileGitTests(unittest.TestCase):
             self.assertNotIn("secret.txt", tracked)
             self.assertFalse(any(path.startswith(".harness/memory/semantic/nested") for path in tracked))
 
+    def test_registration_checkpoint_tracks_context_but_never_repository_documents(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            profile = Path(temporary_directory) / "profile"
+            init_profile(profile, "Work")
+            repository = profile / "projects/api"
+            repository.mkdir()
+            (repository / "STATUS.md").write_text("user-owned\n", encoding="utf-8")
+
+            register_repo(profile, "api", repository)
+
+            tracked = set(git(profile, "ls-files").stdout.splitlines())
+            self.assertIn("project-context/api/STATUS.md", tracked)
+            self.assertIn("project-context/api/TASKS.md", tracked)
+            self.assertIn("project-context/api/DECISIONS.md", tracked)
+            self.assertFalse(any(path.startswith("projects/api/") for path in tracked))
+            self.assertEqual("user-owned\n", (repository / "STATUS.md").read_text())
+
+    def test_checkpoint_rejects_unregistered_project_context_content(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            profile = Path(temporary_directory) / "profile"
+            init_profile(profile, "Work")
+            orphan = profile / "project-context/orphan"
+            orphan.mkdir(parents=True)
+            (orphan / "STATUS.md").write_text("must not commit\n", encoding="utf-8")
+
+            result = checkpoint_profile(profile, CHECKPOINT_SUBJECT)
+
+            self.assertFalse(result.committed)
+            self.assertIn("unregistered", result.error or "")
+            self.assertNotIn(
+                "project-context/orphan/STATUS.md",
+                git(profile, "ls-files").stdout.splitlines(),
+            )
+
+    def test_checkpoint_rejects_deleted_context_root_for_registered_repository(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            profile = Path(temporary_directory) / "profile"
+            init_profile(profile, "Work")
+            repository = profile / "projects/api"
+            repository.mkdir()
+            register_repo(profile, "api", repository)
+            before = git(profile, "rev-parse", "HEAD").stdout.strip()
+            shutil.rmtree(profile / "project-context")
+
+            result = checkpoint_profile(profile, CHECKPOINT_SUBJECT)
+
+            self.assertFalse(result.committed)
+            self.assertIn("project context", result.error or "")
+            self.assertEqual(before, git(profile, "rev-parse", "HEAD").stdout.strip())
+
     def test_checkpoint_does_not_commit_pre_staged_forbidden_file_and_noop_is_stable(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             profile = Path(temporary_directory) / "profile"
@@ -1500,7 +1550,7 @@ class ProfileGitTests(unittest.TestCase):
                 observed.append((
                     subject,
                     "api" in (root / "PROJECTS.toml").read_text(encoding="utf-8"),
-                    (repository / "STATUS.md").is_file(),
+                    (root / "project-context/api/STATUS.md").is_file(),
                 ))
                 return CheckpointResult(False)
 

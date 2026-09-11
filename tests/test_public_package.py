@@ -93,7 +93,7 @@ class PublicPackageTests(unittest.TestCase):
 
     def test_release_metadata_and_selector_are_consistent(self) -> None:
         manifest = json.loads((ROOT / ".codex-plugin/plugin.json").read_text())
-        self.assertEqual("0.3.4", manifest["version"])
+        self.assertEqual("0.4.0", manifest["version"])
         self.assertEqual("codex-profile-harness", manifest["name"])
         self.assertIn("MIT License", (ROOT / "LICENSE").read_text())
         self.assertIn(
@@ -117,7 +117,7 @@ class PublicPackageTests(unittest.TestCase):
             first, first_checksum = build_release_archive(ROOT, output / "one")
             second, second_checksum = build_release_archive(ROOT, output / "two")
 
-            self.assertEqual("codex-profile-harness-0.3.4.tar.gz", first.name)
+            self.assertEqual("codex-profile-harness-0.4.0.tar.gz", first.name)
             self.assertEqual(first.read_bytes(), second.read_bytes())
             self.assertEqual(first_checksum.read_text(), second_checksum.read_text())
             self.assertEqual(
@@ -131,14 +131,14 @@ class PublicPackageTests(unittest.TestCase):
                 members = archive.getmembers()
                 self.assertTrue(members)
                 self.assertTrue(all(
-                    member.name == "codex-profile-harness-0.3.4"
-                    or member.name.startswith("codex-profile-harness-0.3.4/")
+                    member.name == "codex-profile-harness-0.4.0"
+                    or member.name.startswith("codex-profile-harness-0.4.0/")
                     for member in members
                 ))
                 self.assertTrue(all(member.uid == member.gid == 0 for member in members))
                 self.assertTrue(all(member.mtime == 0 for member in members))
                 archive.extractall(extracted, filter="data")
-            release_root = extracted / "codex-profile-harness-0.3.4"
+            release_root = extracted / "codex-profile-harness-0.4.0"
             validated = subprocess.run(
                 [sys.executable, str(release_root / "scripts/validate_release.py"), str(release_root)],
                 text=True, capture_output=True, check=False,
@@ -209,7 +209,7 @@ class PublicPackageTests(unittest.TestCase):
             output = Path(temporary_directory)
             victim = output / "victim"
             victim.write_text("unchanged", encoding="utf-8")
-            predictable = output / ".codex-profile-harness-0.3.4.tar.gz.tmp"
+            predictable = output / ".codex-profile-harness-0.4.0.tar.gz.tmp"
             predictable.symlink_to(victim)
 
             archive, checksum = build_release_archive(ROOT, output)
@@ -290,7 +290,7 @@ class PublicPackageTests(unittest.TestCase):
         ):
             self.assertIn(command, agent)
         for phrase in (
-            "0.3.4", "automatic_apply = false", "approval_required",
+            "0.4.0", "automatic_apply = false", "approval_required",
             "automatic_apply = true", "legacy markdown", "read-only",
             "reproducible", "sha-256", "clean extraction",
         ):
@@ -390,7 +390,6 @@ class PublicPackageTests(unittest.TestCase):
     def test_skill_preserves_agent_and_authority_boundaries(self) -> None:
         skill = (ROOT / "skills/profile-harness/SKILL.md").read_text().lower()
         profile_agents = (ROOT / "templates/profile/AGENTS.md").read_text().lower()
-        repo_agents = (ROOT / "templates/repo/AGENTS.md").read_text().lower()
         for phrase in (
             "status.md", "tasks.md", "working agent", "naturally",
             "missed", "duplicate", "conflicting", "user approval",
@@ -399,8 +398,9 @@ class PublicPackageTests(unittest.TestCase):
             self.assertIn(phrase, skill, phrase)
         self.assertIn("explicit user approval", profile_agents)
         self.assertIn("proposal-only", profile_agents)
-        self.assertIn("update `status.md`", repo_agents)
-        self.assertIn("update `tasks.md`", repo_agents)
+        self.assertIn("project-context", profile_agents)
+        self.assertIn("do not create", profile_agents)
+        self.assertFalse(any((ROOT / "templates/repo").glob("**/*")))
 
     def test_cron_runs_maintain_every_fifteen_minutes(self) -> None:
         cron = (ROOT / "examples/cron.example").read_text()

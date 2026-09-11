@@ -69,10 +69,9 @@ PACKAGED_FILES = (
     "templates/automations/harness-control.md",
     "templates/prompts/curate.md",
     "templates/prompts/improve.md",
-    "templates/repo/AGENTS.md",
-    "templates/repo/DECISIONS.md",
-    "templates/repo/STATUS.md",
-    "templates/repo/TASKS.md",
+    "templates/project-context/DECISIONS.md",
+    "templates/project-context/STATUS.md",
+    "templates/project-context/TASKS.md",
 )
 
 RELEASE_FILES = tuple(sorted(set(PACKAGED_FILES) | {

@@ -18,7 +18,7 @@ import time
 from typing import Any, BinaryIO
 from urllib.parse import urlsplit
 
-from .config import HarnessConfig, load_profile_config
+from .config import HarnessConfig, load_profile_config, load_profile_for_recovery
 from .fs import atomic_write_text, ensure_safe_directory, require_safe_path
 
 
@@ -56,6 +56,7 @@ MANAGED_PATHS = (
     ".harness/improvements/proposed",
     ".harness/improvements/accepted",
     ".harness/improvements/rejected",
+    "project-context",
 )
 MANAGED_FILES = frozenset(path for path in MANAGED_PATHS if "." in Path(path).name)
 MANAGED_DIRECTORIES = tuple(
@@ -476,7 +477,69 @@ def _tracked_paths(root: Path) -> tuple[str, ...]:
     return paths
 
 
+def _validate_project_context_inventory(root: Path) -> None:
+    context_root = root / "project-context"
+    if context_root.is_symlink():
+        raise ProfileGitError("managed Git path is unsafe: project-context")
+    if not context_root.exists():
+        raise ProfileGitError("project context directory is missing")
+    require_safe_path(root, context_root, directory=True)
+    try:
+        profile = load_profile_for_recovery(root)
+    except (OSError, ValueError) as error:
+        raise ProfileGitError(f"project context registry is invalid: {error}") from error
+    registered = {repository.context_path.resolve(): repository for repository in profile.repositories}
+    for child in context_root.iterdir():
+        if child.is_symlink() or not child.is_dir():
+            raise ProfileGitError(
+                f"managed Git path is unsafe: {child.relative_to(root).as_posix()}"
+            )
+        if child.resolve() not in registered:
+            raise ProfileGitError(
+                f"unregistered project context: {child.relative_to(root).as_posix()}"
+            )
+    for context, repository in registered.items():
+        if context.parent != context_root.resolve():
+            raise ProfileGitError(f"registered project context is unsafe: {repository.name}")
+        for filename in ("STATUS.md", "TASKS.md", "DECISIONS.md"):
+            path = context / filename
+            if path.is_symlink() or not path.is_file():
+                raise ProfileGitError(
+                    f"registered project context has missing or unsafe {filename}: {repository.name}"
+                )
+        decisions = context / "decisions"
+        archive = decisions / "archive"
+        for directory in (decisions, archive):
+            if directory.is_symlink() or not directory.is_dir():
+                raise ProfileGitError(
+                    f"registered project context has missing or unsafe decisions directory: {repository.name}"
+                )
+        for current_text, directories, filenames in os.walk(context, followlinks=False):
+            current = Path(current_text)
+            for name in (*directories, *filenames):
+                candidate = current / name
+                if candidate.is_symlink():
+                    raise ProfileGitError(
+                        f"managed Git path is unsafe: {candidate.relative_to(root).as_posix()}"
+                    )
+            relative_parent = current.relative_to(context)
+            for filename in filenames:
+                allowed = (
+                    relative_parent == Path(".")
+                    and filename in {"STATUS.md", "TASKS.md", "DECISIONS.md"}
+                ) or (
+                    relative_parent in {Path("decisions"), Path("decisions/archive")}
+                    and re.fullmatch(r"ADR-[0-9]{4}-[a-z0-9-]+\.md", filename) is not None
+                )
+                if not allowed:
+                    raise ProfileGitError(
+                        "unregistered project context content: "
+                        + (current / filename).relative_to(root).as_posix()
+                    )
+
+
 def _managed_candidates(root: Path) -> tuple[str, ...]:
+    _validate_project_context_inventory(root)
     candidates: set[str] = set()
     for relative_text in _tracked_paths(root):
         if not _is_managed(relative_text):

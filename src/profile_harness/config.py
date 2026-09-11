@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 import math
+import os
 from pathlib import Path
 import re
 import tomllib
@@ -20,7 +21,7 @@ from .fs import (
 
 PLUGIN_ROOT = Path(__file__).resolve().parents[2]
 PROFILE_TEMPLATE_ROOT = PLUGIN_ROOT / "templates" / "profile"
-REPO_TEMPLATE_ROOT = PLUGIN_ROOT / "templates" / "repo"
+PROJECT_CONTEXT_TEMPLATE_ROOT = PLUGIN_ROOT / "templates" / "project-context"
 
 PROFILE_DIRECTORIES = (
     ".agents/skills",
@@ -37,6 +38,7 @@ PROFILE_DIRECTORIES = (
     ".harness/improvements/rejected",
     ".harness/control/outbox",
     ".harness/control/claims",
+    "project-context",
     "projects",
 )
 OPTIONAL_RUNTIME_DIRECTORIES = (
@@ -72,6 +74,7 @@ REASONING_EFFORTS = frozenset({"low", "medium", "high", "xhigh", "max", "ultra"}
 class RepositoryConfig:
     name: str
     path: Path
+    context_path: Path
 
 
 @dataclass(frozen=True)
@@ -433,6 +436,73 @@ def load_profile_config(root: Path) -> HarnessConfig:
     )
 
 
+def _validated_repository_name(value: object) -> str:
+    if not isinstance(value, str) or re.fullmatch(
+        r"[a-z0-9][a-z0-9._-]{0,63}", value
+    ) is None:
+        raise ValueError(
+            "repository name must be a 1-64 character portable identifier"
+        )
+    return value
+
+
+def _validate_project_context(profile_root: Path, context: Path, name: str) -> Path:
+    contexts = (profile_root / "project-context").resolve()
+    require_safe_path(profile_root, context, directory=True)
+    resolved = context.resolve()
+    if context.is_symlink() or resolved.parent != contexts:
+        raise ValueError(f"repository {name} has an unsafe project context")
+    fixed_files = {"STATUS.md", "TASKS.md", "DECISIONS.md"}
+    for filename in fixed_files:
+        path = resolved / filename
+        if path.is_symlink():
+            raise ValueError(
+                f"repository {name} context contains an unsafe symlink: {filename}"
+            )
+        if not path.is_file():
+            raise ValueError(
+                f"repository {name} context has missing or unsafe {filename}"
+            )
+    decisions = resolved / "decisions"
+    archive = decisions / "archive"
+    for directory in (decisions, archive):
+        if directory.is_symlink() or not directory.is_dir():
+            raise ValueError(
+                f"repository {name} context has a missing or unsafe decisions directory"
+            )
+    allowed_directories = {
+        Path("."): {"decisions"},
+        Path("decisions"): {"archive"},
+        Path("decisions/archive"): set(),
+    }
+    for current_text, directories, filenames in os.walk(resolved, followlinks=False):
+        current = Path(current_text)
+        relative_parent = current.relative_to(resolved)
+        if relative_parent not in allowed_directories:
+            raise ValueError(
+                f"repository {name} context contains an unexpected directory"
+            )
+        if set(directories) != allowed_directories[relative_parent]:
+            raise ValueError(
+                f"repository {name} context contains an unexpected directory"
+            )
+        for child_name in (*directories, *filenames):
+            if (current / child_name).is_symlink():
+                raise ValueError(f"repository {name} context contains an unsafe symlink")
+        for filename in filenames:
+            allowed = (
+                relative_parent == Path(".") and filename in fixed_files
+            ) or (
+                relative_parent in {Path("decisions"), Path("decisions/archive")}
+                and re.fullmatch(r"ADR-[0-9]{4}-[a-z0-9-]+\.md", filename) is not None
+            )
+            if not allowed:
+                raise ValueError(
+                    f"repository {name} context contains unexpected content: {filename}"
+                )
+    return resolved
+
+
 def _load_profile_registry(profile_root: Path, name: str) -> ProfileConfig:
     projects_path = require_safe_path(
         profile_root, profile_root / "PROJECTS.toml", directory=False
@@ -443,18 +513,42 @@ def _load_profile_registry(profile_root: Path, name: str) -> ProfileConfig:
         raise ValueError("PROJECTS.toml must contain version = 1 and repositories")
 
     repositories: list[RepositoryConfig] = []
+    names: set[str] = set()
+    paths: set[Path] = set()
     for entry in raw_repositories:
         if not isinstance(entry, dict):
             raise ValueError("each repository registration must be a TOML table")
-        repo_name = entry.get("name")
+        repo_name = _validated_repository_name(entry.get("name"))
         relative_path = entry.get("path")
-        if not isinstance(repo_name, str) or not repo_name.strip():
-            raise ValueError("each repository must have a non-empty name")
         if not isinstance(relative_path, str) or not relative_path.strip():
             raise ValueError("each repository must have a non-empty path")
         candidate = profile_root / relative_path
         require_safe_path(profile_root, candidate, directory=True)
-        repositories.append(RepositoryConfig(repo_name, candidate.resolve()))
+        projects = (profile_root / "projects").resolve()
+        try:
+            project_relative = candidate.resolve().relative_to(projects)
+        except ValueError as error:
+            raise ValueError(
+                "registered repository must remain below the profile projects directory"
+            ) from error
+        if project_relative == Path(".") or candidate.is_symlink():
+            raise ValueError(
+                "registered repository must remain below the profile projects directory"
+            )
+        resolved_candidate = candidate.resolve()
+        if repo_name in names:
+            raise ValueError(f"duplicate repository name: {repo_name}")
+        if resolved_candidate in paths:
+            raise ValueError(f"duplicate repository path: {relative_path}")
+        context = profile_root / "project-context" / repo_name
+        resolved_context = _validate_project_context(
+            profile_root, context, repo_name
+        )
+        repositories.append(
+            RepositoryConfig(repo_name, resolved_candidate, resolved_context)
+        )
+        names.add(repo_name)
+        paths.add(resolved_candidate)
     return ProfileConfig(profile_root, name, tuple(repositories))
 
 
@@ -524,8 +618,7 @@ def _serialize_projects(repositories: tuple[RepositoryConfig, ...], root: Path) 
 
 def register_repo(root: Path, name: str, path: Path) -> None:
     """Register an existing directory below the profile's projects directory."""
-    if not name.strip():
-        raise ValueError("repository name must not be empty")
+    name = _validated_repository_name(name)
     requested_root = Path(root).expanduser().absolute()
     repository_input = Path(path).expanduser().absolute()
     try:
@@ -567,16 +660,20 @@ def register_repo(root: Path, name: str, path: Path) -> None:
         if existing.path == repository:
             raise ValueError(f"repository path '{repository}' is already registered")
 
-    for source in _template_files(REPO_TEMPLATE_ROOT):
-        destination = repository / source.relative_to(REPO_TEMPLATE_ROOT)
-        require_safe_path(REPO_TEMPLATE_ROOT, source, directory=False)
-        require_safe_path(repository, destination, directory=False)
+    context = profile.root / "project-context" / name
+    ensure_safe_directory(profile.root, context)
+    for source in _template_files(PROJECT_CONTEXT_TEMPLATE_ROOT):
+        destination = context / source.relative_to(PROJECT_CONTEXT_TEMPLATE_ROOT)
+        require_safe_path(PROJECT_CONTEXT_TEMPLATE_ROOT, source, directory=False)
+        require_safe_path(context, destination, directory=False)
         exclusive_write_text(destination, source.read_text(encoding="utf-8"))
     ensure_safe_directory(
-        repository, repository / "docs" / "decisions" / "archive"
+        context, context / "decisions" / "archive"
     )
 
-    registrations = profile.repositories + (RepositoryConfig(name, repository),)
+    registrations = profile.repositories + (
+        RepositoryConfig(name, repository, context.resolve()),
+    )
     atomic_write_text(
         profile.root / "PROJECTS.toml",
         _serialize_projects(registrations, profile.root),

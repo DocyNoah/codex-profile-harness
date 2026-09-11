@@ -50,7 +50,7 @@ ACTION_TYPES = frozenset(
     }
 )
 _ADR = re.compile(r"ADR-(\d{4,})-[a-z0-9-]+\.md")
-_INDEX_LINK = re.compile(r"\[[^]]+\]\(docs/decisions/(ADR-(\d{4,})-[a-z0-9-]+\.md)\)")
+_INDEX_LINK = re.compile(r"\[[^]]+\]\(decisions/(ADR-(\d{4,})-[a-z0-9-]+\.md)\)")
 _BATCH_ID = re.compile(r"[0-9]{8}T[0-9]{12}Z-[a-f0-9]{12}")
 _SIGNAL_ID = re.compile(r"[a-z0-9][a-z0-9._-]{2,63}")
 
@@ -347,7 +347,10 @@ def claim_receipts(
 ) -> CurationBatch:
     """Atomically claim valid inbox receipts into a unique processing batch."""
     profile_root = Path(root).resolve()
-    load_profile(profile_root, config=config)
+    try:
+        load_profile(profile_root, config=config)
+    except ValueError as error:
+        raise CurationError(str(error)) from error
     if limit is not None and (isinstance(limit, bool) or limit < 1):
         raise CurationError("limit must be a positive integer")
     batch_id = _batch_id()
@@ -807,8 +810,8 @@ def load_result(path: Path) -> dict[str, Any]:
     return result
 
 
-def _active_decisions(repository: Path) -> dict[str, tuple[str, str]]:
-    index = repository / "DECISIONS.md"
+def _active_decisions(context: Path) -> dict[str, tuple[str, str]]:
+    index = context / "DECISIONS.md"
     if not index.exists():
         return {}
     active: dict[str, tuple[str, str]] = {}
@@ -818,9 +821,9 @@ def _active_decisions(repository: Path) -> dict[str, tuple[str, str]]:
     return active
 
 
-def _decision_number(repository: Path) -> int:
+def _decision_number(context: Path) -> int:
     maximum = 0
-    decision_root = repository / "docs/decisions"
+    decision_root = context / "decisions"
     for path in decision_root.glob("ADR-*.md"):
         match = _ADR.fullmatch(path.name)
         if match:
@@ -832,7 +835,7 @@ def _decision_index(active: dict[str, tuple[str, str]]) -> str:
     lines = ["# Active Decisions", ""]
     for number in sorted(active, key=int):
         filename, title = active[number]
-        lines.append(f"- [{title}](docs/decisions/{filename})")
+        lines.append(f"- [{title}](decisions/{filename})")
     if not active:
         lines.append("No active decisions have been recorded.")
     content = "\n".join(lines) + "\n"
@@ -981,14 +984,14 @@ def _allowed_transaction_target(root: Path, profile: object, relative: Path) -> 
     if relative.parent in fixed_roots and re.fullmatch(r"[a-z0-9-]+\.md", relative.name):
         return target
     for repository in profile.repositories:
-        repository_relative = repository.path.relative_to(root)
+        context_relative = repository.context_path.relative_to(root)
         if relative in {
-            repository_relative / "STATUS.md",
-            repository_relative / "TASKS.md",
-            repository_relative / "DECISIONS.md",
+            context_relative / "STATUS.md",
+            context_relative / "TASKS.md",
+            context_relative / "DECISIONS.md",
         }:
             return target
-        if relative.parent == repository_relative / "docs/decisions" and _ADR.fullmatch(relative.name):
+        if relative.parent == context_relative / "decisions" and _ADR.fullmatch(relative.name):
             return target
     raise CurationError("transaction target escapes its exact allowed scope")
 
@@ -1375,13 +1378,23 @@ def apply_actions(
     config: HarnessConfig | None = None,
 ) -> ApplyResult:
     """Apply one validated batch transactionally, restoring it on any failure."""
-    profile = load_profile(root, config=config)
+    profile_root = Path(root).expanduser().resolve()
+    if not isinstance(batch_id, str) or _BATCH_ID.fullmatch(batch_id) is None:
+        raise CurationError("batch ID is invalid")
+    try:
+        profile = load_profile(profile_root, config=config)
+    except ValueError as error:
+        batch_path = profile_root / ".harness/memory/processing" / batch_id
+        try:
+            require_safe_path(profile_root, batch_path, directory=True)
+            _return_receipts(profile_root, batch_path)
+        except (OSError, ValueError, CurationError):
+            pass
+        raise CurationError(str(error)) from error
     applied_at = now or datetime.now(timezone.utc)
     if applied_at.tzinfo is None or applied_at.utcoffset() is None:
         raise CurationError("curation clock must be timezone-aware")
     applied_at = applied_at.astimezone(timezone.utc)
-    if not isinstance(batch_id, str) or _BATCH_ID.fullmatch(batch_id) is None:
-        raise CurationError("batch ID is invalid")
     batch_path = profile.root / ".harness/memory/processing" / batch_id
     journal = profile.root / ".harness/memory/journal/curation.jsonl"
     _safe_dir(profile.root, ".harness/memory/processing")
@@ -1395,7 +1408,7 @@ def apply_actions(
     changed: list[Path] = []
     snapshot_root = profile.root / ".harness/memory/archive/snapshots" / batch_id
     repositories = {
-        repository.name: repository.path for repository in profile.repositories
+        repository.name: repository.context_path for repository in profile.repositories
     }
     writes = 0
     transaction_path = _transaction_path(profile.root, batch_id)
@@ -1492,24 +1505,24 @@ def apply_actions(
         _durable_unlink(
             profile.root / ".harness/state/preparations" / f"{batch_id}.json"
         )
-        projects_root = (profile.root / "projects").resolve()
-        for repository in repositories.values():
+        contexts_root = (profile.root / "project-context").resolve()
+        for context in repositories.values():
             try:
-                relative_repository = repository.resolve().relative_to(projects_root)
+                relative_context = context.resolve().relative_to(contexts_root)
             except ValueError as error:
                 raise CurationError(
-                    "registered repository must remain below the profile projects directory"
+                    "registered project context must remain below the profile context directory"
                 ) from error
-            if relative_repository == Path("."):
+            if relative_context == Path("."):
                 raise CurationError(
-                    "registered repository must remain below the profile projects directory"
+                    "registered project context must remain below the profile context directory"
                 )
             try:
-                require_safe_path(profile.root, repository, directory=True)
-                for relative in ("docs", "docs/decisions", "docs/decisions/archive"):
-                    require_safe_path(profile.root, repository / relative, directory=True)
+                require_safe_path(profile.root, context, directory=True)
+                for relative in ("decisions", "decisions/archive"):
+                    require_safe_path(profile.root, context / relative, directory=True)
                 for filename in ("STATUS.md", "TASKS.md", "DECISIONS.md"):
-                    require_safe_path(profile.root, repository / filename, directory=False)
+                    require_safe_path(profile.root, context / filename, directory=False)
             except ValueError as error:
                 raise CurationError(str(error)) from error
         for action in actions:
@@ -1528,24 +1541,24 @@ def apply_actions(
                 )
             elif action_type in {"repo_status", "repo_tasks"}:
                 name = "STATUS.md" if action_type == "repo_status" else "TASKS.md"
-                repository = repositories[action["repository"]]
-                write(repository / name, action["content"], repository)
+                context = repositories[action["repository"]]
+                write(context / name, action["content"], context)
             elif action_type == "repo_decision":
-                repository = repositories[action["repository"]]
-                number = _decision_number(repository)
+                context = repositories[action["repository"]]
+                number = _decision_number(context)
                 number_text = f"{number:04d}"
                 filename = f"ADR-{number_text}-{_slug(action['title'], 'decision')}.md"
-                adr = repository / "docs/decisions" / filename
+                adr = context / "decisions" / filename
                 body = (
                     f"# ADR-{number_text}: {action['title'].strip()}\n\n"
                     f"{action['content'].strip()}\n"
                 )
-                write(adr, body, repository / "docs/decisions")
-                active = _active_decisions(repository)
+                write(adr, body, context / "decisions")
+                active = _active_decisions(context)
                 for superseded in action["supersedes"]:
                     active.pop(f"{int(superseded):04d}", None)
                 active[number_text] = (filename, action["title"].strip())
-                write(repository / "DECISIONS.md", _decision_index(active), repository)
+                write(context / "DECISIONS.md", _decision_index(active), context)
 
         receipt_digests = {
             receipt_id: _receipt_record(batch_path / f"{receipt_id}.json")["sha256"]

@@ -258,7 +258,7 @@ class ImprovementConfigurationTests(unittest.TestCase):
 
 
 class RepositoryRegistrationTests(unittest.TestCase):
-    def test_valid_registration_is_loaded_and_creates_repo_templates(self) -> None:
+    def test_valid_registration_creates_profile_owned_context_without_touching_repo(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory) / "profile"
             init_profile(root, "Work")
@@ -271,16 +271,19 @@ class RepositoryRegistrationTests(unittest.TestCase):
             self.assertEqual(1, len(profile.repositories))
             self.assertEqual("api", profile.repositories[0].name)
             self.assertEqual(repository.resolve(), profile.repositories[0].path)
+            context = root / "project-context" / "api"
+            self.assertEqual(context.resolve(), profile.repositories[0].context_path)
             for relative_path in (
-                "AGENTS.md",
                 "STATUS.md",
                 "TASKS.md",
                 "DECISIONS.md",
             ):
-                self.assertTrue((repository / relative_path).is_file())
-            self.assertTrue((repository / "docs/decisions/archive").is_dir())
+                self.assertTrue((context / relative_path).is_file())
+                self.assertFalse((repository / relative_path).exists())
+            self.assertFalse((repository / "AGENTS.md").exists())
+            self.assertTrue((context / "decisions/archive").is_dir())
 
-    def test_registration_preserves_existing_repo_template(self) -> None:
+    def test_registration_never_reads_or_replaces_same_named_repo_documents(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory) / "profile"
             init_profile(root, "Work")
@@ -292,6 +295,22 @@ class RepositoryRegistrationTests(unittest.TestCase):
             register_repo(root, "api", repository)
 
             self.assertEqual("custom status\n", status.read_text(encoding="utf-8"))
+            self.assertNotEqual(
+                "custom status\n",
+                (root / "project-context/api/STATUS.md").read_text(encoding="utf-8"),
+            )
+
+    def test_registration_rejects_name_that_cannot_be_a_safe_context_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory) / "profile"
+            init_profile(root, "Work")
+            repository = root / "projects" / "api"
+            repository.mkdir()
+
+            with self.assertRaisesRegex(ValueError, "repository name"):
+                register_repo(root, "../escape", repository)
+            with self.assertRaisesRegex(ValueError, "repository name"):
+                register_repo(root, "Api", repository)
 
     def test_registration_rejects_directory_outside_projects(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -317,6 +336,24 @@ class RepositoryRegistrationTests(unittest.TestCase):
                 register_repo(root, "api", second)
             with self.assertRaisesRegex(ValueError, "path.*already registered"):
                 register_repo(root, "other", first)
+
+    def test_loading_rejects_duplicate_registry_identity_after_tampering(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory) / "profile"
+            init_profile(root, "Work")
+            api = root / "projects/api"
+            web = root / "projects/web"
+            api.mkdir()
+            web.mkdir()
+            register_repo(root, "api", api)
+            (root / "PROJECTS.toml").write_text(
+                'version = 1\n\n[[repositories]]\nname = "api"\npath = "projects/api"\n'
+                '\n[[repositories]]\nname = "api"\npath = "projects/web"\n',
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(ValueError, "duplicate repository name"):
+                load_profile(root)
 
     def test_registration_rejects_missing_directory_and_symlink_escape(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

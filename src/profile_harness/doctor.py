@@ -86,10 +86,9 @@ REQUIRED_PLUGIN_FILES = (
     "examples/launchd.plist",
     "examples/systemd.service",
     "examples/systemd.timer",
-    "templates/repo/AGENTS.md",
-    "templates/repo/DECISIONS.md",
-    "templates/repo/STATUS.md",
-    "templates/repo/TASKS.md",
+    "templates/project-context/DECISIONS.md",
+    "templates/project-context/STATUS.md",
+    "templates/project-context/TASKS.md",
 )
 PROFILE_FILES = (
     ".gitignore",
@@ -685,8 +684,10 @@ def _registry_findings(root: Path) -> tuple[list[Finding], tuple[Path, ...]]:
             )
         ], ()
     projects = (root / "projects").resolve()
+    contexts = (root / "project-context").resolve()
     names: set[str] = set()
     paths: set[Path] = set()
+    registered_contexts: set[Path] = set()
     for index, entry in enumerate(entries, start=1):
         if not isinstance(entry, dict):
             findings.append(
@@ -696,7 +697,7 @@ def _registry_findings(root: Path) -> tuple[list[Finding], tuple[Path, ...]]:
         name, value = entry.get("name"), entry.get("path")
         if (
             not isinstance(name, str)
-            or not name.strip()
+            or re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,63}", name) is None
             or not isinstance(value, str)
             or not value.strip()
         ):
@@ -704,7 +705,7 @@ def _registry_findings(root: Path) -> tuple[list[Finding], tuple[Path, ...]]:
                 Finding(
                     "ERROR",
                     "registry",
-                    f"entry {index} needs non-empty name and path",
+                    f"entry {index} needs a portable repository name and non-empty path",
                 )
             )
             continue
@@ -748,26 +749,48 @@ def _registry_findings(root: Path) -> tuple[list[Finding], tuple[Path, ...]]:
                 )
             )
             continue
+        context = root / "project-context" / name
+        try:
+            require_safe_path(root, context, directory=True)
+            resolved_context = context.resolve()
+        except ValueError:
+            findings.append(Finding("ERROR", "registry", f"{name} has an unsafe project context"))
+            continue
+        if context.is_symlink() or resolved_context.parent != contexts:
+            findings.append(Finding("ERROR", "registry", f"{name} has an unsafe project context"))
+            continue
+        registered_contexts.add(resolved_context)
         for filename in ("STATUS.md", "TASKS.md", "DECISIONS.md"):
-            path = resolved / filename
+            path = resolved_context / filename
             if path.is_symlink() or not path.is_file():
                 findings.append(
                     Finding(
                         "ERROR",
                         "registry",
-                        f"{name} has missing or unsafe {filename}",
+                        f"{name} context has missing or unsafe {filename}",
                     )
                 )
-        for relative in ("docs", "docs/decisions", "docs/decisions/archive"):
-            path = resolved / relative
+        for relative in ("decisions", "decisions/archive"):
+            path = resolved_context / relative
             if path.is_symlink() or not path.is_dir():
-                findings.append(Finding("ERROR", "registry", f"{name} has missing or unsafe {relative}"))
+                findings.append(Finding("ERROR", "registry", f"{name} context has missing or unsafe {relative}"))
+    context_root = root / "project-context"
+    if context_root.is_dir() and not context_root.is_symlink():
+        for child in context_root.iterdir():
+            if child.is_symlink() or not child.is_dir() or child.resolve() not in registered_contexts:
+                findings.append(
+                    Finding(
+                        "ERROR",
+                        "registry",
+                        f"unregistered or unsafe project context: {child.name}",
+                    )
+                )
     if not any(item.subject == "registry" for item in findings):
         findings.append(
             Finding(
                 "OK",
                 "registry",
-                f"{len(repositories)} registered repositories are contained",
+                f"{len(repositories)} registered repositories and contexts are contained",
             )
         )
     return findings, tuple(repositories)

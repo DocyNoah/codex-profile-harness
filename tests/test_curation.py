@@ -362,8 +362,16 @@ class CurationTests(unittest.TestCase):
             applied = apply_actions(root, batch.batch_id, result)
 
             self.assertEqual(3, len(applied.changed_paths))
-            self.assertEqual("# Status\n\nHealthy.\n", (api / "STATUS.md").read_text())
-            self.assertIn("No current status", (web / "STATUS.md").read_text())
+            self.assertEqual(
+                "# Status\n\nHealthy.\n",
+                (root / "project-context/api/STATUS.md").read_text(),
+            )
+            self.assertIn(
+                "No current status",
+                (root / "project-context/web/STATUS.md").read_text(),
+            )
+            self.assertFalse((api / "STATUS.md").exists())
+            self.assertFalse((web / "STATUS.md").exists())
             memories = list((root / ".harness/memory/semantic").glob("*.md"))
             self.assertEqual(1, len(memories))
             self.assertEqual(memories[0].parent, root / ".harness/memory/semantic")
@@ -414,7 +422,9 @@ class CurationTests(unittest.TestCase):
                 },
             )
             second_adr = next(path for path in second.changed_paths if "ADR-" in path.name)
-            index = (api / "DECISIONS.md").read_text(encoding="utf-8")
+            index = (root / "project-context/api/DECISIONS.md").read_text(
+                encoding="utf-8"
+            )
 
             self.assertNotEqual(first_adr, second_adr)
             self.assertTrue(first_adr.is_file())
@@ -489,7 +499,8 @@ class CurationTests(unittest.TestCase):
             root, api, _ = self.make_profile(Path(temporary_directory))
             self.add_receipt(root, "one")
             batch = prepare_curation(root)
-            status_before = (api / "STATUS.md").read_bytes()
+            status = root / "project-context/api/STATUS.md"
+            status_before = status.read_bytes()
             journal = root / ".harness/memory/journal/curation.jsonl"
             append_entry(journal, {"batch_id": "before", "actions": 0})
             journal_before = journal.read_bytes()
@@ -513,7 +524,7 @@ class CurationTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "injected"):
                 apply_actions(root, batch.batch_id, result, fail_after_writes=1)
 
-            self.assertEqual(status_before, (api / "STATUS.md").read_bytes())
+            self.assertEqual(status_before, status.read_bytes())
             self.assertEqual(journal_before, journal.read_bytes())
             self.assertTrue((root / ".harness/memory/inbox/one.json").is_file())
             self.assertFalse(batch.path.exists())
@@ -548,14 +559,18 @@ class CurationTests(unittest.TestCase):
                 )
 
             self.assertEqual(journal_before, journal.read_bytes())
-            self.assertIn("No current status", (api / "STATUS.md").read_text())
+            self.assertIn(
+                "No current status",
+                (root / "project-context/api/STATUS.md").read_text(),
+            )
 
     def test_rollback_streams_snapshot_without_an_unbounded_read(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root, api, _ = self.make_profile(Path(temporary_directory))
             self.add_receipt(root, "one")
             batch = prepare_curation(root)
-            status_before = (api / "STATUS.md").read_bytes()
+            status = root / "project-context/api/STATUS.md"
+            status_before = status.read_bytes()
             real_read_bytes = Path.read_bytes
             real_open = Path.open
 
@@ -610,7 +625,7 @@ class CurationTests(unittest.TestCase):
                         fail_after_writes=1,
                     )
 
-            self.assertEqual(status_before, (api / "STATUS.md").read_bytes())
+            self.assertEqual(status_before, status.read_bytes())
             self.assertTrue((root / ".harness/memory/inbox/one.json").exists())
 
     def test_failed_apply_dead_letters_a_receipt_tampered_after_preparation(self) -> None:
@@ -749,8 +764,9 @@ class CurationTests(unittest.TestCase):
             batch = prepare_curation(root)
             identity = root / "IDENTITY.md"
             original_identity = identity.read_bytes()
-            (api / "STATUS.md").unlink()
-            (api / "STATUS.md").symlink_to(identity)
+            status = root / "project-context/api/STATUS.md"
+            status.unlink()
+            status.symlink_to(identity)
 
             with self.assertRaisesRegex(CurationError, "symlink"):
                 apply_actions(
@@ -770,6 +786,22 @@ class CurationTests(unittest.TestCase):
 
             self.assertEqual(original_identity, identity.read_bytes())
             self.assertTrue((root / ".harness/memory/inbox/one.json").exists())
+
+    def test_unexpected_project_context_file_blocks_curation_before_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root, _, _ = self.make_profile(Path(temporary_directory))
+            unexpected = root / "project-context/api/NOTES.md"
+            unexpected.write_text("foreign\n", encoding="utf-8")
+            status = root / "project-context/api/STATUS.md"
+            before = status.read_bytes()
+            self.add_receipt(root, "one")
+
+            with self.assertRaisesRegex(CurationError, "unexpected"):
+                prepare_curation(root)
+
+            self.assertEqual(before, status.read_bytes())
+            self.assertTrue((root / ".harness/memory/inbox/one.json").is_file())
+            self.assertFalse((root / ".harness/memory/journal/curation.jsonl").exists())
 
     def test_profile_memory_directory_symlink_cannot_escape_its_exact_scope(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -862,8 +894,10 @@ class CurationCliTests(unittest.TestCase):
             self.assertEqual(0, applied.returncode, applied.stderr)
             self.assertEqual("applied", json.loads(applied.stdout)["status"])
             self.assertEqual(
-                "# Status\n\nReady.\n", (repository / "STATUS.md").read_text()
+                "# Status\n\nReady.\n",
+                (root / "project-context/api/STATUS.md").read_text(),
             )
+            self.assertFalse((repository / "STATUS.md").exists())
 
 
 if __name__ == "__main__":

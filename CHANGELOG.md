@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.4.0 - 2026-09-12
+
+- Move repository status, tasks, and decisions into profile-owned
+  `project-context/<repo-id>/` directories so nested code repositories remain
+  untouched and keep independent Git history.
+- Add strict lowercase repository IDs and fail-closed validation for duplicate,
+  missing, symlinked, unregistered, or unexpected project-context content.
+- Route curation, decision records, dashboard links, recovery, doctor checks,
+  packaging, and profile Git checkpoints through the new context boundary.
+
 ## 0.3.4 - 2026-09-11
 
 - Stabilize the hostile Git environment regression test on macOS by comparing

@@ -34,7 +34,7 @@ the task and its recurring automation.
 
 Capture stores immutable, redacted, bounded evidence. It does not infer facts or
 classify meaning. Curation performs semantic reconciliation and may update only
-the existing narrow profile and registered-repository targets.
+the existing narrow profile and registered project-context targets.
 
 Per-session transcript cursors are serialized so overlapping `Stop` and
 `SessionEnd` hooks cannot move a cursor backward or duplicate a delta.
@@ -45,8 +45,10 @@ bounded improvement signals. A signal has a stable, model-proposed `signal_id`,
 a concise summary, and source receipt IDs. Schema and runtime validation reject
 invalid identifiers, missing provenance, duplicates, and oversized data.
 
-Normal repository work updates `STATUS.md` and `TASKS.md` directly. Curation
-only reconciles omissions, duplication, or conflicts.
+Normal repository work updates the matching
+`project-context/<repo-id>/STATUS.md` and `TASKS.md`. These files and decision
+records belong to profile Git; the nested code repository is never modified by
+the harness. Curation only reconciles omissions, duplication, or conflicts.
 
 ## Improvement eligibility and proposal contract
 
@@ -145,8 +147,10 @@ adapted silently.
 
 ## Git and push
 
-Profile Git continues to stage only the existing managed allowlist. New proposal
-manifests, lifecycle records, and audit journals are managed; runtime locks,
+Profile Git continues to stage only the existing managed allowlist, including
+strictly validated contexts for registered repositories. Unregistered context
+directories and unexpected context files fail closed. New proposal manifests,
+lifecycle records, and audit journals are managed; runtime locks,
 transient outbox delivery state, raw inbox evidence, nested repositories, and the
 generated dashboard remain ignored.
 

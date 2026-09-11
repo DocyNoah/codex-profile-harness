@@ -449,8 +449,9 @@ class EndToEndTests(unittest.TestCase):
             self.assertIn("web", dashboard_text)
             self.assertEqual(
                 "# Status\n\nAPI launch-ready.\n",
-                (api / "STATUS.md").read_text(encoding="utf-8"),
+                (profile / "project-context/api/STATUS.md").read_text(encoding="utf-8"),
             )
+            self.assertFalse((api / "STATUS.md").exists())
             self.assertEqual(
                 web_before,
                 {

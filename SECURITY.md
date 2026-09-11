@@ -3,8 +3,8 @@
 ## Boundaries
 
 - One Codex project is one profile. Registered repositories must resolve below
-  its `projects/` directory; fixed profile/repository paths reject symlink
-  components.
+  its `projects/` directory. Harness-owned repository state lives separately in
+  `project-context/<repo-id>/`; both boundaries reject symlink components.
 - Hook capture is model-free and bounded. It keeps only selected user/assistant
   text, applies best-effort credential redaction, and writes immutable receipts.
 - Transcript reads must be regular files contained below `CODEX_HOME`. Unsafe,
@@ -49,8 +49,10 @@ Registration is last; a failure restores both filesystem and confirmed Codex
 state, while a failed compensation is reported separately from the primary error.
 
 Automatic profile Git stages only code-owned managed paths: profile documents,
-registry/config, curated semantic/procedural memory, journals, and improvement
-state. Runtime receipts, processing/archive/state/log directories,
+strictly validated registered project contexts, registry/config, curated
+semantic/procedural memory, journals, and improvement state. Unregistered or
+unexpected project-context content blocks a checkpoint. Runtime receipts,
+processing/archive/state/log directories,
 `DASHBOARD.md`, and nested repositories are ignored. Harness checkpoint commands
 disable Git hooks and hostile repository environment variables at their own
 boundary; normal Git usage is unaffected. Automatic push is disabled by default.
@@ -88,7 +90,7 @@ tampering. Do not edit receipts, journal entries, or transaction descriptors to
 silence a finding. Recover with the harness where safe or restore an independently
 verified backup.
 
-Version 0.3.4 release archives use deterministic order, timestamps, ownership,
+Version 0.4.0 release archives use deterministic order, timestamps, ownership,
 and permissions and ship a SHA-256 checksum. Reproducibility detects accidental
 packaging drift; it does not replace review of the source and hook. Validate a
 clean extraction before installation.

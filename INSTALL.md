@@ -105,7 +105,9 @@ profile-harness git status
 ```
 
 Initialization preserves existing user files and creates automatic local Git
-history. Registration accepts only real directories below `projects/`.
+history. Registration accepts only real directories below `projects/`, creates
+their harness documents under `project-context/<repo-id>/`, and never writes
+harness files into the registered repository.
 
 ## Scheduling and models
 
@@ -146,15 +148,17 @@ profile-harness git status
 profile-harness git log
 ```
 
-The working agent should update repository `STATUS.md` and `TASKS.md` during the
-work itself. Curation reconciles evidence; it is not a separate routine rewrite.
+The working agent should update the corresponding
+`project-context/<repo-id>/STATUS.md` and `TASKS.md` during the work itself.
+Curation reconciles evidence; it is not a separate routine rewrite.
 
 ## Managed Git and recovery
 
 Only managed profile documents are staged: profile instructions/context,
-`PROJECTS.toml`, config, curated semantic/procedural memory, journals, and
-improvement proposals/status. Runtime evidence and state, `DASHBOARD.md`, and
-nested repositories are ignored. Deterministic commits are local by default:
+registered `project-context/` documents, `PROJECTS.toml`, config, curated
+semantic/procedural memory, journals, and improvement proposals/status. Runtime
+evidence and state, `DASHBOARD.md`, and nested repositories are ignored.
+Deterministic commits are local by default:
 there is no automatic push unless the user opts in with a privacy acknowledgement
 and exact upstream. Git hooks are disabled only for harness-owned checkpoint commands;
 normal user Git commands retain their configured hooks.

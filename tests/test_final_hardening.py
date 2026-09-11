@@ -57,7 +57,7 @@ class FinalHardeningTests(unittest.TestCase):
         repo = root / "projects/api"
         repo.mkdir()
         register_repo(root, "api", repo)
-        return root, repo
+        return root, root / "project-context/api"
 
     def add_receipt(self, root: Path, receipt_id: str = "one") -> Path:
         path = root / ".harness/memory/inbox" / f"{receipt_id}.json"
@@ -96,10 +96,12 @@ class FinalHardeningTests(unittest.TestCase):
             repo = root / "projects/api"
             repo.mkdir()
             outside.mkdir()
-            (repo / "docs").symlink_to(outside, target_is_directory=True)
+            context = root / "project-context/api"
+            context.mkdir()
+            (context / "decisions").symlink_to(outside, target_is_directory=True)
             with self.assertRaisesRegex(ValueError, "symlink"):
                 register_repo(root, "api", repo)
-            self.assertFalse((outside / "decisions").exists())
+            self.assertFalse((outside / "archive").exists())
 
     def test_capture_and_doctor_reject_runtime_directory_symlink_escape(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
