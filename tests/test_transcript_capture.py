@@ -502,6 +502,22 @@ class TranscriptCaptureTests(unittest.TestCase):
                 self.assertNotIn("outside", persisted)
         self.assertEqual([], self.cursors())
 
+    def test_cursor_lock_rejects_symlinked_state_without_external_creation(self) -> None:
+        outside = self.parent / "outside-state"
+        outside.mkdir()
+        state = self.root / ".harness/state"
+        state.rename(self.root / ".harness/state-real")
+        state.symlink_to(outside, target_is_directory=True)
+
+        with self.assertRaises(ValueError):
+            capture_event({
+                "hook_event_name": "Stop",
+                "session_id": "unsafe-state-session",
+                "cwd": str(self.root),
+            })
+
+        self.assertEqual([], list(outside.iterdir()))
+
     def test_malformed_record_falls_back_without_exception_details(self) -> None:
         transcript = self.codex_home / "broken.jsonl"
         transcript.write_bytes(b'{"type":"response_item"}\nnot-json\n')

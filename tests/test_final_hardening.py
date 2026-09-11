@@ -420,6 +420,39 @@ class FinalHardeningTests(unittest.TestCase):
             with self.assertRaisesRegex(CurationError, "journal binding"):
                 recover_transactions(root, checkpoint=False)
 
+    def test_upgrade_recovers_old_v3_descriptor_without_signal_binding_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root, _ = self.make_profile(Path(temporary_directory))
+            self.add_receipt(root)
+            batch = prepare_curation(root)
+            self._crash_apply(
+                root,
+                batch.batch_id,
+                {
+                    "type": "profile_proposal",
+                    "title": "Old v3",
+                    "content": "body",
+                    "source_receipt_ids": ["one"],
+                },
+                "after_commit",
+            )
+            descriptor = (
+                root / ".harness/state/transactions" / f"{batch.batch_id}.json"
+            )
+            value = json.loads(descriptor.read_text(encoding="utf-8"))
+            value["version"] = 3
+            value.pop("result_digest")
+            value.pop("signals")
+            descriptor.write_text(json.dumps(value), encoding="utf-8")
+
+            recovered = recover_transactions(root, checkpoint=False)
+
+            self.assertEqual((batch.batch_id,), recovered)
+            self.assertFalse(descriptor.exists())
+            self.assertTrue(
+                (root / ".harness/improvements/proposed/old-v3.md").is_file()
+            )
+
     def test_recovery_fsyncs_unlinks_before_deleting_precommit_descriptor(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root, _ = self.make_profile(Path(temporary_directory))

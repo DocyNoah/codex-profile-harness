@@ -998,7 +998,7 @@ def _journal_entry_binds_transaction(
         and entry.get("target_digests") == target_digests
         and set(entry.get("changed_paths", [])) == set(target_digests)
         and (
-            transaction.get("version") != 3
+            transaction.get("version") != 4
             or (
                 entry.get("result_digest") == transaction.get("result_digest")
                 and entry.get("signals") == transaction.get("signals")
@@ -1017,20 +1017,24 @@ def _target_has_batch_marker(path: Path, batch_id: str) -> bool:
 
 def _validate_transaction(root: Path, transaction_path: Path, transaction: object) -> dict[str, Any]:
     fields = {"version", "batch_id", "state", "batch_path", "targets", "archives", "journal"}
+    if not isinstance(transaction, dict):
+        raise CurationError(f"invalid transaction descriptor: {transaction_path.name}")
+    version = transaction.get("version")
+    expected_fields = fields
+    if version == 3:
+        expected_fields = fields | {"batch_files"}
+    elif version == 4:
+        expected_fields = fields | {"batch_files", "result_digest", "signals"}
     if (
-        not isinstance(transaction, dict)
-        or transaction.get("version") not in {1, 2, 3}
-        or set(transaction) != (
-            fields | {"batch_files", "result_digest", "signals"}
-            if transaction.get("version") == 3
-            else fields
-        )
+        version not in {1, 2, 3, 4}
+        or set(transaction) != expected_fields
         or transaction.get("state") not in {"applying", "committed"}
     ):
         raise CurationError(f"invalid transaction descriptor: {transaction_path.name}")
     legacy = transaction["version"] == 1
-    self_contained = transaction["version"] == 3
-    if self_contained and not _is_digest(transaction.get("result_digest")):
+    self_contained = transaction["version"] in {3, 4}
+    strongly_bound = transaction["version"] == 4
+    if strongly_bound and not _is_digest(transaction.get("result_digest")):
         raise CurationError("transaction result digest is invalid")
     batch_id = transaction.get("batch_id")
     if (
@@ -1061,7 +1065,8 @@ def _validate_transaction(root: Path, transaction_path: Path, transaction: objec
         if len(derived_ids) != len(set(derived_ids)):
             raise CurationError("transaction archive receipt IDs are not unique")
         receipt_ids = tuple(derived_ids)
-        _validate_signals(transaction.get("signals"), set(receipt_ids))
+        if strongly_bound:
+            _validate_signals(transaction.get("signals"), set(receipt_ids))
         batch_files = _validate_remaining_batch_files(batch_path, transaction["batch_files"], receipt_ids)
         if batch_path.exists() and (batch_path / "batch.json").exists():
             manifest_ids, recorded_digests = _transaction_manifest(batch_path, batch_id)
@@ -1444,7 +1449,7 @@ def apply_actions(
                 raise CurationError("immutable receipt archive destination already exists")
             archives.append({"source": str(source.relative_to(profile.root)), "destination": str(destination.relative_to(profile.root)), "digest": _receipt_record(source)["sha256"]})
         transaction = {
-            "version": 3,
+            "version": 4,
             "batch_id": batch_id,
             "state": "applying",
             "batch_path": str(batch_path.relative_to(profile.root)),

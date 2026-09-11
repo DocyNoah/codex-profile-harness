@@ -48,8 +48,10 @@ def _cursor_path(profile_root: Path, session_id: str) -> Path:
 def serialize_session_cursor(profile_root: Path, session_id: str) -> Iterator[None]:
     """Serialize preparation through publication for one session cursor."""
     cursor_path = _cursor_path(profile_root, session_id)
-    cursor_path.parent.mkdir(exist_ok=True)
-    ensure_safe_directory(profile_root, cursor_path.parent)
+    try:
+        ensure_safe_directory(profile_root, cursor_path.parent)
+    except FileExistsError:
+        ensure_safe_directory(profile_root, cursor_path.parent)
     lock_path = cursor_path.with_suffix(".lock")
     require_safe_path(profile_root, lock_path, directory=False)
     flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
