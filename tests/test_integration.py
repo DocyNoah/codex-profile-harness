@@ -53,6 +53,41 @@ class EndToEndTests(unittest.TestCase):
             self.assertEqual("already_applied", json.loads(retried.stdout)["status"])
             self.assertEqual("# Context\n\nCLI applied.\n", target.read_text())
 
+    def test_control_poll_then_immediate_cli_approval_applies_successfully(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            parent = Path(temporary_directory)
+            profile = parent / "profile"
+            self.assertEqual(0, self.run_cli(parent, "init", str(profile), "--name", "Control approval").returncode)
+            sys.path.insert(0, str(ROOT / "src"))
+            from profile_harness.proposals import ProposalStore
+            from profile_harness.profile_git import IMPROVEMENT_SUBJECT, checkpoint_profile
+            target = profile / "CONTEXT.md"
+            proposal = ProposalStore(profile).create(
+                title="Immediate approval", rationale="Control delivered", risk_level="low",
+                source_journal_hashes=["e" * 64],
+                replacements=[{
+                    "path": "CONTEXT.md",
+                    "expected_old_sha256": hashlib.sha256(target.read_bytes()).hexdigest(),
+                    "content": "# Context\n\nApproved from control.\n",
+                }],
+                base_commit=subprocess.run(
+                    ["git", "-C", str(profile), "rev-parse", "HEAD"],
+                    text=True, capture_output=True, check=True,
+                ).stdout.strip(),
+                policy={"mode": "approval_required", "automatic_eligible": False, "reason": "review"},
+                created_at=datetime(2026, 9, 11, tzinfo=timezone.utc),
+            )
+            self.assertIsNone(checkpoint_profile(profile, IMPROVEMENT_SUBJECT).error)
+            polled = self.run_cli(profile, "control", "poll", "--json")
+            self.assertEqual(0, polled.returncode, polled.stderr)
+            self.assertEqual("notified", ProposalStore(profile).load(proposal["proposal_id"])["status"])
+
+            approved = self.run_cli(profile, "proposal", "approve", proposal["proposal_id"])
+
+            self.assertEqual(0, approved.returncode, approved.stderr)
+            self.assertEqual("applied", json.loads(approved.stdout)["status"])
+            self.assertEqual("# Context\n\nApproved from control.\n", target.read_text())
+
     def test_proposal_and_control_cli_are_bounded_local_workflows(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             parent = Path(temporary_directory)

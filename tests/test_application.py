@@ -24,6 +24,7 @@ from profile_harness.application import (  # noqa: E402
 from profile_harness.config import init_profile, load_profile_config  # noqa: E402
 from profile_harness.proposals import ProposalStore  # noqa: E402
 from profile_harness.control import ControlOutbox  # noqa: E402
+import profile_harness.application as application_module  # noqa: E402
 
 
 class ApplicationTests(unittest.TestCase):
@@ -166,6 +167,56 @@ class ApplicationTests(unittest.TestCase):
             self.assertTrue(recover_application(root))
             self.assertEqual("applied", ProposalStore(root).load(manifest["proposal_id"])["status"])
             self.assertEqual("# Context\n\nApplied exactly.\n", (root / "CONTEXT.md").read_text())
+
+    def test_post_commit_finalization_failures_never_roll_back_committed_content(self) -> None:
+        variants = ("second_wal", "lifecycle", "cleanup")
+        for variant in variants:
+            with self.subTest(variant=variant), tempfile.TemporaryDirectory() as temporary_directory:
+                root, manifest = self.make_profile(Path(temporary_directory))
+                self.notify_and_approve(root, manifest["proposal_id"])
+                if variant == "second_wal":
+                    original = application_module.atomic_write_text
+                    wal_writes = 0
+
+                    def fail_second_wal(path: Path, content: str):
+                        nonlocal wal_writes
+                        if path.name == "application-transaction.json":
+                            wal_writes += 1
+                            if wal_writes == 2:
+                                raise OSError("injected second WAL failure")
+                        return original(path, content)
+
+                    patcher = mock.patch.object(application_module, "atomic_write_text", side_effect=fail_second_wal)
+                elif variant == "lifecycle":
+                    original_transition = ProposalStore._transition_unlocked
+
+                    def fail_final_transition(store, proposal_id, expected, target, reason=None):
+                        if target == "applied":
+                            raise OSError("injected lifecycle finalization failure")
+                        return original_transition(store, proposal_id, expected, target, reason)
+
+                    patcher = mock.patch.object(ProposalStore, "_transition_unlocked", new=fail_final_transition)
+                else:
+                    patcher = mock.patch.object(
+                        application_module, "_cleanup_unlocked",
+                        side_effect=OSError("injected cleanup failure"),
+                    )
+
+                with patcher, self.assertRaises(ApplicationError):
+                    apply_proposal(root, manifest["proposal_id"])
+
+                self.assertEqual("# Context\n\nApplied exactly.\n", (root / "CONTEXT.md").read_text())
+                self.assertEqual(
+                    "# Context\n\nApplied exactly.\n",
+                    subprocess.run(
+                        ["git", "-C", str(root), "show", "HEAD:CONTEXT.md"],
+                        text=True, capture_output=True, check=True,
+                    ).stdout,
+                )
+                self.assertTrue((root / ".harness/state/application-transaction.json").exists())
+
+                self.assertTrue(recover_application(root))
+                self.assertEqual("applied", ProposalStore(root).load(manifest["proposal_id"])["status"])
 
     def test_cli_approval_does_not_checkpoint_unrelated_dirty_managed_content(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

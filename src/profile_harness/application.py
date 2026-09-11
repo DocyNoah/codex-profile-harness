@@ -242,7 +242,11 @@ def _recover_unlocked(root: Path) -> bool:
     transaction = _load_transaction(root)
     if transaction is None:
         return False
-    manifest = ProposalStore(root).load(transaction["proposal_id"])
+    store = ProposalStore(root)
+    manifest = store.load(transaction["proposal_id"])
+    validated_lifecycle_sha256 = _validated_lifecycle_digest(
+        root, store, transaction["proposal_id"]
+    )
     if (
         manifest.get("legacy")
         or transaction["base_commit"] != manifest["base_commit"]
@@ -261,7 +265,10 @@ def _recover_unlocked(root: Path) -> bool:
     target_digests = {item["path"]: item["new_sha256"] for item in transaction["targets"]}
     try:
         observed = identify_application_checkpoint(
-            root, transaction["pre_commit"], target_digests
+            root,
+            transaction["pre_commit"],
+            target_digests,
+            validated_lifecycle_sha256=validated_lifecycle_sha256,
         )
     except Exception as error:
         raise ApplicationError(f"application recovery found ambiguous HEAD: {error}") from error
@@ -279,7 +286,6 @@ def _recover_unlocked(root: Path) -> bool:
         transaction["state"] = "committed"
         transaction["post_commit"] = observed
         atomic_write_text(_wal_path(root), json.dumps(transaction, sort_keys=True, indent=2) + "\n")
-        store = ProposalStore(root)
         if store.load(transaction["proposal_id"])["status"] == "applying":
             store._transition_unlocked(
                 transaction["proposal_id"], "applying", "applied",
@@ -306,6 +312,25 @@ def _manifest_digest(root: Path, proposal_id: str) -> str:
         directory=False,
     )
     return _digest(path.read_bytes())
+
+
+def _validated_lifecycle_digest(
+    root: Path, store: ProposalStore, proposal_id: str
+) -> str:
+    """Validate the complete journal/provenance view, then bind its exact bytes."""
+    lifecycle = require_safe_path(
+        root, root / ".harness/improvements/lifecycle.jsonl", directory=False
+    )
+    if not lifecycle.is_file():
+        raise ApplicationError("proposal lifecycle journal is missing")
+    before = lifecycle.read_bytes()
+    proposals = store.list()
+    if not any(item.get("proposal_id") == proposal_id for item in proposals):
+        raise ApplicationError("proposal lifecycle does not contain the requested proposal")
+    after = lifecycle.read_bytes()
+    if before != after:
+        raise ApplicationError("proposal lifecycle changed during validation")
+    return _digest(after)
 
 
 def _finish_committed_unlocked(
@@ -373,8 +398,18 @@ def apply_proposal(
         elif not approve and manifest["status"] != "approved":
             raise ApplicationError("proposal must be approved before application")
         targets = tuple(item["path"] for item in manifest["replacements"])
+        validated_lifecycle_sha256 = None
+        if manifest["status"] == "notified" and (approve or automatic):
+            validated_lifecycle_sha256 = _validated_lifecycle_digest(
+                profile_root, store, proposal_id
+            )
         try:
-            validate_application_baseline(profile_root, manifest["base_commit"], targets)
+            validate_application_baseline(
+                profile_root,
+                manifest["base_commit"],
+                targets,
+                validated_lifecycle_sha256=validated_lifecycle_sha256,
+            )
         except Exception as error:
             _expire_unlocked(profile_root, store, manifest, f"stale managed baseline: {error}")
             raise ApplicationError(str(error)) from error
@@ -416,7 +451,12 @@ def apply_proposal(
                     "snapshot_sha256": snapshot_digest,
                     "old_mode": stat.S_IMODE(target.stat(follow_symlinks=False).st_mode),
                 })
-            validate_application_baseline(profile_root, manifest["base_commit"], targets)
+            validate_application_baseline(
+                profile_root,
+                manifest["base_commit"],
+                targets,
+                validated_lifecycle_sha256=validated_lifecycle_sha256,
+            )
             atomic_write_text(_wal_path(profile_root), json.dumps(transaction, sort_keys=True, indent=2) + "\n")
         except BaseException:
             _cleanup_unlocked(profile_root, transaction)
@@ -429,6 +469,7 @@ def apply_proposal(
                 reason = "automatic policy approved exact bytes" if automatic else "approved by user"
                 manifest = store._transition_unlocked(proposal_id, "notified", "approved", reason)
         store._transition_unlocked(proposal_id, "approved", "applying")
+        commit_observed = False
         try:
             for index, replacement in enumerate(manifest["replacements"], start=1):
                 _replace_preserving_mode(
@@ -469,6 +510,9 @@ def apply_proposal(
                     else (checkpoint.error if checkpoint is not None else "no result")
                 )
                 raise ApplicationError(f"application checkpoint failed before commit: {detail}")
+            # This exact HEAD is the durability boundary. From here on, recovery
+            # must finish lifecycle/WAL cleanup and must never restore snapshots.
+            commit_observed = True
             if (
                 checkpoint is not None and checkpoint.commit_sha is not None
                 and checkpoint.commit_sha != observed_post
@@ -488,6 +532,10 @@ def apply_proposal(
         except RuntimeError as error:
             if fail_after_writes is not None and str(error).startswith("injected"):
                 raise
+            if commit_observed:
+                raise ApplicationError(
+                    "application commit is durable; finalization remains pending"
+                ) from error
             _restore_unlocked(profile_root, transaction)
             from .control import ControlOutbox
             try:
@@ -499,6 +547,10 @@ def apply_proposal(
                 pass
             raise ApplicationError(str(error)) from error
         except BaseException as error:
+            if commit_observed:
+                raise ApplicationError(
+                    "application commit is durable; finalization remains pending"
+                ) from error
             _restore_unlocked(profile_root, transaction)
             from .control import ControlOutbox
             try:

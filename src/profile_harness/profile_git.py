@@ -590,15 +590,32 @@ def current_profile_commit(root: Path) -> str:
 
 
 def validate_application_baseline(
-    root: Path, base_commit: str, target_paths: tuple[str, ...]
+    root: Path,
+    base_commit: str,
+    target_paths: tuple[str, ...],
+    *,
+    validated_lifecycle_sha256: str | None = None,
 ) -> None:
     """Require a clean managed tree and only proposal metadata since *base_commit*."""
     profile_root = Path(root).expanduser().resolve()
     _safe_git_directory(profile_root)
     if not re.fullmatch(r"[a-f0-9]{40,64}", base_commit):
         raise ProfileGitError("proposal base commit is invalid")
-    if _dirty_paths(profile_root):
-        raise ProfileGitError("managed profile baseline is dirty")
+    dirty = _dirty_paths(profile_root)
+    if dirty:
+        lifecycle_path = ".harness/improvements/lifecycle.jsonl"
+        if dirty != (lifecycle_path,) or validated_lifecycle_sha256 is None:
+            raise ProfileGitError("managed profile baseline is dirty")
+        lifecycle = require_safe_path(
+            profile_root, profile_root / lifecycle_path, directory=False
+        )
+        if (
+            not lifecycle.is_file()
+            or not re.fullmatch(r"[a-f0-9]{64}", validated_lifecycle_sha256)
+            or hashlib.sha256(lifecycle.read_bytes()).hexdigest()
+            != validated_lifecycle_sha256
+        ):
+            raise ProfileGitError("validated proposal lifecycle changed")
     ancestor = _git(
         profile_root, "merge-base", "--is-ancestor", base_commit, "HEAD",
         check=False, read_only=True,
@@ -626,6 +643,8 @@ def identify_application_checkpoint(
     root: Path,
     pre_commit: str,
     target_digests: dict[str, str],
+    *,
+    validated_lifecycle_sha256: str | None = None,
 ) -> str | None:
     """Identify one exact harness application commit after an ambiguous result."""
     profile_root = Path(root).expanduser().resolve()
@@ -649,8 +668,20 @@ def identify_application_checkpoint(
     allowed = set(target_digests) | {".harness/improvements/lifecycle.jsonl"}
     if ".harness/improvements/lifecycle.jsonl" not in changed or not changed <= allowed:
         raise ProfileGitError("application commit changed unexpected paths")
-    if _dirty_paths(profile_root):
-        raise ProfileGitError("application commit left managed paths dirty")
+    dirty = _dirty_paths(profile_root)
+    if dirty:
+        lifecycle_path = ".harness/improvements/lifecycle.jsonl"
+        lifecycle = require_safe_path(
+            profile_root, profile_root / lifecycle_path, directory=False
+        )
+        if (
+            dirty != (lifecycle_path,)
+            or validated_lifecycle_sha256 is None
+            or not lifecycle.is_file()
+            or hashlib.sha256(lifecycle.read_bytes()).hexdigest()
+            != validated_lifecycle_sha256
+        ):
+            raise ProfileGitError("application commit left managed paths dirty")
     for relative, expected in target_digests.items():
         path = require_safe_path(profile_root, profile_root / relative, directory=False)
         if not path.is_file():
