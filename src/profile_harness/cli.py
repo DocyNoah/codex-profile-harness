@@ -21,6 +21,7 @@ from .curation import (
     find_single_batch,
     load_result,
     prepare_curation,
+    recover_preparations,
     recover_transactions,
 )
 from .dashboard import generate_dashboard
@@ -137,6 +138,12 @@ def _curate(arguments: argparse.Namespace) -> int:
     command, timeout, stale_timeout, model, reasoning_effort = _curation_settings(root)
     with ProfileLease(root, stale_timeout=stale_timeout):
         recover_transactions(root)
+        apply_batch_id = None
+        if arguments.apply is not None:
+            apply_batch_id = arguments.batch_id or find_single_batch(root)
+            recover_preparations(root, preserve_batch_id=apply_batch_id)
+        else:
+            recover_preparations(root)
         if arguments.prepare:
             if arguments.batch_id is not None:
                 raise ValueError("--batch is only valid with --apply")
@@ -150,7 +157,8 @@ def _curate(arguments: argparse.Namespace) -> int:
         elif arguments.apply is not None:
             if arguments.limit is not None:
                 raise ValueError("--limit is not valid with --apply")
-            batch_id = arguments.batch_id or find_single_batch(root)
+            batch_id = apply_batch_id
+            assert batch_id is not None
             applied = apply_actions(root, batch_id, load_result(arguments.apply))
             output = {
                 "status": "applied",

@@ -542,6 +542,262 @@ class FinalHardeningTests(unittest.TestCase):
                     self.assertEqual(original, (repo / "STATUS.md").read_bytes())
                     self.assertTrue((root / ".harness/memory/inbox/one.json").is_file())
 
+    def test_preparation_descriptor_is_durable_before_first_claim_and_crashes_recover(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root, _ = self.make_profile(Path(temporary_directory))
+            self.add_receipt(root, "one")
+            real_replace = curation_module._durable_replace
+            observed = []
+
+            def assert_descriptor_precedes_claim(source: Path, destination: Path) -> None:
+                if source.parent == (root / ".harness/memory/inbox").resolve():
+                    descriptors = list((root / ".harness/state/preparations").glob("*.json"))
+                    self.assertEqual(1, len(descriptors))
+                    observed.append(descriptors[0].read_bytes())
+                real_replace(source, destination)
+
+            with mock.patch.object(curation_module, "_durable_replace", side_effect=assert_descriptor_precedes_claim):
+                batch = prepare_curation(root)
+            self.assertTrue(observed)
+            descriptor = json.loads(observed[0])
+            self.assertEqual(batch.batch_id, descriptor["batch_id"])
+            self.assertEqual(["one"], descriptor["manifest"]["receipt_ids"])
+            self.assertRegex(descriptor["manifest"]["receipts"][0]["sha256"], r"^[a-f0-9]{64}$")
+            self.assertTrue((root / ".harness/state/preparations" / f"{batch.batch_id}.json").is_file())
+
+        for stage in ("after_claim_manifest", "after_claim_move", "after_claim_move_2", "after_prompt"):
+            with self.subTest(stage=stage), tempfile.TemporaryDirectory() as temporary_directory:
+                root, _ = self.make_profile(Path(temporary_directory))
+                self.add_receipt(root, "one")
+                if stage == "after_claim_move_2":
+                    self.add_receipt(root, "two")
+                script = (
+                    "import sys;from pathlib import Path;"
+                    f"sys.path.insert(0,{str(ROOT / 'src')!r});"
+                    "from profile_harness.curation import prepare_curation;"
+                    f"prepare_curation(Path({str(root)!r}),crash_after_stage={stage!r})"
+                )
+                crashed = subprocess.run([sys.executable, "-c", script], check=False)
+                self.assertEqual(91, crashed.returncode)
+
+                recovered = curation_module.recover_preparations(root)
+
+                self.assertEqual(1, len(recovered))
+                self.assertTrue((root / ".harness/memory/inbox/one.json").is_file())
+                if stage == "after_claim_move_2":
+                    self.assertTrue((root / ".harness/memory/inbox/two.json").is_file())
+                self.assertFalse(list((root / ".harness/memory/processing").iterdir()))
+                self.assertFalse(list((root / ".harness/state/preparations").glob("*.json")))
+
+    def test_orphan_return_recovery_is_idempotent_and_same_digest_duplicate_is_safe(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root, _ = self.make_profile(Path(temporary_directory))
+            self.add_receipt(root, "one")
+            self.add_receipt(root, "two")
+            script = (
+                "import sys;from pathlib import Path;"
+                f"sys.path.insert(0,{str(ROOT / 'src')!r});"
+                "from profile_harness.curation import prepare_curation;"
+                f"prepare_curation(Path({str(root)!r}),crash_after_stage='after_prompt')"
+            )
+            self.assertEqual(91, subprocess.run([sys.executable, "-c", script], check=False).returncode)
+            processing = next((root / ".harness/memory/processing").iterdir())
+            inbox = root / ".harness/memory/inbox"
+            (inbox / "one.json").write_bytes((processing / "one.json").read_bytes())
+            real_replace = curation_module._durable_replace
+            interrupted = False
+
+            def interrupt_after_move(source: Path, destination: Path) -> None:
+                nonlocal interrupted
+                real_replace(source, destination)
+                if destination.parent == inbox.resolve() and not interrupted:
+                    interrupted = True
+                    raise OSError("injected orphan return interruption")
+
+            with mock.patch.object(curation_module, "_durable_replace", side_effect=interrupt_after_move):
+                with self.assertRaisesRegex(OSError, "orphan return"):
+                    curation_module.recover_preparations(root)
+
+            curation_module.recover_preparations(root)
+            self.assertEqual({"one.json", "two.json"}, {path.name for path in inbox.glob("*.json")})
+            self.assertFalse(list((root / ".harness/memory/processing").iterdir()))
+
+    def test_apply_wal_publish_atomically_takes_ownership_from_preparation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root, _ = self.make_profile(Path(temporary_directory))
+            self.add_receipt(root, "one")
+            batch = prepare_curation(root)
+
+            self._crash_apply(
+                root,
+                batch.batch_id,
+                {
+                    "type": "profile_memory",
+                    "kind": "semantic",
+                    "title": "Owned",
+                    "content": "body",
+                    "source_receipt_ids": ["one"],
+                },
+                "after_transaction_publish",
+            )
+
+            self.assertTrue((root / ".harness/state/transactions" / f"{batch.batch_id}.json").is_file())
+            self.assertTrue((root / ".harness/state/preparations" / f"{batch.batch_id}.json").is_file())
+            self.assertEqual((batch.batch_id,), recover_transactions(root, checkpoint=False))
+            self.assertTrue((root / ".harness/memory/inbox/one.json").is_file())
+            self.assertFalse((root / ".harness/state/preparations" / f"{batch.batch_id}.json").exists())
+
+    def test_tampered_orphan_preparation_fails_closed_and_doctor_reports_it(self) -> None:
+        for mutation in ("digest", "unexpected", "symlink", "different_duplicate"):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as temporary_directory:
+                root, _ = self.make_profile(Path(temporary_directory))
+                self.add_receipt(root, "one")
+                script = (
+                    "import sys;from pathlib import Path;"
+                    f"sys.path.insert(0,{str(ROOT / 'src')!r});"
+                    "from profile_harness.curation import prepare_curation;"
+                    f"prepare_curation(Path({str(root)!r}),crash_after_stage='after_claim_move')"
+                )
+                self.assertEqual(91, subprocess.run([sys.executable, "-c", script], check=False).returncode)
+                processing = next((root / ".harness/memory/processing").iterdir())
+                descriptor = next((root / ".harness/state/preparations").glob("*.json"))
+                if mutation == "digest":
+                    value = json.loads(descriptor.read_text())
+                    value["manifest"]["receipts"][0]["sha256"] = "0" * 64
+                    descriptor.write_text(json.dumps(value), encoding="utf-8")
+                elif mutation == "unexpected":
+                    (processing / "unexpected").write_text("x", encoding="utf-8")
+                elif mutation == "symlink":
+                    (processing / "unexpected").symlink_to(root / "IDENTITY.md")
+                else:
+                    duplicate = root / ".harness/memory/inbox/one.json"
+                    duplicate.write_text(json.dumps({
+                        "id": "one", "event": "Stop",
+                        "captured_at": "2026-09-11T00:00:00Z", "cwd": str(root),
+                        "payload": {"session_id": "different"},
+                    }), encoding="utf-8")
+                protected = {
+                    descriptor: descriptor.read_bytes(),
+                    root / "IDENTITY.md": (root / "IDENTITY.md").read_bytes(),
+                }
+
+                with self.assertRaises(CurationError):
+                    curation_module.recover_preparations(root)
+                report = diagnose(root)
+
+                self.assertFalse(report.ok)
+                self.assertIn("preparation", report.format())
+                self.assertEqual(protected, {path: path.read_bytes() for path in protected})
+
+    def test_maintenance_recovers_pre_model_orphan_before_due_calculation(self) -> None:
+        from profile_harness.maintenance import run_maintenance
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            parent = Path(temporary_directory)
+            root, _ = self.make_profile(parent)
+            self.add_receipt(root, "one")
+            script = (
+                "import sys;from pathlib import Path;"
+                f"sys.path.insert(0,{str(ROOT / 'src')!r});"
+                "from profile_harness.curation import prepare_curation;"
+                f"prepare_curation(Path({str(root)!r}),crash_after_stage='after_prompt')"
+            )
+            self.assertEqual(91, subprocess.run([sys.executable, "-c", script], check=False).returncode)
+            fake = parent / "fake-codex"
+            fake.write_text(
+                "#!/usr/bin/env python3\nimport pathlib,sys\n"
+                "sys.stdin.read()\npathlib.Path(sys.argv[sys.argv.index('-o')+1]).write_text('{\"actions\":[]}')\n",
+                encoding="utf-8",
+            )
+            fake.chmod(fake.stat().st_mode | stat.S_IXUSR)
+            config = root / ".harness/config.toml"
+            config.write_text(
+                config.read_text() +
+                f'\n[curation]\nmaintenance_receipt_threshold = 1\ncodex_command = {json.dumps(str(fake))}\n',
+                encoding="utf-8",
+            )
+
+            result = run_maintenance(root)
+
+            self.assertEqual("performed", result["curation"]["status"])
+            self.assertTrue((root / ".harness/memory/archive/processed/one.json").is_file())
+
+    def test_model_process_crash_is_restored_and_retried_from_inbox(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            parent = Path(temporary_directory)
+            root, _ = self.make_profile(parent)
+            self.add_receipt(root, "one")
+            fake = parent / "fake-codex"
+            fake.write_text(
+                "#!/usr/bin/env python3\nimport os,signal\nos.kill(os.getppid(), signal.SIGKILL)\n",
+                encoding="utf-8",
+            )
+            fake.chmod(fake.stat().st_mode | stat.S_IXUSR)
+            config = root / ".harness/config.toml"
+            config.write_text(
+                config.read_text()
+                + f'\n[curation]\ncodex_command = {json.dumps(str(fake))}\n'
+                + "stale_timeout_seconds = 0.001\n",
+                encoding="utf-8",
+            )
+            command = [sys.executable, str(ROOT / "bin/profile-harness"), "curate", "--run"]
+
+            crashed = subprocess.run(command, cwd=root, text=True, capture_output=True, check=False)
+
+            self.assertNotEqual(0, crashed.returncode)
+            self.assertTrue(list((root / ".harness/state/preparations").glob("*.json")))
+            self.assertFalse((root / ".harness/memory/inbox/one.json").exists())
+            fake.write_text(
+                "#!/usr/bin/env python3\nimport pathlib,sys\n"
+                "sys.stdin.read()\n"
+                "pathlib.Path(sys.argv[sys.argv.index('-o')+1]).write_text('{\"actions\":[]}')\n",
+                encoding="utf-8",
+            )
+            retried = subprocess.run(command, cwd=root, text=True, capture_output=True, check=False)
+
+            self.assertEqual(0, retried.returncode, retried.stderr)
+            self.assertEqual("applied", json.loads(retried.stdout)["status"])
+            self.assertTrue((root / ".harness/memory/archive/processed/one.json").is_file())
+            self.assertFalse(list((root / ".harness/state/preparations").glob("*.json")))
+
+    def test_doctor_recovers_valid_orphan_and_rejects_descriptorless_batch(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root, _ = self.make_profile(Path(temporary_directory))
+            self.add_receipt(root, "one")
+            script = (
+                "import sys;from pathlib import Path;"
+                f"sys.path.insert(0,{str(ROOT / 'src')!r});"
+                "from profile_harness.curation import prepare_curation;"
+                f"prepare_curation(Path({str(root)!r}),crash_after_stage='after_claim_move')"
+            )
+            self.assertEqual(91, subprocess.run([sys.executable, "-c", script], check=False).returncode)
+
+            report = diagnose(root)
+
+            self.assertIn("recovered 1 orphan prepared/claim batch", report.format())
+            self.assertTrue((root / ".harness/memory/inbox/one.json").is_file())
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root, _ = self.make_profile(Path(temporary_directory))
+            self.add_receipt(root, "one")
+            script = (
+                "import sys;from pathlib import Path;"
+                f"sys.path.insert(0,{str(ROOT / 'src')!r});"
+                "from profile_harness.curation import prepare_curation;"
+                f"prepare_curation(Path({str(root)!r}),crash_after_stage='after_claim_move')"
+            )
+            self.assertEqual(91, subprocess.run([sys.executable, "-c", script], check=False).returncode)
+            descriptor = next((root / ".harness/state/preparations").glob("*.json"))
+            batch = next((root / ".harness/memory/processing").iterdir())
+            descriptor.unlink()
+            before = {path.name: path.read_bytes() for path in batch.iterdir() if path.is_file()}
+
+            report = diagnose(root)
+
+            self.assertFalse(report.ok)
+            self.assertIn("malformed orphan preparation", report.format())
+            self.assertEqual(before, {path.name: path.read_bytes() for path in batch.iterdir() if path.is_file()})
+
     def test_partial_batch_cleanup_rejects_unrecorded_file_or_link_without_mutation(self) -> None:
         for kind in ("file", "link"):
             with self.subTest(kind=kind), tempfile.TemporaryDirectory() as temporary_directory:

@@ -281,7 +281,18 @@ def _batch_id() -> str:
     return f"{stamp}-{uuid.uuid4().hex[:12]}"
 
 
-def claim_receipts(root: Path, limit: int | None = None) -> CurationBatch:
+def _preparation_path(root: Path, batch_id: str) -> Path:
+    directory = _ensure_dir(root, ".harness/state/preparations")
+    return directory / f"{batch_id}.json"
+
+
+def _publish_preparation(path: Path, descriptor: dict[str, Any]) -> None:
+    atomic_write_text(path, json.dumps(descriptor, sort_keys=True, indent=2) + "\n")
+
+
+def claim_receipts(
+    root: Path, limit: int | None = None, *, crash_after_stage: str | None = None
+) -> CurationBatch:
     """Atomically claim valid inbox receipts into a unique processing batch."""
     profile_root = Path(root).resolve()
     load_profile(profile_root)
@@ -290,28 +301,53 @@ def claim_receipts(root: Path, limit: int | None = None) -> CurationBatch:
     batch_id = _batch_id()
     processing = _safe_dir(profile_root, ".harness/memory/processing")
     batch_path = processing / batch_id
-    ensure_safe_directory(profile_root, batch_path)
-    receipt_ids: list[str] = []
+    selected: list[tuple[Path, dict[str, Any]]] = []
     inbox = _safe_dir(profile_root, ".harness/memory/inbox")
+    for path in sorted(inbox.glob("*.json")):
+        if limit is not None and len(selected) >= limit:
+            break
+        try:
+            _valid_receipt(path)
+            selected.append((path, _receipt_record(path)))
+        except CurationError as error:
+            _dead_letter(profile_root, path, str(error))
+    receipt_ids = tuple(record["id"] for _, record in selected)
+    batch = CurationBatch(batch_id, batch_path, receipt_ids, batch_path / "prompt.md")
+    if not receipt_ids:
+        return batch
+    manifest = {
+        "batch_id": batch_id,
+        "receipt_ids": list(receipt_ids),
+        "receipts": [record for _, record in selected],
+        "created_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+    }
+    descriptor = {
+        "version": 1,
+        "batch_id": batch_id,
+        "state": "claiming",
+        "batch_path": f".harness/memory/processing/{batch_id}",
+        "manifest": manifest,
+    }
+    preparation_path = _preparation_path(profile_root, batch_id)
+    _publish_preparation(preparation_path, descriptor)
+    if crash_after_stage == "after_claim_manifest":
+        os._exit(91)
     try:
-        for path in sorted(inbox.glob("*.json")):
-            if limit is not None and len(receipt_ids) >= limit:
-                break
-            try:
-                receipt = _valid_receipt(path)
-            except CurationError as error:
-                _dead_letter(profile_root, path, str(error))
-                continue
-            destination = batch_path / path.name
-            try:
-                _durable_replace(path, destination)
-            except FileNotFoundError:
-                continue
-            receipt_ids.append(receipt["id"])
+        ensure_safe_directory(profile_root, batch_path)
+        atomic_write_text(
+            batch_path / "batch.json",
+            json.dumps(manifest, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
+        )
+        for index, (path, record) in enumerate(selected):
+            if _receipt_record(path) != record:
+                raise CurationError("inbox receipt changed while being claimed")
+            _durable_replace(path, batch_path / path.name)
+            if crash_after_stage in {"after_claim_move", f"after_claim_move_{index + 1}"}:
+                os._exit(91)
     except BaseException:
-        _return_receipts(profile_root, batch_path)
+        recover_preparations(profile_root)
         raise
-    return CurationBatch(batch_id, batch_path, tuple(receipt_ids), batch_path / "prompt.md")
+    return batch
 
 
 def _return_receipts(root: Path, batch_path: Path) -> None:
@@ -334,14 +370,14 @@ def _return_receipts(root: Path, batch_path: Path) -> None:
     _durable_rmtree(batch_path)
 
 
-def prepare_curation(root: Path, limit: int | None = None) -> CurationBatch:
+def prepare_curation(
+    root: Path, limit: int | None = None, *, crash_after_stage: str | None = None
+) -> CurationBatch:
     """Claim receipts and create the immutable batch manifest and bounded prompt."""
     profile_root = Path(root).resolve()
-    batch = claim_receipts(profile_root, limit)
+    batch = claim_receipts(profile_root, limit, crash_after_stage=crash_after_stage)
     try:
         if not batch.receipt_ids:
-            batch.path.rmdir()
-            fsync_directory(batch.path.parent)
             return batch
         receipts = [
             _valid_receipt(batch.path / f"{receipt_id}.json")
@@ -354,24 +390,172 @@ def prepare_curation(root: Path, limit: int | None = None) -> CurationBatch:
         prompt = f"{template.rstrip()}\n\n## Batch evidence\n\n```json\n{evidence}\n```\n"
         if len(prompt) > MAX_PROMPT_CHARS:
             raise CurationError("prepared prompt exceeds the bounded size limit")
-        manifest = {
-            "batch_id": batch.batch_id,
-            "receipt_ids": list(batch.receipt_ids),
-            "receipts": [
-                _receipt_record(batch.path / f"{receipt_id}.json")
-                for receipt_id in batch.receipt_ids
-            ],
-            "created_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-        }
-        atomic_write_text(
-            batch.path / "batch.json",
-            json.dumps(manifest, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
-        )
         atomic_write_text(batch.prompt_path, prompt)
+        preparation_path = _preparation_path(profile_root, batch.batch_id)
+        descriptor = _strict_json(preparation_path)
+        descriptor["state"] = "prepared"
+        _publish_preparation(preparation_path, descriptor)
+        if crash_after_stage == "after_prompt":
+            os._exit(91)
         return batch
     except BaseException:
-        _return_receipts(profile_root, batch.path)
+        recover_preparations(profile_root)
         raise
+
+
+def _validate_preparation(
+    root: Path, descriptor_path: Path, descriptor: object
+) -> tuple[str, Path, tuple[tuple[str, Path, Path], ...]]:
+    fields = {"version", "batch_id", "state", "batch_path", "manifest"}
+    if (
+        not isinstance(descriptor, dict)
+        or set(descriptor) != fields
+        or descriptor.get("version") != 1
+        or descriptor.get("state") not in {"claiming", "prepared"}
+    ):
+        raise CurationError("preparation descriptor has an invalid shape")
+    batch_id = descriptor.get("batch_id")
+    if (
+        not isinstance(batch_id, str)
+        or _BATCH_ID.fullmatch(batch_id) is None
+        or descriptor_path.name != f"{batch_id}.json"
+        or descriptor.get("batch_path") != f".harness/memory/processing/{batch_id}"
+    ):
+        raise CurationError("preparation descriptor identity is invalid")
+    try:
+        expected_descriptor = require_safe_path(
+            root, root / ".harness/state/preparations" / f"{batch_id}.json", directory=False
+        )
+        batch_path = require_safe_path(
+            root, root / ".harness/memory/processing" / batch_id, directory=True
+        )
+    except ValueError as error:
+        raise CurationError(str(error)) from error
+    if descriptor_path != expected_descriptor or descriptor_path.is_symlink():
+        raise CurationError("preparation descriptor path is unsafe")
+    manifest = descriptor.get("manifest")
+    if (
+        not isinstance(manifest, dict)
+        or set(manifest) != {"batch_id", "receipt_ids", "receipts", "created_at"}
+        or manifest.get("batch_id") != batch_id
+    ):
+        raise CurationError("preparation manifest has an invalid shape")
+    try:
+        _journal_timestamp(manifest.get("created_at"))
+    except CurationError as error:
+        raise CurationError("preparation manifest timestamp is invalid") from error
+    receipt_ids = manifest.get("receipt_ids")
+    records = manifest.get("receipts")
+    if (
+        not isinstance(receipt_ids, list)
+        or not receipt_ids
+        or len(receipt_ids) != len(set(receipt_ids))
+        or any(not isinstance(item, str) or _RECEIPT_ID.fullmatch(item) is None for item in receipt_ids)
+        or not isinstance(records, list)
+        or len(records) != len(receipt_ids)
+    ):
+        raise CurationError("preparation receipt manifest is invalid")
+    record_by_id: dict[str, dict[str, Any]] = {}
+    for receipt_id, record in zip(receipt_ids, records):
+        if (
+            not isinstance(record, dict)
+            or set(record) != {"id", "sha256", "size"}
+            or record.get("id") != receipt_id
+            or not _is_digest(record.get("sha256"))
+            or isinstance(record.get("size"), bool)
+            or not isinstance(record.get("size"), int)
+            or record["size"] < 1
+        ):
+            raise CurationError("preparation receipt manifest is invalid")
+        record_by_id[receipt_id] = record
+    if batch_path.exists():
+        allowed = {"batch.json", "prompt.md", "result.json"} | {
+            f"{receipt_id}.json" for receipt_id in receipt_ids
+        }
+        for member in batch_path.iterdir():
+            if member.name not in allowed or member.is_symlink() or not member.is_file():
+                raise CurationError("preparation batch contains an unexpected member")
+        batch_manifest = batch_path / "batch.json"
+        if batch_manifest.exists():
+            try:
+                if _strict_json(batch_manifest) != manifest:
+                    raise CurationError("preparation batch manifest does not match its descriptor")
+            except (OSError, ValueError, json.JSONDecodeError) as error:
+                raise CurationError("preparation batch manifest is invalid") from error
+    inbox = _safe_dir(root, ".harness/memory/inbox")
+    locations: list[tuple[str, Path, Path]] = []
+    for receipt_id in receipt_ids:
+        processing_receipt = batch_path / f"{receipt_id}.json"
+        inbox_receipt = inbox / f"{receipt_id}.json"
+        existing = [path for path in (processing_receipt, inbox_receipt) if path.exists()]
+        if not existing:
+            raise CurationError("preparation receipt is missing from inbox and processing")
+        for path in existing:
+            if path.is_symlink() or not path.is_file() or _receipt_record(path) != record_by_id[receipt_id]:
+                raise CurationError("preparation receipt provenance is invalid")
+        locations.append((receipt_id, processing_receipt, inbox_receipt))
+    return batch_id, batch_path, tuple(locations)
+
+
+def recover_preparations(
+    root: Path, *, preserve_batch_id: str | None = None
+) -> tuple[str, ...]:
+    """Fail closed, then return every non-applying prepared claim to the inbox."""
+    profile_root = Path(root).resolve()
+    load_profile_for_recovery(profile_root)
+    if preserve_batch_id is not None and (
+        not isinstance(preserve_batch_id, str) or _BATCH_ID.fullmatch(preserve_batch_id) is None
+    ):
+        raise CurationError("preserved preparation batch ID is invalid")
+    preparation_dir = profile_root / ".harness/state/preparations"
+    processing_dir = _safe_dir(profile_root, ".harness/memory/processing")
+    if preparation_dir.is_symlink():
+        raise CurationError("preparation descriptor directory is unsafe")
+    descriptor_paths: list[Path] = []
+    if preparation_dir.exists():
+        if not preparation_dir.is_dir():
+            raise CurationError("preparation descriptor directory is invalid")
+        for member in preparation_dir.iterdir():
+            if member.is_symlink() or not member.is_file() or member.suffix != ".json":
+                raise CurationError("preparation descriptor member is unsafe")
+            descriptor_paths.append(member)
+    plans: list[tuple[Path, str, Path, tuple[tuple[str, Path, Path], ...]]] = []
+    described: set[str] = set()
+    described_receipts: set[str] = set()
+    for descriptor_path in sorted(descriptor_paths):
+        try:
+            descriptor = _strict_json(descriptor_path)
+        except (OSError, ValueError, json.JSONDecodeError) as error:
+            raise CurationError("preparation descriptor is invalid") from error
+        batch_id, batch_path, locations = _validate_preparation(
+            profile_root, descriptor_path, descriptor
+        )
+        receipt_ids = {receipt_id for receipt_id, _, _ in locations}
+        if described_receipts & receipt_ids:
+            raise CurationError("preparation descriptors claim overlapping receipts")
+        described_receipts.update(receipt_ids)
+        described.add(batch_id)
+        plans.append((descriptor_path, batch_id, batch_path, locations))
+    for member in processing_dir.iterdir():
+        if member.is_symlink() or not member.is_dir() or _BATCH_ID.fullmatch(member.name) is None:
+            raise CurationError("processing contains an unsafe orphan batch")
+        if member.name not in described and member.name != preserve_batch_id:
+            raise CurationError("processing batch has no preparation or applying descriptor")
+    recovered: list[str] = []
+    for descriptor_path, batch_id, batch_path, locations in plans:
+        if batch_id == preserve_batch_id:
+            continue
+        for _, processing_receipt, inbox_receipt in locations:
+            if processing_receipt.exists():
+                if inbox_receipt.exists():
+                    _durable_unlink(processing_receipt)
+                else:
+                    _durable_replace(processing_receipt, inbox_receipt)
+        if batch_path.exists():
+            _durable_rmtree(batch_path)
+        _durable_unlink(descriptor_path)
+        recovered.append(batch_id)
+    return tuple(recovered)
 
 
 def _nonempty_text(action: dict[str, Any], field: str) -> str:
@@ -1002,6 +1186,7 @@ def _restore_transaction(root: Path, transaction_path: Path, transaction: dict[s
     else:
         _durable_unlink(journal)
     _return_receipts(root, batch_path)
+    _durable_unlink(root / ".harness/state/preparations" / f"{transaction['batch_id']}.json")
     _durable_unlink(transaction_path)
 
 
@@ -1015,6 +1200,7 @@ def _complete_transaction(root: Path, transaction_path: Path, transaction: dict[
     batch_path = _transaction_member(root, transaction["batch_path"], directory=True)
     if batch_path.exists():
         _durable_rmtree(batch_path)
+    _durable_unlink(root / ".harness/state/preparations" / f"{transaction['batch_id']}.json")
     _durable_unlink(transaction_path)
 
 
@@ -1034,7 +1220,14 @@ def recover_transactions(root: Path, *, checkpoint: bool = True) -> tuple[str, .
     validated: list[tuple[Path, dict[str, Any]]] = []
     for transaction_path in transaction_paths:
         transaction = _strict_json(transaction_path)
-        validated.append((transaction_path, _validate_transaction(profile_root, transaction_path, transaction)))
+        transaction = _validate_transaction(profile_root, transaction_path, transaction)
+        preparation_path = (
+            profile_root / ".harness/state/preparations" / f"{transaction['batch_id']}.json"
+        )
+        if preparation_path.exists():
+            preparation = _strict_json(preparation_path)
+            _validate_preparation(profile_root, preparation_path, preparation)
+        validated.append((transaction_path, transaction))
     recovered: list[str] = []
     recovered_committed_state = False
     for transaction_path, transaction in validated:
@@ -1171,6 +1364,10 @@ def apply_actions(
             },
         }
         _publish_transaction(transaction_path, transaction)
+        crash("after_transaction_publish")
+        _durable_unlink(
+            profile.root / ".harness/state/preparations" / f"{batch_id}.json"
+        )
         projects_root = (profile.root / "projects").resolve()
         for repository in repositories.values():
             try:
@@ -1289,6 +1486,9 @@ def apply_actions(
                 _restore_transaction(profile.root, transaction_path, transaction)
         else:
             _return_receipts(profile.root, batch_path)
+            _durable_unlink(
+                profile.root / ".harness/state/preparations" / f"{batch_id}.json"
+            )
         raise
 
 

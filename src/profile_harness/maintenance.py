@@ -8,7 +8,14 @@ from pathlib import Path
 from typing import Any
 
 from .config import DEFAULT_STALE_TIMEOUT_SECONDS, HarnessConfig, load_profile_config
-from .curation import _valid_receipt, apply_actions, load_result, prepare_curation, recover_transactions
+from .curation import (
+    _valid_receipt,
+    apply_actions,
+    load_result,
+    prepare_curation,
+    recover_preparations,
+    recover_transactions,
+)
 from .locking import ProfileLease
 from .runner import run_codex
 from .improvement import _run_locked as _run_improvement_locked, recover_improvement_transaction
@@ -130,12 +137,17 @@ def run_maintenance(root: Path, *, now: datetime | None = None) -> dict[str, Any
         except (OSError, ValueError, ProfileGitError) as error:
             raise ProfileGitError(f"profile Git preflight failed: {error}") from error
         curation_recovered = recover_transactions(profile_root, checkpoint=False)
+        preparation_recovered = recover_preparations(profile_root)
         improvement_recovered = recover_improvement_transaction(
             profile_root, checkpoint=False
         )
         subject = (
             pending_subject
-            or (RECOVERY_SUBJECT if curation_recovered or improvement_recovered else None)
+            or (
+                RECOVERY_SUBJECT
+                if curation_recovered or preparation_recovered or improvement_recovered
+                else None
+            )
             or CHECKPOINT_SUBJECT
         )
         _checkpoint_preflight(profile_root, subject)

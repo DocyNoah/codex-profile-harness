@@ -31,6 +31,7 @@ from .curation import (
     _valid_receipt,
     _strict_json,
     _BATCH_ID,
+    recover_preparations,
     recover_transactions,
     successful_curation_entries,
 )
@@ -879,6 +880,28 @@ def diagnose(
             findings.append(Finding("ERROR", "transaction", f"recovery failed: {error}"))
         else:
             findings.append(Finding("OK", "transaction", f"recovered {len(recovered)} interrupted transaction(s) while holding the profile lease"))
+
+    preparation_dir = profile_root / ".harness/state/preparations"
+    processing_dir = profile_root / ".harness/memory/processing"
+    transaction_still_pending = (
+        transaction_dir.is_dir() and any(transaction_dir.glob("*.json"))
+    )
+    has_preparation_state = (
+        preparation_dir.exists()
+        and (not preparation_dir.is_dir() or any(preparation_dir.iterdir()))
+    ) or (processing_dir.is_dir() and any(processing_dir.iterdir()))
+    if preparation_dir.is_symlink():
+        findings.append(Finding("ERROR", "preparation", "preparation descriptor directory is a symlink"))
+    elif has_preparation_state and not transaction_still_pending:
+        try:
+            with ProfileLease(profile_root, stale_timeout=effective_stale_timeout):
+                recovered = recover_preparations(profile_root)
+        except LeaseBusyError:
+            findings.append(Finding("ERROR", "preparation", "orphan preparation is actively locked; recovery was not attempted"))
+        except (OSError, ValueError) as error:
+            findings.append(Finding("ERROR", "preparation", f"malformed orphan preparation: {error}"))
+        else:
+            findings.append(Finding("OK", "preparation", f"recovered {len(recovered)} orphan prepared/claim batch(es)"))
 
     improvement_transaction = profile_root / ".harness/state/improvement-transaction.json"
     if improvement_transaction.is_symlink():
