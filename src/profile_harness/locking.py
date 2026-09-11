@@ -10,6 +10,7 @@ from pathlib import Path
 import shutil
 import socket
 import time
+import threading
 import uuid
 from typing import Any, BinaryIO
 
@@ -18,6 +19,15 @@ from .fs import atomic_write_text, ensure_safe_directory, require_safe_path
 
 class LeaseBusyError(RuntimeError):
     """A live curation lease is already owned."""
+
+
+_LOCAL_LEASES = threading.local()
+
+
+def profile_lease_held(profile_root: Path) -> bool:
+    """Return whether this thread already owns the profile transaction lease."""
+    held = getattr(_LOCAL_LEASES, "roots", {})
+    return str(Path(profile_root).resolve()) in held
 
 
 def _utc_now() -> datetime:
@@ -92,6 +102,8 @@ class ProfileLease:
     def acquire(self) -> "ProfileLease":
         if self._acquired:
             raise RuntimeError("curation lease is already acquired by this owner")
+        held = getattr(_LOCAL_LEASES, "roots", {})
+        key = str(self.root)
         ensure_safe_directory(self.root, self.path.parent)
         guard_path = self.path.parent / "curation.guard"
         require_safe_path(self.root, guard_path, directory=False)
@@ -111,9 +123,9 @@ class ProfileLease:
                 self.path.mkdir()
             except FileExistsError:
                 metadata = self._existing_metadata()
-                if not self._is_stale(metadata):
-                    owner = json.dumps(metadata.get("owner", {}), sort_keys=True)
-                    raise LeaseBusyError(f"curation lease is live: {owner}")
+                # Holding the OS guard proves that no cooperating live process
+                # owns this directory. A fresh marker can therefore only be a
+                # crash remnant; timestamps are diagnostic, not authority.
                 quarantine = self.path.parent / "quarantine"
                 ensure_safe_directory(self.root, quarantine)
                 destination = quarantine / f"curation.lock.{uuid.uuid4().hex}"
@@ -129,6 +141,8 @@ class ProfileLease:
                 raise
             self._acquired = True
             self._guard = guard
+            held[key] = self.token
+            _LOCAL_LEASES.roots = held
             return self
         except BaseException:
             fcntl.flock(guard.fileno(), fcntl.LOCK_UN)
@@ -139,6 +153,8 @@ class ProfileLease:
         if not self._acquired:
             return
         guard = self._guard
+        held = getattr(_LOCAL_LEASES, "roots", {})
+        key = str(self.root)
         try:
             metadata = self._existing_metadata()
             if metadata.get("token") == self.token:
@@ -150,6 +166,8 @@ class ProfileLease:
         finally:
             self._acquired = False
             self._guard = None
+            held.pop(key, None)
+            _LOCAL_LEASES.roots = held
             if guard is not None:
                 fcntl.flock(guard.fileno(), fcntl.LOCK_UN)
                 guard.close()

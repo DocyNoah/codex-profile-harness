@@ -28,6 +28,7 @@ from profile_harness.profile_git import (  # noqa: E402
     RECOVERY_SUBJECT,
     CheckpointResult,
     ProfileGitError,
+    PushResult,
     checkpoint_profile,
 )
 import profile_harness.profile_git as profile_git_module  # noqa: E402
@@ -56,17 +57,28 @@ class MaintenanceTests(unittest.TestCase):
                 ["git", "-C", str(root), "symbolic-ref", "--short", "HEAD"],
                 text=True, capture_output=True, check=True,
             ).stdout.strip()
-            subprocess.run(["git", "-C", str(root), "remote", "add", "origin", "ext::false"], check=True)
+            subprocess.run(["git", "-C", str(root), "remote", "add", "origin", "https://example.invalid/profile.git"], check=True)
             subprocess.run(["git", "-C", str(root), "config", f"branch.{branch}.remote", "origin"], check=True)
             subprocess.run(["git", "-C", str(root), "config", f"branch.{branch}.merge", f"refs/heads/{branch}"], check=True)
             config = root / ".harness/config.toml"
             config.write_text(
                 config.read_text(encoding="utf-8")
-                + f'\n[git]\nauto_push = true\nupstream = "origin/{branch}"\nprivate_data_acknowledged = true\nallow_local_file_remote = true\n',
+                + f'\n[git]\nauto_push = true\nupstream = "origin/{branch}"\nprivate_data_acknowledged = true\n',
                 encoding="utf-8",
             )
             (root / "MEMORY.md").write_text("durable locally\n", encoding="utf-8")
 
+            push_calls = []
+
+            def controlled_push(profile_root, commit_sha, **kwargs):
+                push_calls.append(commit_sha)
+                if len(push_calls) < 3:
+                    return PushResult(False, commit_sha, error="simulated rejection")
+                return PushResult(True, commit_sha, f"origin/{branch}")
+
+            push_patcher = mock.patch.object(profile_git_module, "push_profile", side_effect=controlled_push)
+            push_patcher.start()
+            self.addCleanup(push_patcher.stop)
             failed = run_maintenance(root, now=NOW)
             committed = subprocess.run(
                 ["git", "-C", str(root), "rev-parse", "HEAD"], text=True,
@@ -90,7 +102,6 @@ class MaintenanceTests(unittest.TestCase):
                 ).stdout.strip(),
             )
             self.assertEqual(1, ControlOutbox(root).status()["total"])
-            subprocess.run(["git", "-C", str(root), "remote", "set-url", "origin", remote.resolve().as_uri()], check=True)
             (root / "MEMORY.md").write_text("later successful checkpoint\n", encoding="utf-8")
 
             retried = run_maintenance(root, now=NOW + timedelta(minutes=15))
@@ -100,13 +111,7 @@ class MaintenanceTests(unittest.TestCase):
             ).stdout.strip()
 
             self.assertTrue(retried["push"]["pushed"])
-            self.assertEqual(
-                retried_commit,
-                subprocess.run(
-                    ["git", "-C", str(remote), "rev-parse", f"refs/heads/{branch}"],
-                    text=True, capture_output=True, check=True,
-                ).stdout.strip(),
-            )
+            self.assertEqual(retried_commit, push_calls[-1])
             self.assertEqual(0, ControlOutbox(root).status()["pending"])
 
     def test_failed_checkpoint_never_pushes_uncommitted_managed_bytes(self) -> None:
@@ -120,20 +125,21 @@ class MaintenanceTests(unittest.TestCase):
                 ["git", "-C", str(root), "symbolic-ref", "--short", "HEAD"],
                 text=True, capture_output=True, check=True,
             ).stdout.strip()
-            subprocess.run(["git", "-C", str(root), "remote", "add", "origin", remote.resolve().as_uri()], check=True)
+            subprocess.run(["git", "-C", str(root), "remote", "add", "origin", "https://example.invalid/profile.git"], check=True)
             subprocess.run(["git", "-C", str(root), "config", f"branch.{branch}.remote", "origin"], check=True)
             subprocess.run(["git", "-C", str(root), "config", f"branch.{branch}.merge", f"refs/heads/{branch}"], check=True)
             config = root / ".harness/config.toml"
             config.write_text(
                 config.read_text(encoding="utf-8")
-                + f'\n[git]\nauto_push = true\nupstream = "origin/{branch}"\nprivate_data_acknowledged = true\nallow_local_file_remote = true\n',
+                + f'\n[git]\nauto_push = true\nupstream = "origin/{branch}"\nprivate_data_acknowledged = true\n',
                 encoding="utf-8",
             )
             (root / "MEMORY.md").write_text("must not push\n", encoding="utf-8")
 
-            with self.fail_commit_subject(CHECKPOINT_SUBJECT):
-                with self.assertRaises(ProfileGitError):
-                    run_maintenance(root, now=NOW)
+            with mock.patch.object(profile_git_module, "_NetworkGitSession", side_effect=AssertionError("network called")):
+                with self.fail_commit_subject(CHECKPOINT_SUBJECT):
+                    with self.assertRaises(ProfileGitError):
+                        run_maintenance(root, now=NOW)
 
             self.assertNotEqual(
                 0,
@@ -249,7 +255,6 @@ class MaintenanceTests(unittest.TestCase):
             self.assertFalse(config.git.auto_push)
             self.assertIsNone(config.git.upstream)
             self.assertFalse(config.git.private_data_acknowledged)
-            self.assertFalse(config.git.allow_local_file_remote)
             self.assertTrue(config.improvement.enabled)
             self.assertEqual("gpt-6-astra", config.improvement.model)
             self.assertEqual("high", config.improvement.reasoning_effort)

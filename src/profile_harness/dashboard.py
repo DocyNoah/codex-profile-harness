@@ -74,7 +74,7 @@ def generate_dashboard(root: Path) -> Path:
             f"- Managed paths: {dirty}",
             f"- Remote: {'configured' if git.has_remote else 'not configured'}",
             f"- Automatic push: {'enabled for ' + str(harness_config.git.upstream) if harness_config.git.auto_push else 'disabled'}",
-            f"- Push retry: {'pending' if (profile.root / '.harness/state/profile-git-push.json').is_file() else 'none'}",
+            f"- Push retry: {'pending' if (profile.root / '.harness/state/profile-git-push-intent.json').is_file() else 'none'}",
         ))
     else:
         lines.extend(("", "## Git checkpoint", "", f"Unavailable: {git.error or 'not initialized'}"))

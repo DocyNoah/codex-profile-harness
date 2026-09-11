@@ -936,6 +936,23 @@ def diagnose(
         except (OSError, ValueError) as error:
             detail = f"unreadable diagnostic: {error}"
         findings.append(Finding("WARN", "git push", f"pending automatic push retry: {detail or 'unknown push failure'}"))
+    push_intent = profile_root / ".harness/state/profile-git-push-intent.json"
+    if push_intent.is_symlink():
+        findings.append(Finding("ERROR", "git push", "push intent path is unsafe"))
+    elif push_intent.is_file():
+        try:
+            intent = _json_file(push_intent)
+            if (
+                not isinstance(intent, dict)
+                or intent.get("version") != 1
+                or intent.get("state") not in {"prepared", "ready"}
+            ):
+                raise ValueError("invalid push intent")
+            detail = intent.get("commit_sha") or "prepared checkpoint"
+        except (OSError, ValueError) as error:
+            findings.append(Finding("ERROR", "git push", f"unreadable push intent: {error}"))
+        else:
+            findings.append(Finding("WARN", "git push", f"durable automatic push intent pending: {detail}"))
 
     transaction_dir = profile_root / ".harness/state/transactions"
     if transaction_dir.is_symlink():
