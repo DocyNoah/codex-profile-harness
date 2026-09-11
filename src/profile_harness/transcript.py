@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from contextlib import contextmanager
+import fcntl
 import hashlib
 import json
 import os
 from pathlib import Path
 import stat
-from typing import Callable
+from typing import Callable, Iterator
 
 from .fs import atomic_write_text, ensure_safe_directory, require_safe_path
 
@@ -40,6 +42,25 @@ def _reject_json_constant(value: str) -> None:
 def _cursor_path(profile_root: Path, session_id: str) -> Path:
     safe_name = hashlib.sha256(session_id.encode("utf-8")).hexdigest()
     return profile_root / ".harness/state/transcript-cursors" / f"{safe_name}.json"
+
+
+@contextmanager
+def serialize_session_cursor(profile_root: Path, session_id: str) -> Iterator[None]:
+    """Serialize preparation through publication for one session cursor."""
+    cursor_path = _cursor_path(profile_root, session_id)
+    ensure_safe_directory(profile_root, cursor_path.parent)
+    lock_path = cursor_path.with_suffix(".lock")
+    require_safe_path(profile_root, lock_path, directory=False)
+    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(lock_path, flags, 0o600)
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise TranscriptUnavailable("unsafe cursor lock")
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(descriptor)
 
 
 def _load_cursor(profile_root: Path, path: Path) -> dict[str, object] | None:

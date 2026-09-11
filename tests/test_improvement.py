@@ -39,10 +39,19 @@ class ImprovementTests(unittest.TestCase):
         init_profile(root, "Work")
         return root
 
-    def add_curations(self, root: Path, count: int, *, start: datetime) -> list[dict]:
+    def add_curations(
+        self,
+        root: Path,
+        count: int,
+        *,
+        start: datetime,
+        signal_ids: list[str] | None = None,
+        offset: int = 0,
+    ) -> list[dict]:
         journal = root / ".harness/memory/journal/curation.jsonl"
         entries = []
-        for index in range(count):
+        for local_index in range(count):
+            index = offset + local_index
             receipt_id = f"curation-receipt-{index}"
             receipt_digest = f"{index + 1:064x}"[-64:]
             entries.append(append_entry(journal, {
@@ -59,6 +68,11 @@ class ImprovementTests(unittest.TestCase):
                 "result_digest": "a" * 64,
                 "target_digests": {},
                 "actions": 0,
+                "signals": [] if signal_ids is None else [{
+                    "signal_id": signal_ids[local_index],
+                    "summary": "A recurring curation concern.",
+                    "source_receipt_ids": [receipt_id],
+                }],
                 "changed_paths": [],
                 "applied_at": (start + timedelta(minutes=index)).isoformat().replace("+00:00", "Z"),
             }))
@@ -122,16 +136,43 @@ class ImprovementTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = self.make_profile(Path(temporary_directory))
-            self.add_curations(root, 3, start=NOW - timedelta(hours=72))
-            due = improvement_due(root, now=NOW)
-            self.assertTrue(due.due)
-            self.assertEqual("low_interval", due.reason)
-
-        with tempfile.TemporaryDirectory() as temporary_directory:
-            root = self.make_profile(Path(temporary_directory))
             self.add_curations(root, 2, start=NOW - timedelta(days=10))
             self.assertFalse(improvement_due(root, now=NOW).due)
             self.assertEqual("curation_count", improvement_due(root, now=NOW).reason)
+
+    def test_repeated_signal_requires_three_distinct_curations_after_cooldown(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = self.make_profile(Path(temporary_directory))
+            previous = self.add_curations(root, 1, start=NOW - timedelta(days=2))
+            self.add_improvement_success(
+                root, previous[-1]["entry_hash"], NOW - timedelta(hours=24)
+            )
+            self.add_curations(
+                root,
+                3,
+                start=NOW - timedelta(hours=1),
+                signal_ids=["workflow.review-gap"] * 3,
+                offset=1,
+            )
+
+            due = improvement_due(root, now=NOW)
+
+            self.assertTrue(due.due)
+            self.assertEqual("repeated_signal", due.reason)
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = self.make_profile(Path(temporary_directory))
+            self.add_curations(
+                root,
+                3,
+                start=NOW - timedelta(days=10),
+                signal_ids=["workflow.one", "workflow.two", "workflow.three"],
+            )
+
+            due = improvement_due(root, now=NOW)
+
+            self.assertFalse(due.due)
+            self.assertEqual("curation_count", due.reason)
 
     def test_force_invokes_exact_improvement_model_and_creates_only_proposals(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

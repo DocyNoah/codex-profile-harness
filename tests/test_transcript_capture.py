@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import multiprocessing
 import os
 from pathlib import Path
 import shutil
@@ -21,6 +22,34 @@ from profile_harness.curation import CurationError, _valid_receipt  # noqa: E402
 from profile_harness import doctor as doctor_module  # noqa: E402
 from profile_harness import fs as fs_module  # noqa: E402
 from profile_harness.packaging import build_local_marketplace  # noqa: E402
+
+
+def capture_worker(
+    payload: dict,
+    codex_home: str,
+    prepared,
+    release,
+    done,
+    pause_after_prepare: bool,
+) -> None:
+    real_prepare = capture_module.prepare_transcript_delta
+
+    def blocked_prepare(*args, **kwargs):
+        delta = real_prepare(*args, **kwargs)
+        prepared.set()
+        if not release.wait(10):
+            raise RuntimeError("timed out waiting to release capture")
+        return delta
+
+    with mock.patch.dict(os.environ, {"CODEX_HOME": codex_home}):
+        if pause_after_prepare:
+            with mock.patch.object(
+                capture_module, "prepare_transcript_delta", side_effect=blocked_prepare
+            ):
+                capture_event(payload)
+        else:
+            capture_event(payload)
+    done.set()
 
 
 def response_message(role: str, text: str) -> dict:
@@ -373,6 +402,50 @@ class TranscriptCaptureTests(unittest.TestCase):
         self.assertEqual("duplicate", duplicate.status)
         self.assertEqual(receipt_before, duplicate.receipt_path.read_bytes())
         self.assertEqual(cursor_before, self.cursors()[0].read_bytes())
+
+    def test_overlapping_stop_and_session_end_serialize_one_session_cursor(self) -> None:
+        transcript = self.codex_home / "overlap.jsonl"
+        transcript.write_bytes(jsonl(response_message("assistant", "first")))
+        common = {
+            "session_id": "overlap-session",
+            "cwd": str(self.root),
+            "transcript_path": str(transcript),
+            "last_assistant_message": "fallback",
+        }
+        first_payload = {**common, "hook_event_name": "Stop", "turn_id": "turn-1"}
+        second_payload = {
+            **common,
+            "hook_event_name": "SessionEnd",
+            "reason": "completed",
+        }
+        context = multiprocessing.get_context("fork")
+        prepared = context.Event()
+        release = context.Event()
+        first_done = context.Event()
+        second_done = context.Event()
+        first = context.Process(
+            target=capture_worker,
+            args=(first_payload, str(self.codex_home), prepared, release, first_done, True),
+        )
+        second = context.Process(
+            target=capture_worker,
+            args=(second_payload, str(self.codex_home), prepared, release, second_done, False),
+        )
+        first.start()
+        self.assertTrue(prepared.wait(5), "first capture did not prepare its delta")
+        with transcript.open("ab") as handle:
+            handle.write(jsonl(response_message("assistant", "second")))
+        second.start()
+        bypassed_first = second_done.wait(0.5)
+        release.set()
+        first.join(10)
+        second.join(10)
+
+        self.assertFalse(bypassed_first, "second capture bypassed the session cursor lock")
+        self.assertEqual(0, first.exitcode)
+        self.assertEqual(0, second.exitcode)
+        cursor = json.loads(self.cursors()[0].read_text(encoding="utf-8"))
+        self.assertEqual(transcript.stat().st_size, cursor["offset"])
 
     def test_keeps_only_user_and_assistant_message_text(self) -> None:
         transcript = self.codex_home / "session.jsonl"

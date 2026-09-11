@@ -25,6 +25,8 @@ from .curation import (
     MAX_ACTIONS,
     MAX_ARRAY_ITEMS,
     MAX_CONTENT_CHARS,
+    MAX_SIGNALS,
+    MAX_SIGNAL_SUMMARY_CHARS,
     MAX_IDENTIFIER_CHARS,
     MAX_RECEIPT_BYTES,
     CurationError,
@@ -421,7 +423,7 @@ def _reference_contract(value: object, reference: str, label: str) -> None:
 
 def _validate_curation_schema(value: object) -> None:
     top_properties = _object_contract(
-        value, {"actions"}, "curation actions result"
+        value, {"actions", "signals"}, "curation actions result"
     )
     actions = top_properties["actions"]
     if not isinstance(actions, dict) or actions.get("type") != "array":
@@ -443,7 +445,7 @@ def _validate_curation_schema(value: object) -> None:
     definitions = value.get("$defs") if isinstance(value, dict) else None
     if not isinstance(definitions, dict):
         raise ValueError("curation schema must contain definitions")
-    required_definitions = {"sources", "content", *CURATION_ACTION_CONTRACTS}
+    required_definitions = {"sources", "content", "signal", *CURATION_ACTION_CONTRACTS}
     if not required_definitions <= definitions.keys():
         raise ValueError("curation schema is missing runtime definitions")
 
@@ -467,6 +469,26 @@ def _validate_curation_schema(value: object) -> None:
         maximum=MAX_CONTENT_CHARS,
         pattern="^[\\s\\S]*\\S[\\s\\S]*$",
         label="content",
+    )
+    signal_items = _array_contract(
+        top_properties["signals"], maximum=MAX_SIGNALS, unique=True, label="signals"
+    )
+    _reference_contract(signal_items, "#/$defs/signal", "signals.items")
+    signal = _object_contract(
+        definitions["signal"],
+        {"signal_id", "summary", "source_receipt_ids"},
+        "signal",
+    )
+    _string_contract(
+        signal["signal_id"], minimum=3, maximum=64,
+        pattern="^[a-z0-9][a-z0-9._-]{2,63}$", label="signal.signal_id",
+    )
+    _string_contract(
+        signal["summary"], minimum=1, maximum=MAX_SIGNAL_SUMMARY_CHARS,
+        pattern="^[\\s\\S]*\\S[\\s\\S]*$", label="signal.summary",
+    )
+    _reference_contract(
+        signal["source_receipt_ids"], "#/$defs/sources", "signal.source_receipt_ids"
     )
 
     for name, (action_type, fields) in CURATION_ACTION_CONTRACTS.items():

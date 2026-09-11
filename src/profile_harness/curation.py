@@ -35,6 +35,8 @@ from .receipt import (
 MAX_ACTIONS = 100
 MAX_ARRAY_ITEMS = 100
 MAX_CONTENT_CHARS = 64_000
+MAX_SIGNALS = 20
+MAX_SIGNAL_SUMMARY_CHARS = 240
 MAX_PROMPT_CHARS = 500_000
 MAX_RESULT_BYTES = 1024 * 1024
 ACTION_TYPES = frozenset(
@@ -50,6 +52,7 @@ ACTION_TYPES = frozenset(
 _ADR = re.compile(r"ADR-(\d{4,})-[a-z0-9-]+\.md")
 _INDEX_LINK = re.compile(r"\[[^]]+\]\(docs/decisions/(ADR-(\d{4,})-[a-z0-9-]+\.md)\)")
 _BATCH_ID = re.compile(r"[0-9]{8}T[0-9]{12}Z-[a-f0-9]{12}")
+_SIGNAL_ID = re.compile(r"[a-z0-9][a-z0-9._-]{2,63}")
 
 
 class CurationError(ValueError):
@@ -106,7 +109,11 @@ def validate_curation_journal_entry(entry: object) -> dict[str, Any]:
     required = CURATION_JOURNAL_REQUIRED_FIELDS if has_type else LEGACY_CURATION_JOURNAL_REQUIRED_FIELDS
     if not required <= set(entry):
         raise CurationError("curation journal event is missing required fields")
-    if not has_type and set(entry) != LEGACY_CURATION_JOURNAL_REQUIRED_FIELDS:
+    legacy_shapes = {
+        LEGACY_CURATION_JOURNAL_REQUIRED_FIELDS,
+        LEGACY_CURATION_JOURNAL_REQUIRED_FIELDS | {"signals"},
+    }
+    if not has_type and set(entry) not in legacy_shapes:
         raise CurationError("curation journal legacy event shape is invalid")
     if has_type and (entry.get("type") != "curation" or entry.get("status") != "success"):
         raise CurationError("curation journal event must be a successful curation")
@@ -168,10 +175,12 @@ def validate_curation_journal_entry(entry: object) -> dict[str, Any]:
     actions = entry.get("actions")
     if isinstance(actions, bool) or not isinstance(actions, int) or not 0 <= actions <= MAX_ACTIONS:
         raise CurationError("curation journal action count is invalid")
+    signals = entry.get("signals", [])
+    _validate_signals(signals, set(receipt_ids))
     _journal_timestamp(entry.get("applied_at"))
     if has_type:
-        return entry
-    return {**entry, "type": "curation", "status": "success"}
+        return {**entry, "signals": signals}
+    return {**entry, "type": "curation", "status": "success", "signals": signals}
 
 
 def successful_curation_entries(path: Path) -> list[dict[str, Any]]:
@@ -591,14 +600,58 @@ def _nonempty_text(action: dict[str, Any], field: str) -> str:
     return value
 
 
+def _validate_signals(
+    signals: object, batch_receipt_ids: set[str]
+) -> tuple[dict[str, Any], ...]:
+    if not isinstance(signals, list) or len(signals) > MAX_SIGNALS:
+        raise CurationError("signals must be a bounded array")
+    validated: list[dict[str, Any]] = []
+    signal_ids: set[str] = set()
+    for signal in signals:
+        if not isinstance(signal, dict) or set(signal) != {
+            "signal_id", "summary", "source_receipt_ids"
+        }:
+            raise CurationError("signal contains missing or forbidden fields")
+        signal_id = signal.get("signal_id")
+        if not isinstance(signal_id, str) or _SIGNAL_ID.fullmatch(signal_id) is None:
+            raise CurationError("signal ID is invalid")
+        if signal_id in signal_ids:
+            raise CurationError("signal IDs must be unique per curation")
+        signal_ids.add(signal_id)
+        summary = signal.get("summary")
+        if (
+            not isinstance(summary, str)
+            or not summary.strip()
+            or len(summary) > MAX_SIGNAL_SUMMARY_CHARS
+        ):
+            raise CurationError("signal summary must be a bounded non-empty string")
+        sources = signal.get("source_receipt_ids")
+        if (
+            not isinstance(sources, list)
+            or not sources
+            or len(sources) > MAX_ARRAY_ITEMS
+            or any(
+                not isinstance(item, str)
+                or _RECEIPT_ID.fullmatch(item) is None
+                for item in sources
+            )
+            or len(sources) != len(set(sources))
+            or not set(sources) <= batch_receipt_ids
+        ):
+            raise CurationError("signal source receipt IDs must belong to the batch")
+        validated.append(signal)
+    return tuple(validated)
+
+
 def validate_actions(
     result: dict[str, Any],
     batch_receipt_ids: set[str],
     registered_repositories: set[str],
 ) -> tuple[dict[str, Any], ...]:
     """Validate exact action shapes, evidence provenance, and repository names."""
-    if not isinstance(result, dict) or set(result) != {"actions"}:
-        raise CurationError("result must contain only actions")
+    if not isinstance(result, dict) or not set(result) <= {"actions", "signals"} or "actions" not in result:
+        raise CurationError("result must contain only actions and signals")
+    _validate_signals(result.get("signals", []), batch_receipt_ids)
     actions = result["actions"]
     if not isinstance(actions, list) or len(actions) > MAX_ACTIONS:
         raise CurationError("actions must be a bounded array")
@@ -1415,6 +1468,7 @@ def apply_actions(
             except ValueError as error:
                 raise CurationError(str(error)) from error
         actions = validate_actions(result, set(receipt_ids), set(repositories))
+        signals = _validate_signals(result.get("signals", []), set(receipt_ids))
         for action in actions:
             action_type = action["type"]
             if action_type == "discard":
@@ -1484,6 +1538,7 @@ def apply_actions(
                 "target_digests": target_digests,
                 "archived_receipts": archived_evidence,
                 "actions": len(actions),
+                "signals": list(signals),
                 "changed_paths": [str(path.relative_to(profile.root)) for path in changed],
                 "applied_at": applied_at.isoformat().replace("+00:00", "Z"),
             },

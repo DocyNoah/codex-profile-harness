@@ -464,6 +464,21 @@ class DoctorTests(unittest.TestCase):
                     ),
                     101,
                 ),
+                "signal array limit": set_value(
+                    ("properties", "signals", "maxItems"), 21
+                ),
+                "signal identifier pattern": set_value(
+                    ("$defs", "signal", "properties", "signal_id", "pattern"),
+                    ".*",
+                ),
+                "signal summary limit": set_value(
+                    ("$defs", "signal", "properties", "summary", "maxLength"),
+                    241,
+                ),
+                "signal source reference": set_value(
+                    ("$defs", "signal", "properties", "source_receipt_ids", "$ref"),
+                    "#/$defs/content",
+                ),
             }
             for name, mutate in mutations.items():
                 with self.subTest(contract=name):

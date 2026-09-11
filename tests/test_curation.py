@@ -209,6 +209,70 @@ class CurationTests(unittest.TestCase):
         self.assertEqual(100, discard_sources["maxItems"])
         self.assertEqual(128, discard_sources["items"]["maxLength"])
 
+    def test_signals_require_bounded_unique_ids_summaries_and_batch_sources(self) -> None:
+        valid = {
+            "signal_id": "workflow.review-gap",
+            "summary": "The same review omission recurred.",
+            "source_receipt_ids": ["one", "two"],
+        }
+        accepted = validate_actions(
+            {"actions": [], "signals": [valid]}, {"one", "two"}, set()
+        )
+        self.assertEqual((), accepted)
+
+        invalid_signals = (
+            {**valid, "signal_id": "AB"},
+            {**valid, "signal_id": "Upper.Case"},
+            {**valid, "signal_id": "a" * 65},
+            {**valid, "summary": ""},
+            {**valid, "summary": "x" * 241},
+            {**valid, "source_receipt_ids": ["one", "one"]},
+            {**valid, "source_receipt_ids": ["outside"]},
+        )
+        for signal in invalid_signals:
+            with self.subTest(signal=signal):
+                with self.assertRaises(CurationError):
+                    validate_actions(
+                        {"actions": [], "signals": [signal]},
+                        {"one", "two"},
+                        set(),
+                    )
+
+        with self.assertRaises(CurationError):
+            validate_actions(
+                {"actions": [], "signals": [valid, valid]},
+                {"one", "two"},
+                set(),
+            )
+        with self.assertRaises(CurationError):
+            validate_actions(
+                {"actions": [], "signals": [
+                    {**valid, "signal_id": f"signal-{index:02d}"}
+                    for index in range(21)
+                ]},
+                {"one", "two"},
+                set(),
+            )
+
+    def test_successful_curation_journal_binds_validated_signals(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root, _, _ = self.make_profile(Path(temporary_directory))
+            self.add_receipt(root, "one")
+            batch = prepare_curation(root)
+            signal = {
+                "signal_id": "workflow.review-gap",
+                "summary": "The same review omission recurred.",
+                "source_receipt_ids": ["one"],
+            }
+
+            applied = apply_actions(
+                root,
+                batch.batch_id,
+                {"actions": [], "signals": [signal]},
+            )
+
+            self.assertEqual([signal], applied.journal_entry["signals"])
+
     def test_every_non_discard_action_requires_batch_source_provenance(self) -> None:
         base = {
             "type": "repo_status",

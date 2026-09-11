@@ -16,7 +16,11 @@ from . import fs as fs_operations
 from .config import DEFAULT_MAX_TEXT_CHARS, find_profile_root, load_profile_config
 from .fs import require_safe_path
 from .receipt import ReceiptValidationError, validate_receipt
-from .transcript import prepare_transcript_delta, publish_cursor
+from .transcript import (
+    prepare_transcript_delta,
+    publish_cursor,
+    serialize_session_cursor,
+)
 
 
 MAX_INPUT_BYTES = 1024 * 1024
@@ -246,6 +250,31 @@ def _duplicate_published_same_transcript(
 
 
 def capture_event(payload: dict, cwd: Path | None = None) -> CaptureResult:
+    """Validate and serialize one session's transcript cursor update."""
+    if os.environ.get("PROFILE_HARNESS_CURATOR") == "1":
+        return CaptureResult(True, "curator_noop")
+    if not isinstance(payload, dict):
+        raise CaptureError("payload must be a JSON object")
+    if _serialized_size(payload) > MAX_INPUT_BYTES:
+        raise CaptureError("payload exceeds the 1 MiB limit")
+    event = payload.get("hook_event_name")
+    if not isinstance(event, str) or event not in SUPPORTED_EVENTS:
+        raise CaptureError("unsupported hook event")
+    session_id = payload.get("session_id")
+    if not isinstance(session_id, str) or not session_id.strip():
+        raise CaptureError("session_id must be a non-empty string")
+    start = cwd if cwd is not None else payload.get("cwd", Path.cwd())
+    if not isinstance(start, (str, Path)):
+        raise CaptureError("cwd must be a path string")
+    try:
+        profile_root = find_profile_root(Path(start))
+    except ValueError:
+        return CaptureResult(True, "no_profile")
+    with serialize_session_cursor(profile_root, session_id.strip()):
+        return _capture_event_serialized(payload, cwd)
+
+
+def _capture_event_serialized(payload: dict, cwd: Path | None = None) -> CaptureResult:
     """Validate and persist one immutable Stop or SessionEnd receipt."""
     if os.environ.get("PROFILE_HARNESS_CURATOR") == "1":
         return CaptureResult(True, "curator_noop")

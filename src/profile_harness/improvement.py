@@ -104,22 +104,18 @@ def improvement_due(root: Path, *, now: datetime | None = None) -> ImprovementDu
     cooldown_remaining = 0.0 if last_at is None else max(
         0.0, config.cooldown_seconds - (current - last_at).total_seconds()
     )
-    if last_at is not None:
-        low_base = last_at
-    elif new:
-        low_base = _timestamp(new[0].get("applied_at"), "curation.applied_at")
-    else:
-        low_base = None
-    low_remaining = None if low_base is None else max(
-        0.0, config.low_interval_seconds - (current - low_base).total_seconds()
-    )
     if cooldown_remaining > 0:
-        return ImprovementDue(False, "cooldown", len(new), hashes, cooldown_remaining, low_remaining)
+        return ImprovementDue(False, "cooldown", len(new), hashes, cooldown_remaining, None)
     if len(new) >= config.high_threshold:
-        return ImprovementDue(True, "high_threshold", len(new), hashes, 0.0, low_remaining)
-    if len(new) >= config.low_minimum and low_remaining == 0:
-        return ImprovementDue(True, "low_interval", len(new), hashes, 0.0, 0.0)
-    return ImprovementDue(False, "curation_count", len(new), hashes, 0.0, low_remaining)
+        return ImprovementDue(True, "high_threshold", len(new), hashes, 0.0, None)
+    signal_counts: dict[str, int] = {}
+    for entry in new:
+        for signal in entry["signals"]:
+            signal_id = signal["signal_id"]
+            signal_counts[signal_id] = signal_counts.get(signal_id, 0) + 1
+    if any(count >= 3 for count in signal_counts.values()):
+        return ImprovementDue(True, "repeated_signal", len(new), hashes, 0.0, None)
+    return ImprovementDue(False, "curation_count", len(new), hashes, 0.0, None)
 
 
 def _canonical(value: object) -> bytes:
