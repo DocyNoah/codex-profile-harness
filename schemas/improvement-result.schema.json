@@ -13,14 +13,28 @@
   "$defs": {
     "proposal": {
       "type": "object",
-      "required": ["title", "content", "source_journal_hashes"],
+      "required": ["title", "rationale", "risk_level", "source_journal_hashes", "replacements"],
       "properties": {
         "title": {"type": "string", "minLength": 1, "maxLength": 200, "pattern": "^[\\s\\S]*\\S[\\s\\S]*$"},
-        "content": {"type": "string", "minLength": 1, "maxLength": 64000, "pattern": "^[\\s\\S]*\\S[\\s\\S]*$"},
+        "rationale": {"type": "string", "minLength": 1, "maxLength": 4000, "pattern": "^[\\s\\S]*\\S[\\s\\S]*$"},
+        "risk_level": {"enum": ["low", "medium", "high"]},
         "source_journal_hashes": {
           "type": "array", "minItems": 1, "maxItems": 100, "uniqueItems": true,
           "items": {"type": "string", "minLength": 64, "maxLength": 64, "pattern": "^[a-f0-9]{64}$"}
+        },
+        "replacements": {
+          "type": "array", "minItems": 1, "maxItems": 20, "items": {"$ref": "#/$defs/replacement"}
         }
+      },
+      "additionalProperties": false
+    },
+    "replacement": {
+      "type": "object",
+      "required": ["path", "expected_old_sha256", "content"],
+      "properties": {
+        "path": {"type": "string", "minLength": 1, "maxLength": 4096, "pattern": "^[^/\\\\][^\\\\]*$"},
+        "expected_old_sha256": {"type": "string", "minLength": 64, "maxLength": 64, "pattern": "^[a-f0-9]{64}$"},
+        "content": {"type": "string", "minLength": 1, "maxLength": 64000, "pattern": "^[\\s\\S]*\\S[\\s\\S]*$"}
       },
       "additionalProperties": false
     }

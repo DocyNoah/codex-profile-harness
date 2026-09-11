@@ -11,7 +11,6 @@
       "items": {
         "oneOf": [
           {"$ref": "#/$defs/profileMemory"},
-          {"$ref": "#/$defs/profileProposal"},
           {"$ref": "#/$defs/repoStatus"},
           {"$ref": "#/$defs/repoTasks"},
           {"$ref": "#/$defs/repoDecision"},
@@ -33,11 +32,6 @@
     "profileMemory": {
       "type": "object", "required": ["type", "kind", "title", "content", "source_receipt_ids"],
       "properties": {"type": {"const": "profile_memory"}, "kind": {"enum": ["semantic", "procedural"]}, "title": {"$ref": "#/$defs/content"}, "content": {"$ref": "#/$defs/content"}, "source_receipt_ids": {"$ref": "#/$defs/sources"}},
-      "additionalProperties": false
-    },
-    "profileProposal": {
-      "type": "object", "required": ["type", "title", "content", "source_receipt_ids"],
-      "properties": {"type": {"const": "profile_proposal"}, "title": {"$ref": "#/$defs/content"}, "content": {"$ref": "#/$defs/content"}, "source_receipt_ids": {"$ref": "#/$defs/sources"}},
       "additionalProperties": false
     },
     "repoStatus": {

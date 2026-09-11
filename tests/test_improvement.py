@@ -28,6 +28,7 @@ from profile_harness.journal import append_entry, verify_journal  # noqa: E402
 from profile_harness.packaging import build_local_marketplace  # noqa: E402
 from profile_harness.profile_git import CheckpointResult, IMPROVEMENT_SUBJECT  # noqa: E402
 import profile_harness.profile_git as profile_git_module  # noqa: E402
+from profile_harness.proposals import render_markdown  # noqa: E402
 
 
 NOW = datetime(2026, 9, 11, 12, 0, 0, tzinfo=timezone.utc)
@@ -91,7 +92,31 @@ class ImprovementTests(unittest.TestCase):
             "applied_at": at.isoformat().replace("+00:00", "Z"),
         })
 
-    def make_fake(self, parent: Path, result: dict, invocation: Path | None = None) -> Path:
+    def make_fake(
+        self, parent: Path, result: dict, invocation: Path | None = None,
+        *, preserve_legacy: bool = False,
+    ) -> Path:
+        if not preserve_legacy and isinstance(result.get("proposals"), list):
+            upgraded = []
+            for proposal in result["proposals"]:
+                if isinstance(proposal, dict) and set(proposal) == {
+                    "title", "content", "source_journal_hashes"
+                }:
+                    target = parent / "profile/CONTEXT.md"
+                    upgraded.append({
+                        "title": proposal["title"],
+                        "rationale": proposal["content"],
+                        "risk_level": "low",
+                        "source_journal_hashes": proposal["source_journal_hashes"],
+                        "replacements": [{
+                            "path": "CONTEXT.md",
+                            "expected_old_sha256": __import__("hashlib").sha256(target.read_bytes()).hexdigest(),
+                            "content": proposal["content"],
+                        }],
+                    })
+                else:
+                    upgraded.append(proposal)
+            result = {**result, "proposals": upgraded}
         fake = parent / "fake-codex"
         lines = ["#!/usr/bin/env python3", "import json,os,pathlib,sys"]
         if invocation is not None:
@@ -107,6 +132,20 @@ class ImprovementTests(unittest.TestCase):
         fake.chmod(fake.stat().st_mode | stat.S_IXUSR)
         return fake
 
+    def test_legacy_markdown_only_model_result_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            parent = Path(temporary_directory)
+            root = self.make_profile(parent)
+            entries = self.add_curations(root, 1, start=NOW)
+            fake = self.make_fake(parent, {"proposals": [{
+                "title": "Legacy", "content": "Markdown only",
+                "source_journal_hashes": [entries[0]["entry_hash"]],
+            }]}, preserve_legacy=True)
+            self.configure_fake(root, fake)
+
+            with self.assertRaisesRegex(ImprovementError, "forbidden fields"):
+                run_improvement(root, now=NOW, force=True)
+
     def configure_fake(self, root: Path, fake: Path) -> None:
         path = root / ".harness/config.toml"
         text = path.read_text()
@@ -117,6 +156,74 @@ class ImprovementTests(unittest.TestCase):
         else:
             text += f"\n[curation]\n{line}\n"
         path.write_text(text, encoding="utf-8")
+
+    def replacement_proposal(
+        self, root: Path, source_hash: str, *, title: str = "Safer review"
+    ) -> dict:
+        target = root / "CONTEXT.md"
+        return {
+            "title": title,
+            "rationale": "Keep managed context precise.",
+            "risk_level": "low",
+            "source_journal_hashes": [source_hash],
+            "replacements": [{
+                "path": "CONTEXT.md",
+                "expected_old_sha256": __import__("hashlib").sha256(target.read_bytes()).hexdigest(),
+                "content": "# Context\n\nUse a precise review boundary.\n",
+            }],
+        }
+
+    def test_runtime_owns_manifest_identity_base_status_and_policy(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            parent = Path(temporary_directory)
+            root = self.make_profile(parent)
+            entries = self.add_curations(root, 1, start=NOW)
+            before = subprocess.run(
+                ["git", "-C", str(root), "rev-parse", "HEAD"],
+                text=True, capture_output=True, check=True,
+            ).stdout.strip()
+            proposal = self.replacement_proposal(root, entries[0]["entry_hash"])
+            invocation = parent / "invocation.json"
+            fake = self.make_fake(parent, {"proposals": [proposal]}, invocation)
+            self.configure_fake(root, fake)
+
+            run_improvement(root, now=NOW, force=True)
+
+            manifest_path = next((root / ".harness/improvements/proposed").glob("*.json"))
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            self.assertEqual(1, manifest["version"])
+            self.assertRegex(manifest["proposal_id"], r"^[a-f0-9]{32}$")
+            self.assertEqual("proposed", manifest["status"])
+            self.assertEqual("2026-09-11T12:00:00Z", manifest["created_at"])
+            self.assertEqual(before, manifest["base_commit"])
+            self.assertEqual({
+                "mode": "approval_required",
+                "automatic_eligible": False,
+                "reason": "approval is required by configuration",
+            }, manifest["policy"])
+            self.assertEqual(proposal["replacements"], manifest["replacements"])
+            prompt = json.loads(invocation.read_text(encoding="utf-8"))["stdin"]
+            self.assertIn(proposal["replacements"][0]["expected_old_sha256"], prompt)
+
+    def test_improvement_rejects_model_owned_runtime_fields_commands_and_unsafe_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            parent = Path(temporary_directory)
+            root = self.make_profile(parent)
+            entries = self.add_curations(root, 1, start=NOW)
+            base = self.replacement_proposal(root, entries[0]["entry_hash"])
+            invalid = (
+                {**base, "proposal_id": "a" * 32},
+                {**base, "command": "echo unsafe"},
+                {**base, "replacements": [{
+                    **base["replacements"][0], "path": "../USER.md",
+                }]},
+            )
+            for index, proposal in enumerate(invalid):
+                with self.subTest(index=index):
+                    fake = self.make_fake(parent, {"proposals": [proposal]})
+                    self.configure_fake(root, fake)
+                    with self.assertRaises(ImprovementError):
+                        run_improvement(root, now=NOW, force=True)
 
     def test_improvement_thresholds_and_cooldown_have_inclusive_boundaries(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -204,11 +311,8 @@ class ImprovementTests(unittest.TestCase):
             proposals = list((root / ".harness/improvements/proposed").glob("*.md"))
             self.assertEqual(1, len(proposals))
             journal = verify_journal(root / ".harness/memory/journal/improvement.jsonl")
-            self.assertEqual(
-                f"<!-- profile-harness-improvement-transaction: {journal[0]['transaction_id']} -->\n"
-                "# Safer review\n\nRequire a review before policy changes.\n",
-                proposals[0].read_text(),
-            )
+            manifest = json.loads(proposals[0].with_suffix(".json").read_text())
+            self.assertEqual(render_markdown(manifest), proposals[0].read_text())
             self.assertEqual(protected, {name: (root / name).read_bytes() for name in protected})
             call = json.loads(invocation.read_text())
             self.assertEqual(str(root.resolve()), call["cwd"])
@@ -228,9 +332,9 @@ class ImprovementTests(unittest.TestCase):
             self.assertEqual("high", journal[0]["reasoning_effort"])
             self.assertEqual([entries[0]["entry_hash"]], journal[0]["source_journal_hashes"])
             self.assertEqual(64, len(journal[0]["result_digest"]))
-            self.assertEqual(1, len(journal[0]["proposal_digests"]))
+            self.assertEqual(2, len(journal[0]["proposal_digests"]))
             self.assertRegex(journal[0]["transaction_id"], r"^[a-f0-9]{32}$")
-            self.assertTrue(proposals[0].name.startswith(journal[0]["transaction_id"] + "-"))
+            self.assertEqual(manifest["proposal_id"] + ".md", proposals[0].name)
 
     def test_improvement_checkpoint_observes_transaction_and_runtime_cleanup(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -453,10 +557,11 @@ class ImprovementTests(unittest.TestCase):
                 "journal_snapshot_digest": None,
             }), encoding="utf-8")
 
-            recover_improvement_transaction(root)
+            with self.assertRaises(ImprovementError):
+                recover_improvement_transaction(root)
 
             self.assertEqual(before, {path: path.read_bytes() for path in before})
-            self.assertFalse(descriptor.exists())
+            self.assertTrue(descriptor.exists())
 
         with tempfile.TemporaryDirectory() as temporary_directory:
             parent = Path(temporary_directory)

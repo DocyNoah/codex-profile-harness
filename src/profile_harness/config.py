@@ -57,6 +57,11 @@ DEFAULT_IMPROVEMENT_COOLDOWN_SECONDS = 24 * 60 * 60
 DEFAULT_IMPROVEMENT_HIGH_THRESHOLD = 10
 DEFAULT_IMPROVEMENT_LOW_INTERVAL_SECONDS = 72 * 60 * 60
 DEFAULT_IMPROVEMENT_LOW_MINIMUM = 3
+DEFAULT_IMPROVEMENT_MODE = "approval_required"
+DEFAULT_AUTOMATIC_MAX_CHANGED_BYTES = 64_000
+MAX_AUTOMATIC_CHANGED_BYTES = 1024 * 1024
+DEFAULT_REMINDER_SECONDS = 24 * 60 * 60
+IMPROVEMENT_MODES = frozenset({"proposal_only", "approval_required", "auto_safe"})
 REASONING_EFFORTS = frozenset({"low", "medium", "high", "xhigh", "max", "ultra"})
 
 
@@ -99,7 +104,15 @@ class ImprovementConfig:
     high_threshold: int = DEFAULT_IMPROVEMENT_HIGH_THRESHOLD
     low_interval_seconds: float = DEFAULT_IMPROVEMENT_LOW_INTERVAL_SECONDS
     low_minimum: int = DEFAULT_IMPROVEMENT_LOW_MINIMUM
-    automatic_apply: bool = False
+    mode: str = DEFAULT_IMPROVEMENT_MODE
+    automatic_paths: tuple[str, ...] = ()
+    automatic_max_changed_bytes: int = DEFAULT_AUTOMATIC_MAX_CHANGED_BYTES
+    reminder_seconds: float = DEFAULT_REMINDER_SECONDS
+
+    @property
+    def automatic_apply(self) -> bool:
+        """Compatibility view; policy is governed by ``mode``."""
+        return self.mode == "auto_safe"
 
 
 @dataclass(frozen=True)
@@ -181,6 +194,28 @@ def _reasoning_effort(value: object, field: str, default: str, errors: list[str]
     return value
 
 
+def _automatic_paths(value: object, errors: list[str]) -> tuple[str, ...]:
+    if not isinstance(value, list):
+        errors.append("improvement.automatic_paths must be an array of exact relative paths")
+        return ()
+    validated: list[str] = []
+    for item in value:
+        if not isinstance(item, str) or not item or "\\" in item:
+            errors.append("improvement.automatic_paths must contain exact relative paths")
+            continue
+        path = Path(item)
+        if (
+            path.is_absolute() or path.as_posix() != item or ".." in path.parts
+            or any(character in item for character in "*?[]{}")
+        ):
+            errors.append("improvement.automatic_paths must contain exact relative paths without patterns")
+            continue
+        validated.append(item)
+    if len(validated) != len(set(validated)):
+        errors.append("improvement.automatic_paths must not contain duplicates")
+    return tuple(validated)
+
+
 def load_profile_config(root: Path) -> HarnessConfig:
     """Load the complete validated harness configuration."""
     profile_root = Path(root).expanduser().resolve()
@@ -256,6 +291,18 @@ def load_profile_config(root: Path) -> HarnessConfig:
     if not isinstance(improvement, dict):
         errors.append("improvement configuration must be a TOML table")
         improvement = {}
+    allowed_improvement_fields = {
+        "enabled", "model", "reasoning_effort", "cooldown_seconds",
+        "high_threshold", "low_interval_seconds", "low_minimum",
+        "automatic_apply", "mode", "automatic_paths",
+        "automatic_max_changed_bytes", "reminder_seconds",
+    }
+    unknown_improvement_fields = sorted(set(improvement) - allowed_improvement_fields)
+    if unknown_improvement_fields:
+        errors.append(
+            "unknown improvement configuration fields: "
+            + ", ".join(unknown_improvement_fields)
+        )
     enabled = improvement.get("enabled", True)
     if not isinstance(enabled, bool):
         errors.append("improvement.enabled must be boolean")
@@ -284,10 +331,40 @@ def load_profile_config(root: Path) -> HarnessConfig:
         improvement.get("low_minimum", DEFAULT_IMPROVEMENT_LOW_MINIMUM),
         "improvement.low_minimum", errors,
     )
-    automatic_apply = improvement.get("automatic_apply", False)
-    if automatic_apply is not False:
-        errors.append("improvement.automatic_apply must remain false")
-        automatic_apply = False
+    legacy_automatic = improvement.get("automatic_apply")
+    mode = improvement.get("mode", DEFAULT_IMPROVEMENT_MODE)
+    if legacy_automatic is True:
+        errors.append(
+            "improvement.automatic_apply=true is unsafe; upgrade to improvement.mode "
+            "and configure an exact automatic_paths allowlist"
+        )
+    elif legacy_automatic is not None and legacy_automatic is not False:
+        errors.append("improvement.automatic_apply must be boolean during upgrade")
+    if not isinstance(mode, str) or mode not in IMPROVEMENT_MODES:
+        errors.append(
+            "improvement.mode must be one of " + ", ".join(sorted(IMPROVEMENT_MODES))
+        )
+        mode = DEFAULT_IMPROVEMENT_MODE
+    if legacy_automatic is False and "mode" in improvement and mode != DEFAULT_IMPROVEMENT_MODE:
+        errors.append("legacy improvement.automatic_apply=false requires mode=approval_required")
+    automatic_paths = _automatic_paths(improvement.get("automatic_paths", []), errors)
+    automatic_max_changed_bytes = _positive_integer(
+        improvement.get(
+            "automatic_max_changed_bytes", DEFAULT_AUTOMATIC_MAX_CHANGED_BYTES
+        ),
+        "improvement.automatic_max_changed_bytes",
+        errors,
+    )
+    if automatic_max_changed_bytes > MAX_AUTOMATIC_CHANGED_BYTES:
+        errors.append(
+            "improvement.automatic_max_changed_bytes must not exceed "
+            f"{MAX_AUTOMATIC_CHANGED_BYTES}"
+        )
+    reminder_seconds = _positive_number(
+        improvement.get("reminder_seconds", DEFAULT_REMINDER_SECONDS),
+        "improvement.reminder_seconds",
+        errors,
+    )
     if errors:
         raise ValueError("invalid profile configuration: " + "; ".join(errors))
     return HarnessConfig(
@@ -299,7 +376,8 @@ def load_profile_config(root: Path) -> HarnessConfig:
         ),
         ImprovementConfig(
             enabled, improvement_model, improvement_reasoning, cooldown,
-            high_threshold, low_interval, low_minimum, automatic_apply,
+            high_threshold, low_interval, low_minimum, mode, automatic_paths,
+            automatic_max_changed_bytes, reminder_seconds,
         ),
     )
 

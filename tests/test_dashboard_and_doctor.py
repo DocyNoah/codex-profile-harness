@@ -374,10 +374,6 @@ class DoctorTests(unittest.TestCase):
                     ("$defs", "profileMemory", "properties", "kind", "enum"),
                     ["semantic", "procedural", "episodic"],
                 ),
-                "profile proposal required": set_value(
-                    ("$defs", "profileProposal", "required"),
-                    ["type", "title", "content"],
-                ),
                 "repository status additional fields": set_value(
                     ("$defs", "repoStatus", "additionalProperties"), True
                 ),

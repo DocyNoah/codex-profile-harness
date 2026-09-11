@@ -28,6 +28,7 @@ from .doctor import DoctorReport, Finding, diagnose
 from .journal import append_entry, verify_journal
 from .locking import LeaseBusyError, ProfileLease
 from .packaging import build_local_marketplace
+from .proposals import ProposalError, ProposalStore
 from .runner import run_codex
 
 __all__ = [
@@ -45,6 +46,8 @@ __all__ = [
     "Finding",
     "LeaseBusyError",
     "ProfileLease",
+    "ProposalError",
+    "ProposalStore",
     "append_entry",
     "apply_actions",
     "build_local_marketplace",

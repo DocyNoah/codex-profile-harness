@@ -777,6 +777,9 @@ class MaintenanceTests(unittest.TestCase):
                 self.add_receipt(root, index, NOW)
             calls = parent / "calls.jsonl"
             fake = parent / "fake-codex"
+            context_digest = __import__("hashlib").sha256(
+                (root / "CONTEXT.md").read_bytes()
+            ).hexdigest()
             fake.write_text(
                 "#!/usr/bin/env python3\n"
                 "import json,pathlib,re,sys\n"
@@ -785,7 +788,8 @@ class MaintenanceTests(unittest.TestCase):
                 "if schema.endswith('curation-result.schema.json'): result={'actions':[],'signals':[]}\n"
                 "else:\n"
                 " hashes=re.findall(r'\\\"entry_hash\\\": \\\"([a-f0-9]{64})\\\"',prompt)\n"
-                " result={'proposals':[{'title':'After ten','content':'Review it.','source_journal_hashes':[hashes[-1]]}]}\n"
+                " result={'proposals':[{'title':'After ten','rationale':'Review it.','risk_level':'low','source_journal_hashes':[hashes[-1]],"
+                f"'replacements':[{{'path':'CONTEXT.md','expected_old_sha256':'{context_digest}','content':'Review it.'}}]}}]}}\n"
                 "pathlib.Path(sys.argv[sys.argv.index('-o')+1]).write_text(json.dumps(result))\n",
                 encoding="utf-8",
             )

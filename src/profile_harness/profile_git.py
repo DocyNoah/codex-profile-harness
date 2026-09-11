@@ -8,6 +8,7 @@ import fcntl
 import json
 import os
 from pathlib import Path
+import re
 import signal
 import subprocess
 import threading
@@ -568,6 +569,18 @@ def checkpoint_profile(root: Path, subject: str = CHECKPOINT_SUBJECT) -> Checkpo
                 return CheckpointResult(False, error=str(error))
     except (OSError, ValueError, ProfileGitError) as error:
         return CheckpointResult(False, error=str(error))
+
+
+def current_profile_commit(root: Path) -> str:
+    """Return the exact attached profile commit used to bind a proposal."""
+    profile_root = Path(root).expanduser().resolve()
+    _safe_git_directory(profile_root)
+    result = _git(
+        profile_root, "rev-parse", "--verify", "HEAD", read_only=True
+    ).stdout.strip()
+    if not re.fullmatch(r"[a-f0-9]{40,64}", result):
+        raise ProfileGitError("profile HEAD is invalid")
+    return result
 
 
 def validate_pending_checkpoint(root: Path) -> str | None:

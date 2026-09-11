@@ -47,6 +47,7 @@ from .improvement import (
     recover_improvement_transaction,
     successful_improvement_entries,
 )
+from .proposals import MAX_RATIONALE_CHARS, MAX_REPLACEMENTS, ProposalError, ProposalStore
 from .locking import LeaseBusyError, ProfileLease
 
 
@@ -61,6 +62,7 @@ REQUIRED_PLUGIN_FILES = (
     "scripts/build_local_marketplace.py",
     "src/profile_harness/packaging.py",
     "src/profile_harness/profile_git.py",
+    "src/profile_harness/proposals.py",
     "src/profile_harness/maintenance.py",
     "src/profile_harness/improvement.py",
     "src/profile_harness/receipt.py",
@@ -109,7 +111,6 @@ SEMVER = re.compile(
 )
 CURATION_ACTION_REFS = {
     "#/$defs/profileMemory",
-    "#/$defs/profileProposal",
     "#/$defs/repoStatus",
     "#/$defs/repoTasks",
     "#/$defs/repoDecision",
@@ -119,10 +120,6 @@ CURATION_ACTION_CONTRACTS = {
     "profileMemory": (
         "profile_memory",
         {"type", "kind", "title", "content", "source_receipt_ids"},
-    ),
-    "profileProposal": (
-        "profile_proposal",
-        {"type", "title", "content", "source_receipt_ids"},
     ),
     "repoStatus": (
         "repo_status",
@@ -574,19 +571,21 @@ def _validate_improvement_schema(value: object) -> None:
     _exact_integer(proposals, "maxItems", MAX_PROPOSALS, "improvement proposals")
     _reference_contract(proposals.get("items"), "#/$defs/proposal", "improvement proposals.items")
     definitions = value.get("$defs") if isinstance(value, dict) else None
-    if not isinstance(definitions, dict) or set(definitions) != {"proposal"}:
-        raise ValueError("improvement schema must contain only the proposal definition")
+    if not isinstance(definitions, dict) or set(definitions) != {"proposal", "replacement"}:
+        raise ValueError("improvement schema must contain proposal and replacement definitions")
     proposal = _object_contract(
-        definitions["proposal"], {"title", "content", "source_journal_hashes"}, "improvement proposal"
+        definitions["proposal"],
+        {"title", "rationale", "risk_level", "source_journal_hashes", "replacements"},
+        "improvement proposal",
     )
     _string_contract(
         proposal["title"], minimum=1, maximum=MAX_TITLE_CHARS,
         pattern="^[\\s\\S]*\\S[\\s\\S]*$", label="improvement proposal.title",
     )
-    _string_contract(
-        proposal["content"], minimum=1, maximum=MAX_IMPROVEMENT_CONTENT_CHARS,
-        pattern="^[\\s\\S]*\\S[\\s\\S]*$", label="improvement proposal.content",
-    )
+    _string_contract(proposal["rationale"], minimum=1, maximum=MAX_RATIONALE_CHARS,
+                     pattern="^[\\s\\S]*\\S[\\s\\S]*$", label="improvement proposal.rationale")
+    if set(proposal["risk_level"].get("enum", [])) != {"low", "medium", "high"}:
+        raise ValueError("improvement proposal.risk_level is weakened")
     hashes = _array_contract(
         proposal["source_journal_hashes"], minimum=1, maximum=MAX_SOURCE_HASHES,
         unique=True, label="improvement proposal.source_journal_hashes",
@@ -595,6 +594,21 @@ def _validate_improvement_schema(value: object) -> None:
         hashes, minimum=64, maximum=64, pattern="^[a-f0-9]{64}$",
         label="improvement proposal.source_journal_hashes.items",
     )
+    replacements = _array_contract(
+        proposal["replacements"], minimum=1, maximum=MAX_REPLACEMENTS,
+        unique=False, label="improvement proposal.replacements",
+    )
+    _reference_contract(replacements, "#/$defs/replacement", "improvement proposal.replacements.items")
+    replacement = _object_contract(
+        definitions["replacement"], {"path", "expected_old_sha256", "content"},
+        "improvement replacement",
+    )
+    _string_contract(replacement["path"], minimum=1, maximum=4096,
+                     pattern="^[^/\\\\][^\\\\]*$", label="improvement replacement.path")
+    _string_contract(replacement["expected_old_sha256"], minimum=64, maximum=64,
+                     pattern="^[a-f0-9]{64}$", label="improvement replacement.expected_old_sha256")
+    _string_contract(replacement["content"], minimum=1, maximum=MAX_IMPROVEMENT_CONTENT_CHARS,
+                     pattern="^[\\s\\S]*\\S[\\s\\S]*$", label="improvement replacement.content")
 
 
 JSON_VALIDATORS = {
@@ -828,6 +842,21 @@ def diagnose(
                 "OK", "profile", "configuration and required files are readable"
             )
         )
+        if profile_config.improvement.mode == "auto_safe" and not profile_config.improvement.automatic_paths:
+            findings.append(Finding(
+                "WARN", "proposal policy",
+                "auto_safe has an empty exact allowlist; every proposal will require approval",
+            ))
+        protected = {"AGENTS.md", "IDENTITY.md", "USER.md"}
+        configured_protected = sorted(
+            protected & set(profile_config.improvement.automatic_paths)
+        )
+        if configured_protected:
+            findings.append(Finding(
+                "WARN", "proposal policy",
+                "protected targets always require approval: " + ", ".join(configured_protected),
+            ))
+
     effective_stale_timeout = (
         stale_timeout
         if stale_timeout is not None
@@ -938,6 +967,21 @@ def diagnose(
             findings.append(Finding("ERROR", "transaction", f"improvement recovery failed: {error}"))
         else:
             findings.append(Finding("OK", "transaction", "recovered interrupted improvement while holding the profile lease"))
+
+    try:
+        proposal_items = ProposalStore(profile_root).list()
+    except (OSError, UnicodeError, ProposalError) as error:
+        findings.append(Finding("ERROR", "proposal", str(error)))
+    else:
+        legacy_count = sum(bool(item.get("legacy")) for item in proposal_items)
+        if legacy_count:
+            findings.append(Finding(
+                "WARN", "proposal",
+                f"{legacy_count} legacy Markdown proposal(s) are readable but never applicable",
+            ))
+        findings.append(Finding(
+            "OK", "proposal", f"validated {len(proposal_items) - legacy_count} versioned proposal(s)",
+        ))
 
     for relative in RUNTIME_DIRECTORIES:
         path = profile_root / relative

@@ -42,6 +42,9 @@ MAX_RESULT_BYTES = 1024 * 1024
 ACTION_TYPES = frozenset(
     {
         "profile_memory",
+        # Compatibility for already-prepared pre-v2 batches only. The curation
+        # output schema no longer exposes this action, so no new model run can
+        # choose the legacy Markdown-only persistence path.
         "profile_proposal",
         "repo_status",
         "repo_tasks",
@@ -1505,6 +1508,9 @@ def apply_actions(
                     target.parent,
                 )
             elif action_type == "profile_proposal":
+                # Recovery-only compatibility for transactions prepared before
+                # profileProposal was removed from the curation schema. These
+                # files are intentionally legacy/read-only in ProposalStore.
                 target = (
                     profile.root / ".harness/improvements/proposed" /
                     f"{_slug(action['title'], 'proposal')}.md"

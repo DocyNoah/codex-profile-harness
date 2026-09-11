@@ -15,6 +15,7 @@ sys.path.insert(0, str(ROOT / "src"))
 from profile_harness.config import (  # noqa: E402
     find_profile_root,
     init_profile,
+    load_profile_config,
     load_profile,
     register_repo,
 )
@@ -194,6 +195,65 @@ class ProfileInitializationTests(unittest.TestCase):
             source.write_text("", encoding="utf-8")
 
             self.assertEqual(root.resolve(), find_profile_root(source))
+
+
+class ImprovementConfigurationTests(unittest.TestCase):
+    def make_profile(self, parent: Path, improvement: str) -> Path:
+        root = parent / "profile"
+        init_profile(root, "Work")
+        (root / ".harness/config.toml").write_text(
+            'version = 1\nname = "Work"\n\n[improvement]\n' + improvement,
+            encoding="utf-8",
+        )
+        return root
+
+    def test_three_modes_and_exact_automatic_policy_values_load(self) -> None:
+        for mode in ("proposal_only", "approval_required", "auto_safe"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as temporary_directory:
+                root = self.make_profile(Path(temporary_directory), (
+                    f'mode = "{mode}"\n'
+                    'automatic_paths = ["CONTEXT.md", ".harness/memory/procedural/review.md"]\n'
+                    'automatic_max_changed_bytes = 4096\n'
+                    'reminder_seconds = 7200\n'
+                ))
+
+                config = load_profile_config(root).improvement
+
+                self.assertEqual(mode, config.mode)
+                self.assertEqual(
+                    ("CONTEXT.md", ".harness/memory/procedural/review.md"),
+                    config.automatic_paths,
+                )
+                self.assertEqual(4096, config.automatic_max_changed_bytes)
+                self.assertEqual(7200.0, config.reminder_seconds)
+
+    def test_unsafe_or_unbounded_automatic_configuration_is_rejected(self) -> None:
+        invalid = (
+            'automatic_command = "echo unsafe"\n',
+            'automatic_apply = []\n',
+            'mode = "sometimes"\n',
+            'automatic_paths = ["../USER.md"]\n',
+            'automatic_paths = ["*.md"]\n',
+            'automatic_paths = ["CONTEXT.md", "CONTEXT.md"]\n',
+            'automatic_max_changed_bytes = 0\n',
+            'automatic_max_changed_bytes = 1048577\n',
+            'reminder_seconds = 0\n',
+        )
+        for text in invalid:
+            with self.subTest(text=text), tempfile.TemporaryDirectory() as temporary_directory:
+                root = self.make_profile(Path(temporary_directory), text)
+                with self.assertRaises(ValueError):
+                    load_profile_config(root)
+
+    def test_legacy_false_migrates_but_true_requires_explicit_upgrade(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = self.make_profile(Path(temporary_directory), "automatic_apply = false\n")
+            self.assertEqual("approval_required", load_profile_config(root).improvement.mode)
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = self.make_profile(Path(temporary_directory), "automatic_apply = true\n")
+            with self.assertRaisesRegex(ValueError, "upgrade.*mode"):
+                load_profile_config(root)
 
 
 class RepositoryRegistrationTests(unittest.TestCase):

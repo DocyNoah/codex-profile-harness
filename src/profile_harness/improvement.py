@@ -17,6 +17,13 @@ from .fs import atomic_copy_file, atomic_write_text, exclusive_write_text, fsync
 from .curation import successful_curation_entries
 from .journal import append_entry, verify_journal
 from .locking import ProfileLease
+from .proposals import (
+    MAX_RATIONALE_CHARS,
+    MAX_REPLACEMENTS,
+    ProposalError,
+    render_markdown,
+    validate_manifest,
+)
 from .runner import run_codex
 
 
@@ -163,17 +170,22 @@ def validate_improvement_journal_entry(entry: object) -> dict[str, Any]:
         or entry.get("curation_head_hash") != sources[-1]
         or not isinstance(entry.get("result_digest"), str)
         or _HASH.fullmatch(entry["result_digest"]) is None
-        or not isinstance(proposals, dict) or len(proposals) > MAX_PROPOSALS
+        or not isinstance(proposals, dict) or len(proposals) > MAX_PROPOSALS * 2
     ):
         raise ImprovementError("improvement journal entry contract is invalid")
     for relative_text, digest in proposals.items():
         relative = Path(relative_text) if isinstance(relative_text, str) else Path("/")
+        legacy_name = (
+            isinstance(relative_text, str)
+            and relative.suffix == ".md"
+            and relative.name.startswith(f"{transaction_id}-")
+        )
+        current_name = re.fullmatch(r"[a-f0-9]{32}\.(?:json|md)", relative.name) is not None
         if (
             not isinstance(relative_text, str)
             or relative.is_absolute() or ".." in relative.parts
             or relative.parent != Path(".harness/improvements/proposed")
-            or relative.suffix != ".md"
-            or not relative.name.startswith(f"{transaction_id}-")
+            or not (legacy_name or current_name)
             or not isinstance(digest, str) or _HASH.fullmatch(digest) is None
         ):
             raise ImprovementError("improvement journal proposal binding is invalid")
@@ -204,22 +216,42 @@ def _load_result(path: Path) -> dict[str, Any]:
     return value
 
 
-def _validate_result(value: dict[str, Any], sources: set[str]) -> tuple[dict[str, Any], ...]:
+def _validate_result(root: Path, value: dict[str, Any], sources: set[str]) -> tuple[dict[str, Any], ...]:
     if set(value) != {"proposals"} or not isinstance(value["proposals"], list) or len(value["proposals"]) > MAX_PROPOSALS:
         raise ImprovementError("result must contain only a bounded proposals array")
     validated = []
     for proposal in value["proposals"]:
-        if not isinstance(proposal, dict) or set(proposal) != {"title", "content", "source_journal_hashes"}:
+        fields = {"title", "rationale", "risk_level", "source_journal_hashes", "replacements"}
+        if not isinstance(proposal, dict) or set(proposal) != fields:
             raise ImprovementError("proposal contains missing or forbidden fields")
-        title, content, hashes = proposal["title"], proposal["content"], proposal["source_journal_hashes"]
+        title = proposal["title"]
+        rationale = proposal["rationale"]
+        hashes = proposal["source_journal_hashes"]
         if not isinstance(title, str) or not title.strip() or len(title) > MAX_TITLE_CHARS:
             raise ImprovementError("proposal title must be bounded non-empty text")
-        if not isinstance(content, str) or not content.strip() or len(content) > MAX_CONTENT_CHARS:
-            raise ImprovementError("proposal content must be bounded non-empty text")
+        if not isinstance(rationale, str) or not rationale.strip() or len(rationale) > MAX_RATIONALE_CHARS:
+            raise ImprovementError("proposal rationale must be bounded non-empty text")
+        if proposal["risk_level"] not in {"low", "medium", "high"}:
+            raise ImprovementError("proposal risk level is invalid")
         if (not isinstance(hashes, list) or not 1 <= len(hashes) <= MAX_SOURCE_HASHES
                 or len(hashes) != len(set(hashes))
                 or any(not isinstance(item, str) or _HASH.fullmatch(item) is None or item not in sources for item in hashes)):
             raise ImprovementError("proposal source journal hashes are invalid")
+        replacements = proposal["replacements"]
+        if not isinstance(replacements, list) or not 1 <= len(replacements) <= MAX_REPLACEMENTS:
+            raise ImprovementError("proposal replacements must be a bounded non-empty array")
+        probe = {
+            "version": 1, "proposal_id": "0" * 32, "status": "proposed",
+            "created_at": "2000-01-01T00:00:00Z", "title": title,
+            "rationale": rationale, "risk_level": proposal["risk_level"],
+            "source_journal_hashes": hashes, "replacements": replacements,
+            "base_commit": "0" * 40,
+            "policy": {"mode": "approval_required", "automatic_eligible": False, "reason": "validation"},
+        }
+        try:
+            validate_manifest(root, probe, verify_current=True)
+        except ProposalError as error:
+            raise ImprovementError(str(error)) from error
         validated.append(proposal)
     return tuple(validated)
 
@@ -244,7 +276,11 @@ def _bounded_state(root: Path, entries: list[dict[str, Any]]) -> str:
         total += len(content)
         if total > 300_000:
             raise ImprovementError("curated profile state exceeds the bounded size limit")
-        documents.append({"path": str(path.relative_to(root)), "content": content})
+        documents.append({
+            "path": str(path.relative_to(root)),
+            "sha256": hashlib.sha256(content.encode("utf-8")).hexdigest(),
+            "content": content,
+        })
     metadata = [
         {key: entry[key] for key in ("batch_id", "actions", "applied_at", "entry_hash") if key in entry}
         for entry in entries
@@ -256,6 +292,30 @@ def _bounded_state(root: Path, entries: list[dict[str, Any]]) -> str:
     if len(prompt) > MAX_PROMPT_CHARS:
         raise ImprovementError("improvement prompt exceeds the bounded size limit")
     return prompt
+
+
+def _policy_decision(config: object, replacements: list[dict[str, Any]]) -> dict[str, Any]:
+    mode = config.mode
+    if mode == "proposal_only":
+        return {"mode": mode, "automatic_eligible": False, "reason": "proposal-only mode forbids application"}
+    if mode == "approval_required":
+        return {"mode": mode, "automatic_eligible": False, "reason": "approval is required by configuration"}
+    paths = {replacement["path"] for replacement in replacements}
+    protected = {"AGENTS.md", "IDENTITY.md", "USER.md"}
+    changed_bytes = sum(len(replacement["content"].encode("utf-8")) for replacement in replacements)
+    if paths & protected:
+        reason = "a protected profile policy or identity target always requires approval"
+        eligible = False
+    elif not paths <= set(config.automatic_paths):
+        reason = "one or more targets are outside the exact automatic allowlist"
+        eligible = False
+    elif changed_bytes > config.automatic_max_changed_bytes:
+        reason = "proposed content exceeds the automatic changed-byte limit"
+        eligible = False
+    else:
+        reason = "all targets and changed bytes satisfy the structural automatic policy"
+        eligible = True
+    return {"mode": mode, "automatic_eligible": eligible, "reason": reason}
 
 
 def _validated_transaction(
@@ -274,7 +334,7 @@ def _validated_transaction(
         or _TRANSACTION_ID.fullmatch(transaction["transaction_id"]) is None
         or not isinstance(transaction.get("journal_existed"), bool)
         or not isinstance(transaction.get("targets"), list)
-        or len(transaction["targets"]) > MAX_PROPOSALS
+        or len(transaction["targets"]) > MAX_PROPOSALS * 2
     ):
         raise ImprovementError("invalid improvement transaction descriptor")
     journal = _safe_journal(root, _IMPROVEMENT_JOURNAL)
@@ -323,17 +383,19 @@ def _validated_transaction(
             target = require_safe_path(root, root / relative, directory=False)
         except ValueError as error:
             raise ImprovementError(str(error)) from error
-        if (
-            target.parent != proposed_root
-            or target.suffix != ".md"
-            or re.fullmatch(rf"{transaction_id}-[0-9]{{2}}-[a-z0-9-]+\.md", target.name) is None
-        ):
+        legacy_name = re.fullmatch(
+            rf"{transaction_id}-[0-9]{{2}}-[a-z0-9-]+\.md", target.name
+        ) is not None
+        current_name = re.fullmatch(r"[a-f0-9]{32}\.(?:json|md)", target.name) is not None
+        if target.parent != proposed_root or not (legacy_name or current_name):
             raise ImprovementError("improvement transaction escapes proposal scope")
         if target.exists():
-            try:
-                owned = target.read_text(encoding="utf-8").startswith(ownership_marker)
-            except (OSError, UnicodeError):
-                owned = False
+            owned = current_name
+            if legacy_name:
+                try:
+                    owned = target.read_text(encoding="utf-8").startswith(ownership_marker)
+                except (OSError, UnicodeError):
+                    owned = False
             if target.stat().st_nlink != 1 or _file_digest(target) != member["digest"] or not owned:
                 raise ImprovementError("improvement transaction target digest is invalid")
         if transaction["state"] == "committed" and not target.is_file():
@@ -463,7 +525,7 @@ def _run_locked(
             timeout=config.curation.codex_timeout_seconds,
         )
         result = _load_result(result_path)
-        proposals = _validate_result(result, source_set)
+        proposals = _validate_result(root, result, source_set)
         try:
             proposed_root = require_safe_path(root, root / ".harness/improvements/proposed", directory=True)
             journal = _safe_journal(root, _IMPROVEMENT_JOURNAL)
@@ -476,6 +538,9 @@ def _run_locked(
             atomic_copy_file(journal, snapshot)
             snapshot_digest = _file_digest(snapshot)
         transaction_id = uuid.uuid4().hex
+        from .profile_git import current_profile_commit
+
+        base_commit = current_profile_commit(root)
         transaction = {
             "version": 1, "state": "applying", "targets": [],
             "transaction_id": transaction_id,
@@ -487,28 +552,50 @@ def _run_locked(
         created = []
         proposal_digests = {}
         try:
-            for index, proposal in enumerate(proposals, start=1):
-                body = (
-                    f"<!-- profile-harness-improvement-transaction: {transaction_id} -->\n"
-                    f"# {proposal['title'].strip()}\n\n{proposal['content'].strip()}\n"
+            for proposal in proposals:
+                proposal_id = uuid.uuid4().hex
+                manifest = {
+                    "version": 1,
+                    "proposal_id": proposal_id,
+                    "status": "proposed",
+                    "created_at": now.isoformat().replace("+00:00", "Z"),
+                    "title": proposal["title"].strip(),
+                    "rationale": proposal["rationale"].strip(),
+                    "risk_level": proposal["risk_level"],
+                    "source_journal_hashes": proposal["source_journal_hashes"],
+                    "replacements": proposal["replacements"],
+                    "base_commit": base_commit,
+                    "policy": _policy_decision(config.improvement, proposal["replacements"]),
+                }
+                try:
+                    validate_manifest(root, manifest, verify_current=True)
+                except ProposalError as error:
+                    raise ImprovementError(str(error)) from error
+                payloads = (
+                    (proposed_root / f"{proposal_id}.json", json.dumps(
+                        manifest, ensure_ascii=False, sort_keys=True, indent=2
+                    ) + "\n"),
+                    (proposed_root / f"{proposal_id}.md", render_markdown(manifest)),
                 )
-                target = proposed_root / f"{transaction_id}-{index:02d}-{_slug(proposal['title'])}.md"
-                require_safe_path(root, target, directory=False)
-                if target.exists():
-                    raise ImprovementError("immutable proposal already exists")
-                transaction["targets"].append({
-                    "path": str(target.relative_to(root)),
-                    "digest": hashlib.sha256(body.encode()).hexdigest(),
-                })
-                atomic_write_text(descriptor, json.dumps(transaction, sort_keys=True, indent=2) + "\n")
-                if not exclusive_write_text(target, body):
-                    raise ImprovementError("immutable proposal already exists")
-                created.append(target)
-                proposal_digests[str(target.relative_to(root))] = hashlib.sha256(body.encode()).hexdigest()
-                if fail_after_writes is not None and len(created) >= fail_after_writes:
-                    raise RuntimeError("injected improvement write failure")
-                if crash_after_stage == "after_first_write" and len(created) == 1:
-                    os._exit(91)
+                for target, body in payloads:
+                    require_safe_path(root, target, directory=False)
+                    if target.exists():
+                        raise ImprovementError("immutable proposal already exists")
+                    digest = hashlib.sha256(body.encode()).hexdigest()
+                    transaction["targets"].append({
+                        "path": str(target.relative_to(root)), "digest": digest,
+                    })
+                    atomic_write_text(
+                        descriptor, json.dumps(transaction, sort_keys=True, indent=2) + "\n"
+                    )
+                    if not exclusive_write_text(target, body):
+                        raise ImprovementError("immutable proposal already exists")
+                    created.append(target)
+                    proposal_digests[str(target.relative_to(root))] = digest
+                    if fail_after_writes is not None and len(created) >= fail_after_writes:
+                        raise RuntimeError("injected improvement write failure")
+                    if crash_after_stage == "after_first_write" and len(created) == 1:
+                        os._exit(91)
             entry = append_entry(journal, {
                 "event": "improvement",
                 "transaction_id": transaction_id,
@@ -530,7 +617,8 @@ def _run_locked(
             output = {
                 "status": "performed", "reason": "forced" if force else due.reason,
                 "new_curations": due.new_curations,
-                "proposals": [str(path) for path in created], "journal_entry_hash": entry["entry_hash"],
+                "proposals": [str(path) for path in created if path.suffix == ".json"],
+                "journal_entry_hash": entry["entry_hash"],
             }
             from .profile_git import IMPROVEMENT_SUBJECT, checkpoint_profile
 
