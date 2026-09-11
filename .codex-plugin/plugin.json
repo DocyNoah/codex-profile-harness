@@ -1,7 +1,7 @@
 {
   "name": "codex-profile-harness",
-  "version": "0.2.0",
-  "description": "Isolated profile memory and repository routing for Codex projects.",
+  "version": "0.3.0",
+  "description": "Durable profile memory, approval-controlled self-improvement, and repository routing for Codex.",
   "author": {
     "name": "Codex Profile Harness contributors"
   },
@@ -15,8 +15,8 @@
   ],
   "interface": {
     "displayName": "Codex Profile Harness",
-    "shortDescription": "Keep profile memory isolated and repository work routed.",
-    "longDescription": "Initialize auditable Codex profiles and safely route operational knowledge to nested repositories.",
+    "shortDescription": "Run durable Codex profiles with controlled improvement.",
+    "longDescription": "Capture and curate profile memory, route repository state, review improvement proposals in Harness Control, and keep auditable local Git history.",
     "developerName": "Codex Profile Harness contributors",
     "category": "Productivity",
     "capabilities": [

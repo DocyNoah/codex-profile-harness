@@ -1184,6 +1184,29 @@ class ProfileGitTests(unittest.TestCase):
             self.assertEqual(1, sum(result.committed for result in results))
             self.assertEqual(2, int(git(profile, "rev-list", "--count", "HEAD").stdout))
 
+    def test_manual_checkpoint_cannot_commit_while_profile_lease_is_owned_elsewhere(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            profile = Path(temporary_directory) / "profile"
+            init_profile(profile, "Work")
+            (profile / "MEMORY.md").write_text("not yet complete\n", encoding="utf-8")
+            before = git(profile, "rev-parse", "HEAD").stdout.strip()
+            results: list[CheckpointResult] = []
+
+            with ProfileLease(profile, owner={"test": "active transaction"}):
+                worker = threading.Thread(
+                    target=lambda: results.append(
+                        checkpoint_profile(profile, CHECKPOINT_SUBJECT)
+                    )
+                )
+                worker.start()
+                worker.join(timeout=3)
+
+            self.assertFalse(worker.is_alive())
+            self.assertEqual(1, len(results))
+            self.assertFalse(results[0].committed)
+            self.assertIn("lease", (results[0].error or "").lower())
+            self.assertEqual(before, git(profile, "rev-parse", "HEAD").stdout.strip())
+
     def test_inspection_reports_detached_dirty_and_remote_state(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             profile = Path(temporary_directory) / "profile"

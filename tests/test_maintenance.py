@@ -21,6 +21,7 @@ from profile_harness.journal import append_entry  # noqa: E402
 from profile_harness.locking import LeaseBusyError, ProfileLease  # noqa: E402
 from profile_harness.maintenance import maintenance_due, run_maintenance  # noqa: E402
 import profile_harness.maintenance as maintenance_module  # noqa: E402
+import profile_harness.improvement as improvement_module  # noqa: E402
 from profile_harness.profile_git import (  # noqa: E402
     CHECKPOINT_SUBJECT,
     CURATION_SUBJECT,
@@ -45,6 +46,33 @@ class MaintenanceTests(unittest.TestCase):
         root = parent / "profile"
         init_profile(root, "Work")
         return root
+
+    def test_one_immutable_config_snapshot_governs_all_maintenance_gates(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = self.make_profile(Path(temporary_directory))
+            original = maintenance_module.load_profile_config
+            snapshot = original(root)
+            reads = 0
+
+            def one_read(profile_root: Path):
+                nonlocal reads
+                reads += 1
+                if reads > 1:
+                    raise AssertionError("maintenance re-read its config snapshot")
+                return snapshot
+
+            with mock.patch.object(
+                maintenance_module, "load_profile_config", side_effect=one_read
+            ), mock.patch.object(
+                improvement_module,
+                "load_profile_config",
+                side_effect=AssertionError("improvement re-read maintenance config"),
+            ):
+                output = run_maintenance(root, now=NOW)
+
+            self.assertEqual(1, reads)
+            self.assertEqual("no_op", output["curation"]["status"])
+            self.assertEqual("curation_count", output["improvement"]["reason"])
 
     def test_maintenance_push_failure_preserves_commit_and_later_run_retries(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

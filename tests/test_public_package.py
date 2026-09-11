@@ -8,6 +8,7 @@ import plistlib
 import shlex
 import subprocess
 import sys
+import tarfile
 import tempfile
 import unittest
 
@@ -17,6 +18,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from profile_harness.packaging import (  # noqa: E402
     PACKAGED_FILES,
+    build_release_archive,
     build_local_marketplace,
 )
 
@@ -89,7 +91,7 @@ class PublicPackageTests(unittest.TestCase):
 
     def test_release_metadata_and_selector_are_consistent(self) -> None:
         manifest = json.loads((ROOT / ".codex-plugin/plugin.json").read_text())
-        self.assertEqual("0.2.0", manifest["version"])
+        self.assertEqual("0.3.0", manifest["version"])
         self.assertEqual("codex-profile-harness", manifest["name"])
         self.assertIn("MIT License", (ROOT / "LICENSE").read_text())
         self.assertIn(
@@ -106,6 +108,75 @@ class PublicPackageTests(unittest.TestCase):
             )
             self.assertEqual(manifest["version"], generated_manifest["version"])
             self.assertEqual(manifest["name"], catalog["plugins"][0]["name"])
+
+    def test_release_archive_is_reproducible_versioned_and_cleanly_smoke_tested(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            output = Path(temporary_directory)
+            first, first_checksum = build_release_archive(ROOT, output / "one")
+            second, second_checksum = build_release_archive(ROOT, output / "two")
+
+            self.assertEqual("codex-profile-harness-0.3.0.tar.gz", first.name)
+            self.assertEqual(first.read_bytes(), second.read_bytes())
+            self.assertEqual(first_checksum.read_text(), second_checksum.read_text())
+            self.assertEqual(
+                f"{__import__('hashlib').sha256(first.read_bytes()).hexdigest()}  {first.name}\n",
+                first_checksum.read_text(encoding="ascii"),
+            )
+
+            extracted = output / "extracted"
+            extracted.mkdir()
+            with tarfile.open(first, "r:gz") as archive:
+                members = archive.getmembers()
+                self.assertTrue(members)
+                self.assertTrue(all(
+                    member.name == "codex-profile-harness-0.3.0"
+                    or member.name.startswith("codex-profile-harness-0.3.0/")
+                    for member in members
+                ))
+                self.assertTrue(all(member.uid == member.gid == 0 for member in members))
+                self.assertTrue(all(member.mtime == 0 for member in members))
+                archive.extractall(extracted, filter="data")
+            release_root = extracted / "codex-profile-harness-0.3.0"
+            validated = subprocess.run(
+                [sys.executable, str(release_root / "scripts/validate_release.py"), str(release_root)],
+                text=True, capture_output=True, check=False,
+                env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+            )
+            self.assertEqual(0, validated.returncode, validated.stdout + validated.stderr)
+
+    def test_release_workflows_cover_supported_hosts_and_publish_only_on_tags(self) -> None:
+        ci = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+        release = (ROOT / ".github/workflows/release.yml").read_text(encoding="utf-8")
+        self.assertIn("ubuntu-latest", ci)
+        self.assertIn("macos-latest", ci)
+        self.assertIn("scripts/build_release.py", ci)
+        self.assertIn("tags:", release)
+        self.assertIn("v*.*.*", release)
+        self.assertIn("contents: write", release)
+        self.assertIn("scripts/validate_release.py", release)
+        self.assertIn("scripts/build_release.py", release)
+        self.assertIn("softprops/action-gh-release", release)
+        self.assertNotIn("password", release.lower())
+        self.assertNotIn("private api", release.lower())
+
+    def test_docs_define_agent_install_cli_preflight_and_legacy_upgrade(self) -> None:
+        agent = (ROOT / "INSTALL_AGENT.md").read_text(encoding="utf-8").lower()
+        combined = "\n".join(
+            (ROOT / name).read_text(encoding="utf-8").lower()
+            for name in ("README.md", "INSTALL.md", "INSTALL_AGENT.md", "SECURITY.md", "CHANGELOG.md")
+        )
+        for command in (
+            "codex --version", "codex exec --help", "codex plugin --help",
+            "codex plugin marketplace --help",
+        ):
+            self.assertIn(command, agent)
+        for phrase in (
+            "0.3.0", "automatic_apply = false", "approval_required",
+            "automatic_apply = true", "legacy markdown", "read-only",
+            "reproducible", "sha-256", "clean extraction",
+        ):
+            self.assertIn(phrase, combined, phrase)
+        self.assertIn("does not promise a universal installer", combined)
 
     def test_allowlisted_artifact_is_complete_and_clean(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

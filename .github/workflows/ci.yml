@@ -9,10 +9,11 @@ permissions:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
+        os: [ubuntu-latest, macos-latest]
         python-version: ["3.11", "3.14"]
     steps:
       - uses: actions/checkout@v4
@@ -34,6 +35,14 @@ jobs:
         env:
           PYTHONDONTWRITEBYTECODE: "1"
         run: python scripts/validate_release.py
+      - name: Reproducible release archive
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: |
+          python scripts/build_release.py --output dist-one
+          python scripts/build_release.py --output dist-two
+          cmp dist-one/codex-profile-harness-*.tar.gz dist-two/codex-profile-harness-*.tar.gz
+          cmp dist-one/codex-profile-harness-*.sha256 dist-two/codex-profile-harness-*.sha256
       - name: Artifact hygiene
         run: |
           test -z "$(find . -name '.DS_Store' -o -name '*.pyc' -o -name '*.pyo')"

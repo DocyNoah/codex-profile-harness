@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.3.0 - 2026-09-11
+
+- Add versioned improvement manifests, lifecycle auditing, deterministic
+  approval/rejection/application, and the durable Harness Control outbox.
+- Trigger improvement after a 24-hour cooldown and either 10 new curations or
+  the same validated signal in three distinct curations.
+- Add structurally constrained `auto_safe` application and opt-in exact-upstream
+  Git push with durable intent and fail-closed transport validation.
+- Add agent-assisted launchd, user-systemd, cron-fallback, and Codex Control
+  setup contracts without relying on private Codex APIs.
+- Keep one immutable configuration snapshot through each maintenance run and
+  serialize manual checkpoints with the profile lease.
+- Add reproducible release archives, SHA-256 checksums, clean-extraction smoke
+  validation, macOS/Ubuntu CI, and tag-driven GitHub releases.
+- Upgrade: `automatic_apply = false` maps to `approval_required`;
+  `automatic_apply = true` must be replaced explicitly. Legacy Markdown
+  proposals remain readable but are never applicable.
+
 ## 0.2.0 - 2026-09-11
 
 - Capture bounded transcript deltas without a model, with safe fallback.

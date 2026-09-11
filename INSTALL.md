@@ -5,7 +5,20 @@
 Recommended: ask a local Codex agent to install this release after reading
 [INSTALL_AGENT.md](INSTALL_AGENT.md). The agent inspects the actual device,
 previews every affected path, selects the native scheduler, and verifies the
-result. This document remains the shorter manual reference.
+result. The package does not promise a universal installer; `scripts/install.py`
+is an optional shared-file primitive, not an environment-wide setup program.
+This document remains the shorter manual reference.
+
+Before changing files, verify the public Codex CLI surfaces used by the harness:
+
+```sh
+codex --version
+codex exec --help
+codex plugin --help
+codex plugin marketplace --help
+```
+
+If any required command is absent, stop and update Codex before installation.
 
 The marketplace registration, plugin selector, and executable link form one
 **global shared installation**. Each profile has a separate **per-profile
@@ -176,6 +189,15 @@ profile-harness doctor
 ## Upgrade
 
 This is a global upgrade because every attached profile uses the same executable.
+For an upgrade from 0.2.x, inspect each profile's `.harness/config.toml` first.
+Legacy `automatic_apply = false` is accepted as `mode = "approval_required"`;
+replace it explicitly when convenient. Legacy `automatic_apply = true` is
+rejected: choose `approval_required`, or deliberately configure `auto_safe` with
+an exact `automatic_paths` allowlist. Legacy Markdown-only proposals remain
+read-only and cannot be approved or applied; reject them or replace them with a
+new versioned JSON proposal. Never rewrite old journals merely to silence an
+upgrade finding.
+
 Inventory all attached profiles, all schedulers, and all Harness Control tasks
 and heartbeats. Save the profile inventory and exact scheduler backup mapping in
 a private `0700` backup directory with files mode `0600`. Pause every scheduler

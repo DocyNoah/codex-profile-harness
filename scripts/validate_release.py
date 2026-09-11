@@ -14,7 +14,11 @@ import tempfile
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from profile_harness.packaging import PACKAGED_FILES, build_local_marketplace  # noqa: E402
+from profile_harness.packaging import (  # noqa: E402
+    PACKAGED_FILES,
+    RELEASE_FILES,
+    build_local_marketplace,
+)
 
 
 def require(condition: bool, message: str) -> None:
@@ -122,9 +126,22 @@ def validate_skill(path: Path) -> dict[str, str]:
 def validate_source() -> None:
     manifest = validate_manifest(ROOT / ".codex-plugin/plugin.json")
     require(manifest.get("name") == "codex-profile-harness", "invalid plugin name")
-    require(manifest.get("version") == "0.2.0", "invalid plugin version")
+    require(manifest.get("version") == "0.3.0", "invalid plugin version")
     skill = validate_skill(ROOT / "skills/profile-harness/SKILL.md")
     require(skill["name"] == "profile-harness", "invalid skill name")
+    for relative in RELEASE_FILES:
+        path = ROOT / relative
+        require(path.is_file() and not path.is_symlink(), f"missing or unsafe release file: {relative}")
+    combined = "\n".join(
+        (ROOT / name).read_text(encoding="utf-8").lower()
+        for name in ("README.md", "INSTALL.md", "INSTALL_AGENT.md", "SECURITY.md", "CHANGELOG.md")
+    )
+    for phrase in (
+        "agent-assisted", "does not promise a universal installer",
+        "automatic_apply = false", "automatic_apply = true",
+        "legacy markdown", "sha-256", "clean extraction",
+    ):
+        require(phrase in combined, f"public documentation is missing: {phrase}")
 
 
 def validate_generated() -> None:
@@ -160,6 +177,10 @@ def validate_generated() -> None:
 
 
 def main() -> int:
+    if len(sys.argv) > 2:
+        raise ValueError("usage: validate_release.py [RELEASE_ROOT]")
+    if len(sys.argv) == 2 and Path(sys.argv[1]).expanduser().resolve() != ROOT:
+        raise ValueError("validator must execute from the release root it validates")
     validate_source()
     validate_generated()
     print("release validation: ok")

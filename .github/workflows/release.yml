@@ -1,0 +1,51 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+jobs:
+  validate:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Validate tag and release
+        shell: bash
+        run: |
+          test "${GITHUB_REF_NAME}" = "v$(python -c 'import json; print(json.load(open(".codex-plugin/plugin.json"))["version"])')"
+          python -m unittest discover -s tests -v
+          python scripts/validate_release.py .
+      - name: Build reproducible archive
+        if: matrix.os == 'ubuntu-latest'
+        run: python scripts/build_release.py --output dist
+      - uses: actions/upload-artifact@v4
+        if: matrix.os == 'ubuntu-latest'
+        with:
+          name: release-artifacts
+          path: dist/*
+
+  publish:
+    needs: validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-artifacts
+          path: dist
+      - name: Publish immutable tag artifacts
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          fail_on_unmatched_files: true
+          generate_release_notes: true

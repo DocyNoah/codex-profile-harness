@@ -10,10 +10,13 @@ keeps managed profile documents in automatic local Git history.
 
 Requirements: macOS or Linux, Python 3.11+, Git, and an installed/authenticated
 Codex CLI. Clone [this repository](https://github.com/DocyNoah/codex-profile-harness),
-then ask a local Codex agent to read [INSTALL_AGENT.md](INSTALL_AGENT.md) and
-install it. The agent previews the affected paths, selects launchd or user
-systemd (cron only as fallback), and verifies actual scheduler evidence. For a
-manual plugin/CLI install, inspect `hooks/hooks.json`, then run:
+then ask a local Codex agent: **“Read `INSTALL_AGENT.md`, show the installation
+preview, install this harness, and verify it.”** The repository deliberately
+does not promise a universal installer. The agent inspects the real machine,
+selects launchd or user systemd (cron only as fallback), and verifies actual
+scheduler evidence. The bundled installer is only an optional, bounded primitive
+for the shared plugin/CLI files. For a manual plugin/CLI install, inspect
+`hooks/hooks.json`, then run:
 
 ```sh
 python3 scripts/install.py
@@ -181,3 +184,15 @@ and recovery resume every attachment that was active before the operation.
 Profiles and their local history are preserved. Released under
 the [MIT License](LICENSE); changes are listed in [CHANGELOG.md](CHANGELOG.md),
 and contributions follow [CONTRIBUTING.md](CONTRIBUTING.md).
+
+## Release verification
+
+Version 0.3.0 archives are reproducible and accompanied by a SHA-256 checksum.
+After verifying the checksum, extract into a new directory and run the clean
+extraction validator:
+
+```sh
+python3 scripts/validate_release.py .
+```
+
+Release archives are built with `python3 scripts/build_release.py --output dist`.

@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -15,6 +16,109 @@ CLI = [sys.executable, str(ROOT / "bin/profile-harness")]
 
 
 class EndToEndTests(unittest.TestCase):
+    def test_disposable_profile_reaches_approved_apply_and_isolated_push(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            parent = Path(temporary_directory)
+            profile = parent / "profile"
+            self.assertEqual(0, self.run_cli(parent, "init", str(profile), "--name", "Release").returncode)
+            sys.path.insert(0, str(ROOT / "src"))
+            from profile_harness.capture import capture_event
+            from profile_harness.curation import apply_actions, prepare_curation
+            from profile_harness.control import ControlOutbox
+            from profile_harness.improvement import run_improvement
+            from profile_harness.application import apply_proposal
+            import profile_harness.improvement as improvement_module
+            import profile_harness.profile_git as profile_git_module
+
+            branch = subprocess.run(
+                ["git", "-C", str(profile), "symbolic-ref", "--short", "HEAD"],
+                text=True, capture_output=True, check=True,
+            ).stdout.strip()
+            subprocess.run(
+                ["git", "-C", str(profile), "remote", "add", "origin", "https://example.invalid/profile.git"],
+                check=True,
+            )
+            subprocess.run(["git", "-C", str(profile), "config", f"branch.{branch}.remote", "origin"], check=True)
+            subprocess.run(["git", "-C", str(profile), "config", f"branch.{branch}.merge", f"refs/heads/{branch}"], check=True)
+            config = profile / ".harness/config.toml"
+            config.write_text(
+                config.read_text(encoding="utf-8")
+                + f'\n[git]\nauto_push = true\nupstream = "origin/{branch}"\nprivate_data_acknowledged = true\n',
+                encoding="utf-8",
+            )
+
+            for index in range(3):
+                captured = capture_event({
+                    "hook_event_name": "Stop", "session_id": f"session-{index}",
+                    "turn_id": f"turn-{index}", "cwd": str(profile),
+                    "last_assistant_message": f"signal evidence {index}",
+                })
+                self.assertTrue(captured.success)
+                batch = prepare_curation(profile, 1)
+                apply_actions(profile, batch.batch_id, {
+                    "actions": [],
+                    "signals": [{
+                        "signal_id": "repeat.release-signal",
+                        "summary": "The same bounded improvement is repeatedly useful.",
+                        "source_receipt_ids": list(batch.receipt_ids),
+                    }],
+                })
+
+            context = profile / "CONTEXT.md"
+            expected = hashlib.sha256(context.read_bytes()).hexdigest()
+
+            def write_improvement(_root, _prompt, output, **_kwargs):
+                journal = profile / ".harness/memory/journal/curation.jsonl"
+                source = json.loads(journal.read_text(encoding="utf-8").splitlines()[-1])["entry_hash"]
+                output.write_text(json.dumps({"proposals": [{
+                    "title": "Release integration", "rationale": "Repeated evidence",
+                    "risk_level": "low", "source_journal_hashes": [source],
+                    "replacements": [{
+                        "path": "CONTEXT.md", "expected_old_sha256": expected,
+                        "content": "# Context\n\nRelease integration applied.\n",
+                    }],
+                }]}), encoding="utf-8")
+                return output
+
+            class IsolatedTransport:
+                refs: dict[str, str] = {}
+
+                def __init__(self, _root, _url):
+                    pass
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *_args):
+                    return None
+
+                def git(self, *arguments, **_kwargs):
+                    if arguments[0] == "ls-remote":
+                        body = "".join(f"{sha}\t{ref}\n" for ref, sha in sorted(self.refs.items()))
+                        return subprocess.CompletedProcess(arguments, 0, body, "")
+                    if arguments[0] == "push":
+                        source, target = arguments[-1].split(":", 1)
+                        self.refs[target] = source
+                        return subprocess.CompletedProcess(arguments, 0, "ok\n", "")
+                    if arguments[0] in {"fetch", "merge-base"}:
+                        return subprocess.CompletedProcess(arguments, 0, "", "")
+                    raise AssertionError(f"unexpected isolated transport call: {arguments}")
+
+            with mock.patch.object(improvement_module, "run_codex", side_effect=write_improvement), mock.patch.object(
+                profile_git_module, "_NetworkGitSession", IsolatedTransport
+            ):
+                improved = run_improvement(profile, now=datetime(2026, 9, 11, 12, tzinfo=timezone.utc))
+                proposal_id = Path(improved["proposals"][0]).stem
+                delivery = ControlOutbox(profile).poll()[0]
+                self.assertEqual(proposal_id, delivery["subject_id"])
+                applied = apply_proposal(profile, proposal_id, approve=True)
+
+            self.assertEqual("applied", applied["status"])
+            self.assertTrue(applied["push"]["pushed"])
+            self.assertEqual("# Context\n\nRelease integration applied.\n", context.read_text(encoding="utf-8"))
+            self.assertFalse((profile / ".harness/state/profile-git-push-intent.json").exists())
+            self.assertIn(f"refs/heads/{branch}", IsolatedTransport.refs)
+
     def test_proposal_cli_lists_shows_approves_applies_and_retries(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             parent = Path(temporary_directory)

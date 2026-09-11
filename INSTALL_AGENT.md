@@ -6,6 +6,10 @@ verifies the actual device. Stop before any target not listed here. Never bypass
 hook trust, follow a symlinked destination, replace an ambiguous scheduler, or
 enable Git push without explicit privacy acknowledgement.
 
+The package does not promise a universal installer. `scripts/install.py` is an
+optional bounded primitive for shared files and Codex plugin registration; this
+contract—not that script—governs scheduler and Harness Control setup.
+
 There are two independent scopes:
 
 - **Global shared installation**: one marketplace registration, one plugin
@@ -23,6 +27,16 @@ Confirm macOS or Linux, Python 3.11+, Git, an authenticated Codex CLI, and the
 target canonical profile directory. Inspect `.codex-plugin/plugin.json`,
 `hooks/hooks.json`, all existing Harness registrations, the executable link,
 the profile, scheduler artifacts, cron markers, and Harness Control tasks.
+Before any mutation, run and inspect these public capability checks:
+
+```sh
+codex --version
+codex exec --help
+codex plugin --help
+codex plugin marketplace --help
+```
+
+Stop if `exec`, plugin installation, or marketplace registration is unavailable.
 
 Build a fail-closed **profile inventory** of all attached profiles before any
 global operation. Enumerate installed launchd labels/plists, systemd service and
@@ -324,6 +338,11 @@ an unrendered template is never installation evidence.
 ## 7. Global upgrade and completed-upgrade rollback
 
 Global upgrade affects the shared executable used by all attached profiles.
+When upgrading from 0.2.x, legacy `automatic_apply = false` is compatible with
+`mode = "approval_required"` and should be made explicit. Reject
+`automatic_apply = true` until the user chooses `approval_required` or supplies
+the exact allowlist required by `auto_safe`. Legacy Markdown proposals are
+read-only: preserve them for audit, but never approve or apply them.
 First inventory all attached profiles, all schedulers, and all Harness Control
 tasks/heartbeats. Using the exact platform commands in section 4 and supported
 Codex app actions, pause every scheduler and every heartbeat. Verify every one is

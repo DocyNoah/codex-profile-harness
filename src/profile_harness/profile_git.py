@@ -773,7 +773,7 @@ def checkpoint_profile(root: Path, subject: str = CHECKPOINT_SUBJECT) -> Checkpo
         finally:
             if lease is not None:
                 lease.release()
-    except (OSError, ValueError, ProfileGitError) as error:
+    except (OSError, ValueError, ProfileGitError, LeaseBusyError) as error:
         return CheckpointResult(False, error=str(error))
 
 

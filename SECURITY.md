@@ -18,9 +18,11 @@
   Their stdin/output/time are bounded; timeout, interruption, or output overflow
   sends TERM and then KILL to the complete process group and closes/reaps the
   direct child before rollback or lock release.
-- Improvement is proposal-only. Applying a proposal requires user approval.
-  Identity, user policy, context, and mandatory instructions are outside model
-  write targets.
+- Improvement output is always an untrusted, versioned proposal. The default
+  `approval_required` mode needs user approval. `proposal_only` never applies;
+  `auto_safe` applies only exact user-allowlisted, structurally bounded targets.
+  `AGENTS.md`, `IDENTITY.md`, `USER.md`, executables, hooks, scheduler files, Git
+  configuration, and remotes always require explicit approval.
 
 Redaction is defense in depth, not a secret scanner. User or assistant text may
 contain confidential material that patterns miss. Do not put API keys in profile
@@ -51,7 +53,12 @@ registry/config, curated semantic/procedural memory, journals, and improvement
 state. Runtime receipts, processing/archive/state/log directories,
 `DASHBOARD.md`, and nested repositories are ignored. Harness checkpoint commands
 disable Git hooks and hostile repository environment variables at their own
-boundary; normal Git usage is unaffected. There is no automatic push.
+boundary; normal Git usage is unaffected. Automatic push is disabled by default.
+Opt-in requires an explicit private-data acknowledgement and exact upstream. It
+refuses local/file and `ext::` transports, repository SSH commands, interactive
+authentication, non-fast-forward updates, detached HEAD, hooks, filters, and
+force push. A durable intent binds the exact checkpoint before transport;
+failure keeps the local commit and emits a control event.
 Scheduled maintenance first acquires the profile lease and validates pending
 checkpoint metadata read-only, before WAL recovery or Git mutation. Malformed or
 unknown metadata aborts with the diagnostic and WAL untouched. Valid metadata is
@@ -80,6 +87,11 @@ Run `profile-harness doctor` after install, upgrade, restore, crashes, or suspec
 tampering. Do not edit receipts, journal entries, or transaction descriptors to
 silence a finding. Recover with the harness where safe or restore an independently
 verified backup.
+
+Version 0.3.0 release archives use deterministic order, timestamps, ownership,
+and permissions and ship a SHA-256 checksum. Reproducibility detects accidental
+packaging drift; it does not replace review of the source and hook. Validate a
+clean extraction before installation.
 
 ## Reporting vulnerabilities
 

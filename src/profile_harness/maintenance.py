@@ -7,7 +7,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from .config import DEFAULT_STALE_TIMEOUT_SECONDS, HarnessConfig, load_profile_config
+from .config import (
+    DEFAULT_STALE_TIMEOUT_SECONDS,
+    CurationConfig,
+    HarnessConfig,
+    load_profile_config,
+)
 from .curation import (
     _valid_receipt,
     apply_actions,
@@ -49,27 +54,34 @@ def _receipt_times(root: Path) -> list[datetime]:
     return times
 
 
-def maintenance_due(root: Path, *, now: datetime | None = None) -> MaintenanceDue:
+def maintenance_due(
+    root: Path,
+    *,
+    now: datetime | None = None,
+    config: CurationConfig | None = None,
+) -> MaintenanceDue:
     """Calculate curation eligibility without creating any state."""
     profile_root = Path(root).resolve()
-    config = load_profile_config(profile_root).curation
+    curation_config = config or load_profile_config(profile_root).curation
     current = _utc_now(now)
     times = _receipt_times(profile_root)
     count = len(times)
     oldest = min(times) if times else None
     age = max(0.0, (current - oldest).total_seconds()) if oldest else 0.0
-    if count >= config.maintenance_receipt_threshold:
+    if count >= curation_config.maintenance_receipt_threshold:
         return MaintenanceDue(True, "receipt_count", count, oldest, 0.0)
-    if oldest is not None and age >= config.maintenance_max_age_seconds:
+    if oldest is not None and age >= curation_config.maintenance_max_age_seconds:
         return MaintenanceDue(True, "oldest_receipt_age", count, oldest, 0.0)
-    remaining = None if oldest is None else max(0.0, config.maintenance_max_age_seconds - age)
+    remaining = None if oldest is None else max(
+        0.0, curation_config.maintenance_max_age_seconds - age
+    )
     return MaintenanceDue(False, None, count, oldest, remaining)
 
 
 def _run_maintenance_locked(
     profile_root: Path, config: HarnessConfig, current: datetime
 ) -> dict[str, Any]:
-    due = maintenance_due(profile_root, now=current)
+    due = maintenance_due(profile_root, now=current, config=config.curation)
     if not due.curation_due:
         curation = {
             "status": "no_op",
@@ -108,7 +120,9 @@ def _run_maintenance_locked(
                 "checkpoint_sha": applied.checkpoint_sha,
                 "checkpoint_error": applied.checkpoint_error,
             }
-    improvement = _run_improvement_locked(profile_root, now=current, force=False)
+    improvement = _run_improvement_locked(
+        profile_root, now=current, force=False, config=config
+    )
     return {
         "curation": curation,
         "improvement": improvement,

@@ -12,7 +12,7 @@ import re
 from typing import Any
 import uuid
 
-from .config import PLUGIN_ROOT, load_profile_config
+from .config import HarnessConfig, ImprovementConfig, PLUGIN_ROOT, load_profile_config
 from .fs import atomic_copy_file, atomic_write_text, exclusive_write_text, fsync_directory, require_safe_path
 from .curation import successful_curation_entries
 from .journal import append_entry, verify_journal
@@ -83,10 +83,15 @@ def _safe_journal(root: Path, relative: str) -> Path:
         raise ImprovementError(str(error)) from error
 
 
-def improvement_due(root: Path, *, now: datetime | None = None) -> ImprovementDue:
+def improvement_due(
+    root: Path,
+    *,
+    now: datetime | None = None,
+    config: ImprovementConfig | None = None,
+) -> ImprovementDue:
     """Compute improvement eligibility from verified journals only."""
     profile_root = Path(root).resolve()
-    config = load_profile_config(profile_root).improvement
+    improvement_config = config or load_profile_config(profile_root).improvement
     current = _now(now)
     curation_journal = _safe_journal(profile_root, _CURATION_JOURNAL)
     improvement_journal = _safe_journal(profile_root, _IMPROVEMENT_JOURNAL)
@@ -98,7 +103,7 @@ def improvement_due(root: Path, *, now: datetime | None = None) -> ImprovementDu
         improvements = successful_improvement_entries(improvement_journal)
     except ValueError as error:
         raise ImprovementError(f"invalid improvement journal: {error}") from error
-    if not config.enabled:
+    if not improvement_config.enabled:
         return ImprovementDue(False, "disabled", 0, (), 0.0, None)
     last = improvements[-1] if improvements else None
     start = 0
@@ -112,11 +117,11 @@ def improvement_due(root: Path, *, now: datetime | None = None) -> ImprovementDu
     hashes = tuple(entry["entry_hash"] for entry in new[-MAX_SOURCE_HASHES:])
     last_at = _timestamp(last.get("applied_at"), "improvement.applied_at") if last else None
     cooldown_remaining = 0.0 if last_at is None else max(
-        0.0, config.cooldown_seconds - (current - last_at).total_seconds()
+        0.0, improvement_config.cooldown_seconds - (current - last_at).total_seconds()
     )
     if cooldown_remaining > 0:
         return ImprovementDue(False, "cooldown", len(new), hashes, cooldown_remaining, None)
-    if len(new) >= config.high_threshold:
+    if len(new) >= improvement_config.high_threshold:
         return ImprovementDue(True, "high_threshold", len(new), hashes, 0.0, None)
     signal_counts: dict[str, int] = {}
     for entry in new:
@@ -570,11 +575,11 @@ def recover_improvement_transaction(root: Path, *, checkpoint: bool = True) -> b
 
 def _run_locked(
     root: Path, *, now: datetime, force: bool, fail_after_writes: int | None = None,
-    crash_after_stage: str | None = None,
+    crash_after_stage: str | None = None, config: HarnessConfig | None = None,
 ) -> dict[str, Any]:
     recover_improvement_transaction(root)
-    config = load_profile_config(root)
-    due = improvement_due(root, now=now)
+    run_config = config or load_profile_config(root)
+    due = improvement_due(root, now=now, config=run_config.improvement)
     if due.reason == "disabled":
         return {
             "status": "no_op", "reason": "disabled", "new_curations": 0,
@@ -608,11 +613,11 @@ def _run_locked(
     try:
         run_codex(
             root, prompt_path, result_path,
-            command=config.curation.codex_command,
-            model=config.improvement.model,
-            reasoning_effort=config.improvement.reasoning_effort,
+            command=run_config.curation.codex_command,
+            model=run_config.improvement.model,
+            reasoning_effort=run_config.improvement.reasoning_effort,
             schema_path=IMPROVEMENT_SCHEMA,
-            timeout=config.curation.codex_timeout_seconds,
+            timeout=run_config.curation.codex_timeout_seconds,
         )
         result = _load_result(result_path)
         proposals = _validate_result(root, result, source_set)
@@ -665,7 +670,7 @@ def _run_locked(
                     "source_journal_hashes": proposal["source_journal_hashes"],
                     "replacements": proposal["replacements"],
                     "base_commit": base_commit,
-                    "policy": _policy_decision(config.improvement, proposal["replacements"]),
+                    "policy": _policy_decision(run_config.improvement, proposal["replacements"]),
                 }
                 try:
                     validate_manifest(root, manifest, verify_current=True)
@@ -706,8 +711,8 @@ def _run_locked(
             entry = append_entry(journal, {
                 "event": "improvement",
                 "transaction_id": transaction_id,
-                "model": config.improvement.model,
-                "reasoning_effort": config.improvement.reasoning_effort,
+                "model": run_config.improvement.model,
+                "reasoning_effort": run_config.improvement.reasoning_effort,
                 "source_journal_hashes": list(due.source_journal_hashes),
                 "curation_head_hash": due.source_journal_hashes[-1],
                 "result_digest": _digest(result),
@@ -754,6 +759,7 @@ def run_improvement(
         result = _run_locked(
             profile_root, now=current, force=force,
             fail_after_writes=fail_after_writes, crash_after_stage=crash_after_stage,
+            config=config,
         )
     from .profile_git import CheckpointResult, auto_push_checkpoint
 

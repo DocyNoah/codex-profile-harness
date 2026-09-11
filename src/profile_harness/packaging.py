@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 import json
+import gzip
+import hashlib
+import io
 import os
 from pathlib import Path
 import shutil
+import tarfile
 import tempfile
 
 
@@ -68,6 +72,87 @@ PACKAGED_FILES = (
     "templates/repo/STATUS.md",
     "templates/repo/TASKS.md",
 )
+
+RELEASE_FILES = tuple(sorted(set(PACKAGED_FILES) | {
+    "CONTRIBUTING.md",
+    "docs/architecture.md",
+    "scripts/build_release.py",
+}))
+RELEASE_EXECUTABLES = frozenset({
+    "bin/profile-harness",
+    "scripts/build_local_marketplace.py",
+    "scripts/build_release.py",
+    "scripts/install.py",
+    "scripts/validate_release.py",
+})
+
+
+def package_version(source: Path) -> str:
+    """Read the release version from the validated package manifest."""
+    manifest = Path(source).resolve() / ".codex-plugin/plugin.json"
+    try:
+        value = json.loads(manifest.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise ValueError("release manifest is unreadable") from error
+    version = value.get("version") if isinstance(value, dict) else None
+    if not isinstance(version, str) or not version:
+        raise ValueError("release manifest version is invalid")
+    return version
+
+
+def build_release_archive(source: Path, output: Path) -> tuple[Path, Path]:
+    """Build a byte-reproducible versioned source archive and SHA-256 file."""
+    source_root = Path(source).expanduser().resolve()
+    output_root = Path(output).expanduser().resolve()
+    output_root.mkdir(parents=True, exist_ok=True)
+    version = package_version(source_root)
+    base = f"{PLUGIN_NAME}-{version}"
+    archive_path = output_root / f"{base}.tar.gz"
+    checksum_path = output_root / f"{archive_path.name}.sha256"
+    temporary = output_root / f".{archive_path.name}.tmp"
+    try:
+        with temporary.open("wb") as raw:
+            with gzip.GzipFile(filename="", mode="wb", fileobj=raw, mtime=0) as compressed:
+                with tarfile.open(fileobj=compressed, mode="w", format=tarfile.GNU_FORMAT) as archive:
+                    directories = {base}
+                    for relative in RELEASE_FILES:
+                        source_path = source_root / relative
+                        if not source_path.is_file() or source_path.is_symlink():
+                            raise ValueError(f"required release file is missing or unsafe: {relative}")
+                        resolved = source_path.resolve()
+                        try:
+                            resolved.relative_to(source_root)
+                        except ValueError as error:
+                            raise ValueError(f"release file escapes source root: {relative}") from error
+                        parts = Path(relative).parts
+                        for index in range(1, len(parts)):
+                            directories.add(f"{base}/{'/'.join(parts[:index])}")
+                    for directory in sorted(directories):
+                        info = tarfile.TarInfo(directory)
+                        info.type = tarfile.DIRTYPE
+                        info.mode = 0o755
+                        info.uid = info.gid = 0
+                        info.uname = info.gname = "root"
+                        info.mtime = 0
+                        archive.addfile(info)
+                    for relative in RELEASE_FILES:
+                        source_path = source_root / relative
+                        payload = source_path.read_bytes()
+                        info = tarfile.TarInfo(f"{base}/{relative}")
+                        info.size = len(payload)
+                        info.mode = 0o755 if relative in RELEASE_EXECUTABLES else 0o644
+                        info.uid = info.gid = 0
+                        info.uname = info.gname = "root"
+                        info.mtime = 0
+                        archive.addfile(info, io.BytesIO(payload))
+            raw.flush()
+            os.fsync(raw.fileno())
+        os.replace(temporary, archive_path)
+        digest = hashlib.sha256(archive_path.read_bytes()).hexdigest()
+        checksum_path.write_text(f"{digest}  {archive_path.name}\n", encoding="ascii")
+    finally:
+        temporary.unlink(missing_ok=True)
+    return archive_path, checksum_path
 
 
 def _marketplace() -> dict:
