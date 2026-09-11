@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import plistlib
 import shlex
+import shutil
 import subprocess
 import sys
 import tarfile
@@ -20,6 +21,7 @@ from profile_harness.packaging import (  # noqa: E402
     PACKAGED_FILES,
     build_release_archive,
     build_local_marketplace,
+    package_version,
 )
 
 
@@ -144,6 +146,86 @@ class PublicPackageTests(unittest.TestCase):
             )
             self.assertEqual(0, validated.returncode, validated.stdout + validated.stderr)
 
+    def test_release_version_is_strict_semver_and_cannot_escape_output(self) -> None:
+        valid = (
+            "0.3.0", "1.2.3-alpha.1", "1.2.3+build.5",
+            "1.2.3-alpha.1+build.5",
+        )
+        invalid = (
+            "", "1", "1.2", "01.2.3", "1.02.3", "1.2.03",
+            "1.2.3-", "1.2.3+", "1.2.3-alpha_1", "1.2.3/../../escape",
+            "../1.2.3", "1.2.3\nname", "１.２.３",
+        )
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            manifest = root / ".codex-plugin/plugin.json"
+            manifest.parent.mkdir()
+            for version in valid:
+                with self.subTest(valid=version):
+                    manifest.write_text(json.dumps({"version": version}), encoding="utf-8")
+                    self.assertEqual(version, package_version(root))
+            for version in invalid:
+                with self.subTest(invalid=version):
+                    manifest.write_text(json.dumps({"version": version}), encoding="utf-8")
+                    with self.assertRaisesRegex(ValueError, "version"):
+                        build_release_archive(root, root / "dist")
+            self.assertFalse((root / "escape.tar.gz").exists())
+
+    def test_release_builder_rejects_symlinked_roots_ancestors_and_outputs(self) -> None:
+        if not hasattr(os, "symlink"):
+            self.skipTest("symlinks unavailable")
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            parent = Path(temporary_directory)
+            source_alias = parent / "source-alias"
+            source_alias.symlink_to(ROOT, target_is_directory=True)
+            with self.assertRaisesRegex(ValueError, "symlink"):
+                build_release_archive(source_alias, parent / "out")
+            with self.assertRaisesRegex(ValueError, "symlink"):
+                build_local_marketplace(source_alias, parent / "marketplace")
+
+            copied = parent / "source"
+            shutil.copytree(ROOT, copied, ignore=shutil.ignore_patterns(".git", "__pycache__"))
+            shutil.rmtree(copied / "schemas")
+            (copied / "schemas").symlink_to(ROOT / "schemas", target_is_directory=True)
+            with self.assertRaisesRegex(ValueError, "symlink"):
+                build_release_archive(copied, parent / "out-two")
+            with self.assertRaisesRegex(ValueError, "symlink"):
+                build_local_marketplace(copied, parent / "marketplace-two")
+
+            real_output = parent / "real-output"
+            real_output.mkdir()
+            output_alias = parent / "output-alias"
+            output_alias.symlink_to(real_output, target_is_directory=True)
+            with self.assertRaisesRegex(ValueError, "symlink"):
+                build_release_archive(ROOT, output_alias)
+            with self.assertRaisesRegex(ValueError, "symlink"):
+                build_release_archive(ROOT, output_alias / "nested")
+            self.assertEqual([], list(real_output.iterdir()))
+
+    def test_release_builder_rejects_unsafe_final_targets_and_ignores_predictable_temp_symlink(self) -> None:
+        if not hasattr(os, "symlink"):
+            self.skipTest("symlinks unavailable")
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            output = Path(temporary_directory)
+            victim = output / "victim"
+            victim.write_text("unchanged", encoding="utf-8")
+            predictable = output / ".codex-profile-harness-0.3.0.tar.gz.tmp"
+            predictable.symlink_to(victim)
+
+            archive, checksum = build_release_archive(ROOT, output)
+
+            self.assertEqual("unchanged", victim.read_text(encoding="utf-8"))
+            self.assertTrue(predictable.is_symlink())
+            archive.unlink()
+            archive.symlink_to(victim)
+            with self.assertRaisesRegex(ValueError, "archive"):
+                build_release_archive(ROOT, output)
+            archive.unlink()
+            checksum.unlink()
+            checksum.mkdir()
+            with self.assertRaisesRegex(ValueError, "checksum"):
+                build_release_archive(ROOT, output)
+
     def test_release_workflows_cover_supported_hosts_and_publish_only_on_tags(self) -> None:
         ci = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
         release = (ROOT / ".github/workflows/release.yml").read_text(encoding="utf-8")
@@ -152,12 +234,42 @@ class PublicPackageTests(unittest.TestCase):
         self.assertIn("scripts/build_release.py", ci)
         self.assertIn("tags:", release)
         self.assertIn("v*.*.*", release)
-        self.assertIn("contents: write", release)
+        self.assertRegex(release, r"(?m)^permissions:\n  contents: read$")
+        publish = release.split("\n  publish:\n", 1)[1]
+        validate = release.split("\n  validate:\n", 1)[1].split("\n  publish:\n", 1)[0]
+        self.assertIn("permissions:\n      contents: write", publish)
+        self.assertNotIn("contents: write", validate)
         self.assertIn("scripts/validate_release.py", release)
         self.assertIn("scripts/build_release.py", release)
-        self.assertIn("softprops/action-gh-release", release)
+        self.assertNotIn("softprops/action-gh-release", release)
+        self.assertIn("gh release create", publish)
+        self.assertIn("GH_TOKEN: ${{ github.token }}", publish)
         self.assertNotIn("password", release.lower())
         self.assertNotIn("private api", release.lower())
+
+        validator = self.load_script("profile_harness_release_workflow_validator", "validate_release.py")
+        validator.validate_release_workflow(ROOT / ".github/workflows/release.yml")
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            unsafe = Path(temporary_directory) / "release.yml"
+            unsafe.write_text(release.replace("contents: read", "contents: write", 1), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "top-level"):
+                validator.validate_release_workflow(unsafe)
+            unsafe.write_text(release.replace("gh release create", "uses: vendor/mutable@main #"), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "GitHub CLI"):
+                validator.validate_release_workflow(unsafe)
+
+    def test_packaged_agent_policies_match_runtime_modes_and_push_authority(self) -> None:
+        skill = (ROOT / "skills/profile-harness/SKILL.md").read_text(encoding="utf-8").lower()
+        agents = (ROOT / "templates/profile/AGENTS.md").read_text(encoding="utf-8").lower()
+        combined = skill + "\n" + agents
+        for phrase in (
+            "approval_required", "proposal_only", "auto_safe",
+            "runtime configuration", "deterministic local policy",
+            "never infer permission", "private_data_acknowledged",
+            "exact upstream", "harness engine", "manual push",
+            "explicitly requests",
+        ):
+            self.assertIn(phrase, combined, phrase)
 
     def test_docs_define_agent_install_cli_preflight_and_legacy_upgrade(self) -> None:
         agent = (ROOT / "INSTALL_AGENT.md").read_text(encoding="utf-8").lower()

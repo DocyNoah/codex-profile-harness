@@ -18,9 +18,14 @@ doing the user's work. Curation only reconciles missed, duplicate, or conflictin
 state from captured evidence; it is not a second project-management workflow.
 Preserve the authority boundaries in the profile and repository `AGENTS.md` files.
 
-Improvement is proposal-only. Never apply a file under
-`.harness/improvements/proposed/` without explicit user approval, and never let
-curation or improvement rewrite identity, user policy, or mandatory instructions.
+Improvement defaults to `approval_required`, where explicit user approval is
+required before application. `proposal_only` (proposal-only mode) retains proposals;
+`auto_safe` may apply only when runtime configuration contains the exact target
+and the harness engine's deterministic local policy accepts every structural
+limit. An agent never infers permission, changes these modes, or treats a model's
+risk label as authority. Identity, user policy, mandatory instructions,
+executables, hooks, scheduler files, and Git configuration always remain outside
+automatic application.
 
 Run `profile-harness --help` and the relevant subcommand help before operating
 the harness. Capture hooks only durably record receipt/cursor evidence and never
@@ -33,4 +38,10 @@ validates pending checkpoint metadata read-only, then recovers abandoned WAL
 with recovery checkpoints suppressed. Commit once using the validated pending
 subject first, otherwise the recovery subject if a WAL was recovered, otherwise
 the generic subject. Stop on validation or checkpoint error before config, due
-work, mutation, or model execution. The harness never pushes.
+work, mutation, or model execution.
+
+`auto_push` is disabled unless runtime configuration records
+`private_data_acknowledged = true` and one exact upstream. Only the harness
+engine may execute that bounded push path. The agent must not perform a manual
+push or change Git remotes unless the user explicitly requests that separate
+action.

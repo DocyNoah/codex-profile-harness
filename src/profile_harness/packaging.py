@@ -8,7 +8,9 @@ import hashlib
 import io
 import os
 from pathlib import Path
+import re
 import shutil
+import stat
 import tarfile
 import tempfile
 
@@ -74,6 +76,8 @@ PACKAGED_FILES = (
 )
 
 RELEASE_FILES = tuple(sorted(set(PACKAGED_FILES) | {
+    ".github/workflows/ci.yml",
+    ".github/workflows/release.yml",
     "CONTRIBUTING.md",
     "docs/architecture.md",
     "scripts/build_release.py",
@@ -85,45 +89,140 @@ RELEASE_EXECUTABLES = frozenset({
     "scripts/install.py",
     "scripts/validate_release.py",
 })
+_SEMVER = re.compile(
+    r"(?:0|[1-9][0-9]*)\."
+    r"(?:0|[1-9][0-9]*)\."
+    r"(?:0|[1-9][0-9]*)"
+    r"(?:-(?:(?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)"
+    r"(?:\.(?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*))?"
+    r"(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?",
+    re.ASCII,
+)
+_PLATFORM_DIRECTORY_ALIASES = {
+    Path("/var"): Path("/private/var"),
+    Path("/tmp"): Path("/private/tmp"),
+}
+
+
+def _absolute(path: Path) -> Path:
+    return Path(os.path.abspath(os.fspath(Path(path).expanduser())))
+
+
+def _validate_components(
+    path: Path, *, label: str, final_kind: str | None, allow_missing: bool = False
+) -> Path:
+    """Validate with lstat so resolving cannot hide a symlink component."""
+    candidate = _absolute(path)
+    current = Path(candidate.anchor)
+    parts = candidate.parts[1:] if candidate.anchor else candidate.parts
+    for index, component in enumerate(parts):
+        current = current / component
+        final = index == len(parts) - 1
+        try:
+            metadata = current.lstat()
+        except FileNotFoundError:
+            if allow_missing:
+                return candidate
+            raise ValueError(f"{label} is missing: {current}") from None
+        if stat.S_ISLNK(metadata.st_mode):
+            allowed_target = _PLATFORM_DIRECTORY_ALIASES.get(current)
+            if allowed_target is None or current.resolve() != allowed_target:
+                raise ValueError(f"{label} has a symlink component: {current}")
+            continue
+        expected = final_kind if final else "directory"
+        if expected == "directory" and not stat.S_ISDIR(metadata.st_mode):
+            raise ValueError(f"{label} has a non-directory component: {current}")
+        if expected == "file" and not stat.S_ISREG(metadata.st_mode):
+            raise ValueError(f"{label} is not a regular file: {current}")
+    return candidate
+
+
+def _prepare_output_root(output: Path) -> Path:
+    output_root = _validate_components(
+        output, label="release output", final_kind="directory", allow_missing=True
+    )
+    output_root.mkdir(parents=True, exist_ok=True)
+    return _validate_components(
+        output_root, label="release output", final_kind="directory"
+    )
+
+
+def _reject_unsafe_final(path: Path, label: str) -> None:
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        return
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+        raise ValueError(f"existing {label} target is unsafe")
+
+
+def _fsync_directory(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _source_file(source_root: Path, relative: str, *, release: bool) -> Path:
+    label = "release" if release else "package"
+    source_path = _validate_components(
+        source_root / relative,
+        label=f"required {label} file {relative}",
+        final_kind="file",
+    )
+    try:
+        source_path.resolve(strict=True).relative_to(source_root.resolve(strict=True))
+    except (OSError, ValueError) as error:
+        raise ValueError(f"required {label} file escapes the source root: {relative}") from error
+    return source_path
 
 
 def package_version(source: Path) -> str:
     """Read the release version from the validated package manifest."""
-    manifest = Path(source).resolve() / ".codex-plugin/plugin.json"
+    source_root = _validate_components(
+        source, label="release source", final_kind="directory"
+    )
+    manifest = _validate_components(
+        source_root / ".codex-plugin/plugin.json",
+        label="release manifest",
+        final_kind="file",
+    )
     try:
         value = json.loads(manifest.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError) as error:
         raise ValueError("release manifest is unreadable") from error
     version = value.get("version") if isinstance(value, dict) else None
-    if not isinstance(version, str) or not version:
+    if not isinstance(version, str) or _SEMVER.fullmatch(version) is None:
         raise ValueError("release manifest version is invalid")
     return version
 
 
 def build_release_archive(source: Path, output: Path) -> tuple[Path, Path]:
     """Build a byte-reproducible versioned source archive and SHA-256 file."""
-    source_root = Path(source).expanduser().resolve()
-    output_root = Path(output).expanduser().resolve()
-    output_root.mkdir(parents=True, exist_ok=True)
+    source_root = _validate_components(
+        source, label="release source", final_kind="directory"
+    )
+    output_root = _prepare_output_root(output)
     version = package_version(source_root)
     base = f"{PLUGIN_NAME}-{version}"
     archive_path = output_root / f"{base}.tar.gz"
     checksum_path = output_root / f"{archive_path.name}.sha256"
-    temporary = output_root / f".{archive_path.name}.tmp"
+    _reject_unsafe_final(archive_path, "archive")
+    _reject_unsafe_final(checksum_path, "checksum")
+    archive_descriptor, archive_temporary_name = tempfile.mkstemp(
+        dir=output_root, prefix=f".{archive_path.name}.", suffix=".tmp"
+    )
+    archive_temporary = Path(archive_temporary_name)
+    checksum_temporary: Path | None = None
     try:
-        with temporary.open("wb") as raw:
+        os.fchmod(archive_descriptor, 0o644)
+        with os.fdopen(archive_descriptor, "wb") as raw:
             with gzip.GzipFile(filename="", mode="wb", fileobj=raw, mtime=0) as compressed:
                 with tarfile.open(fileobj=compressed, mode="w", format=tarfile.GNU_FORMAT) as archive:
                     directories = {base}
                     for relative in RELEASE_FILES:
-                        source_path = source_root / relative
-                        if not source_path.is_file() or source_path.is_symlink():
-                            raise ValueError(f"required release file is missing or unsafe: {relative}")
-                        resolved = source_path.resolve()
-                        try:
-                            resolved.relative_to(source_root)
-                        except ValueError as error:
-                            raise ValueError(f"release file escapes source root: {relative}") from error
+                        _source_file(source_root, relative, release=True)
                         parts = Path(relative).parts
                         for index in range(1, len(parts)):
                             directories.add(f"{base}/{'/'.join(parts[:index])}")
@@ -136,7 +235,7 @@ def build_release_archive(source: Path, output: Path) -> tuple[Path, Path]:
                         info.mtime = 0
                         archive.addfile(info)
                     for relative in RELEASE_FILES:
-                        source_path = source_root / relative
+                        source_path = _source_file(source_root, relative, release=True)
                         payload = source_path.read_bytes()
                         info = tarfile.TarInfo(f"{base}/{relative}")
                         info.size = len(payload)
@@ -147,11 +246,24 @@ def build_release_archive(source: Path, output: Path) -> tuple[Path, Path]:
                         archive.addfile(info, io.BytesIO(payload))
             raw.flush()
             os.fsync(raw.fileno())
-        os.replace(temporary, archive_path)
+        os.replace(archive_temporary, archive_path)
+        _fsync_directory(output_root)
         digest = hashlib.sha256(archive_path.read_bytes()).hexdigest()
-        checksum_path.write_text(f"{digest}  {archive_path.name}\n", encoding="ascii")
+        checksum_descriptor, checksum_temporary_name = tempfile.mkstemp(
+            dir=output_root, prefix=f".{checksum_path.name}.", suffix=".tmp"
+        )
+        checksum_temporary = Path(checksum_temporary_name)
+        os.fchmod(checksum_descriptor, 0o644)
+        with os.fdopen(checksum_descriptor, "w", encoding="ascii", newline="\n") as handle:
+            handle.write(f"{digest}  {archive_path.name}\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(checksum_temporary, checksum_path)
+        _fsync_directory(output_root)
     finally:
-        temporary.unlink(missing_ok=True)
+        archive_temporary.unlink(missing_ok=True)
+        if checksum_temporary is not None:
+            checksum_temporary.unlink(missing_ok=True)
     return archive_path, checksum_path
 
 
@@ -178,8 +290,12 @@ def _marketplace() -> dict:
 
 def build_local_marketplace(source: Path, output: Path) -> Path:
     """Copy only reviewed runtime files into a new local marketplace root."""
-    source_root = Path(source).expanduser().resolve()
-    output_root = Path(output).expanduser().resolve()
+    source_root = _validate_components(
+        source, label="marketplace source", final_kind="directory"
+    )
+    output_root = _validate_components(
+        output, label="marketplace output", final_kind="directory", allow_missing=True
+    )
     if output_root.exists():
         raise FileExistsError(f"marketplace output already exists: {output_root}")
     output_root.parent.mkdir(parents=True, exist_ok=True)
@@ -192,21 +308,10 @@ def build_local_marketplace(source: Path, output: Path) -> Path:
     try:
         plugin_root = temporary / "plugins" / PLUGIN_NAME
         for relative in PACKAGED_FILES:
-            source_path = source_root / relative
-            if not source_path.is_file() or source_path.is_symlink():
-                raise ValueError(
-                    f"required package file is missing or unsafe: {relative}"
-                )
-            resolved_source = source_path.resolve()
-            try:
-                resolved_source.relative_to(source_root)
-            except ValueError as error:
-                raise ValueError(
-                    f"required package file escapes the source root: {relative}"
-                ) from error
+            source_path = _source_file(source_root, relative, release=False)
             destination = plugin_root / relative
             destination.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(resolved_source, destination)
+            shutil.copy2(source_path, destination)
         marketplace = temporary / ".agents/plugins/marketplace.json"
         marketplace.parent.mkdir(parents=True, exist_ok=True)
         marketplace.write_text(

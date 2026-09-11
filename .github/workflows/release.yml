@@ -6,7 +6,7 @@ on:
       - "v*.*.*"
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   validate:
@@ -38,14 +38,21 @@ jobs:
   publish:
     needs: validate
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/download-artifact@v4
         with:
           name: release-artifacts
           path: dist
       - name: Publish immutable tag artifacts
-        uses: softprops/action-gh-release@v2
-        with:
-          files: dist/*
-          fail_on_unmatched_files: true
-          generate_release_notes: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          archive="dist/codex-profile-harness-${version}.tar.gz"
+          checksum="${archive}.sha256"
+          test -f "$archive"
+          test -f "$checksum"
+          gh release create "$GITHUB_REF_NAME" "$archive" "$checksum" --verify-tag --generate-notes

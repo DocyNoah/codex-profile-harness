@@ -7,6 +7,14 @@ and tasks naturally during active work; use curation only to reconcile missed,
 duplicate, or conflicting state. Do not let curation write identity, user policy,
 context, or mandatory instructions.
 
-Harness improvement is proposal-only. Require explicit user approval before
-applying a proposal or changing profile policy. Automatic profile Git history is
-local; never infer permission to push.
+Harness improvement defaults to `approval_required` and requires explicit user approval.
+`proposal_only` is proposal-only mode and retains proposals. `auto_safe` is governed only by runtime
+configuration and the harness engine's deterministic local policy over exact
+targets and structural limits.
+Never infer permission, change policy mode, or apply protected identity,
+instruction, executable, hook, scheduler, or Git targets automatically.
+
+Automatic profile Git history is local by default. `auto_push` is allowed only
+through the harness engine when configuration contains
+`private_data_acknowledged = true` and one exact upstream. Do not perform a
+manual push or change remotes unless the user explicitly requests it.

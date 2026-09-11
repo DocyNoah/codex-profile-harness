@@ -26,7 +26,15 @@ def require(condition: bool, message: str) -> None:
         raise ValueError(message)
 
 
-_SEMVER = re.compile(r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)(?:[-+][0-9A-Za-z.-]+)?")
+_SEMVER = re.compile(
+    r"(?:0|[1-9][0-9]*)\."
+    r"(?:0|[1-9][0-9]*)\."
+    r"(?:0|[1-9][0-9]*)"
+    r"(?:-(?:(?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)"
+    r"(?:\.(?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*))?"
+    r"(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?",
+    re.ASCII,
+)
 _IDENTIFIER = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
 
 
@@ -123,12 +131,60 @@ def validate_skill(path: Path) -> dict[str, str]:
     return values
 
 
+def _workflow_job(text: str, name: str) -> str:
+    marker = f"  {name}:\n"
+    start = text.find(marker)
+    require(start >= 0, f"release workflow is missing the {name} job")
+    start += len(marker)
+    match = re.search(r"(?m)^  [A-Za-z0-9_-]+:\s*$", text[start:])
+    end = len(text) if match is None else start + match.start()
+    return text[start:end]
+
+
+def validate_release_workflow(path: Path) -> None:
+    """Validate least-privilege release semantics without a YAML dependency."""
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as error:
+        raise ValueError("release workflow must be readable UTF-8") from error
+    jobs_at = text.find("\njobs:\n")
+    require(jobs_at >= 0, "release workflow jobs are missing")
+    header = text[:jobs_at]
+    require(
+        re.search(r"(?m)^permissions:\n  contents: read$", header) is not None,
+        "release workflow top-level permissions must be contents: read",
+    )
+    require("contents: write" not in header, "release workflow top-level write is forbidden")
+    validate = _workflow_job(text, "validate")
+    publish = _workflow_job(text, "publish")
+    require("contents: write" not in validate, "release validation job must remain read-only")
+    require(
+        re.search(r"(?m)^    permissions:\n      contents: write$", publish) is not None,
+        "release publish job alone must grant contents: write",
+    )
+    uses = re.findall(r"(?m)^      - uses: ([^\s]+)", publish)
+    require(
+        all(item == "actions/download-artifact@v4" for item in uses),
+        "release publish job may use only the trusted artifact download boundary",
+    )
+    require("GH_TOKEN: ${{ github.token }}" in publish, "release publish token binding is missing")
+    require("gh release create" in publish, "release publication must use the GitHub CLI")
+    require("$GITHUB_REF_NAME" in publish, "release publication must bind the triggering tag")
+    require("--verify-tag" in publish, "release publication must verify the tag")
+    require(
+        'archive="dist/codex-profile-harness-${version}.tar.gz"' in publish
+        and 'checksum="${archive}.sha256"' in publish,
+        "release publication must name the exact versioned assets",
+    )
+
+
 def validate_source() -> None:
     manifest = validate_manifest(ROOT / ".codex-plugin/plugin.json")
     require(manifest.get("name") == "codex-profile-harness", "invalid plugin name")
     require(manifest.get("version") == "0.3.0", "invalid plugin version")
     skill = validate_skill(ROOT / "skills/profile-harness/SKILL.md")
     require(skill["name"] == "profile-harness", "invalid skill name")
+    validate_release_workflow(ROOT / ".github/workflows/release.yml")
     for relative in RELEASE_FILES:
         path = ROOT / relative
         require(path.is_file() and not path.is_symlink(), f"missing or unsafe release file: {relative}")

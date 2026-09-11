@@ -61,7 +61,6 @@ class ProfileLease:
         self.root = Path(profile_root).resolve()
         ensure_safe_directory(self.root, self.root / ".harness/state")
         self.path = self.root / ".harness/state/curation.lock"
-        require_safe_path(self.root, self.path, directory=True)
         self.stale_timeout = float(stale_timeout)
         self.token = uuid.uuid4().hex
         self.owner = owner or {
@@ -119,6 +118,7 @@ class ProfileLease:
             owner = json.dumps(metadata.get("owner", {}), sort_keys=True)
             raise LeaseBusyError(f"curation lease is live: {owner}") from error
         try:
+            require_safe_path(self.root, self.path, directory=True)
             try:
                 self.path.mkdir()
             except FileExistsError:
