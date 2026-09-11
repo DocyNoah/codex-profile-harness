@@ -39,6 +39,8 @@ class EndToEndTests(unittest.TestCase):
                 policy={"mode": "approval_required", "automatic_eligible": False, "reason": "review"},
                 created_at=datetime(2026, 9, 11, tzinfo=timezone.utc),
             )
+            from profile_harness.profile_git import IMPROVEMENT_SUBJECT, checkpoint_profile
+            self.assertIsNone(checkpoint_profile(profile, IMPROVEMENT_SUBJECT).error)
 
             listed = self.run_cli(profile, "proposal", "list", "--json")
             shown = self.run_cli(profile, "proposal", "show", proposal["proposal_id"], "--json")

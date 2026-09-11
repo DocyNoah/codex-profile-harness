@@ -19,6 +19,8 @@ from .profile_git import (
     APPLICATION_SUBJECT,
     CheckpointResult,
     checkpoint_profile,
+    current_profile_commit,
+    identify_application_checkpoint,
     validate_application_baseline,
 )
 
@@ -38,6 +40,10 @@ _ID = re.compile(r"[a-f0-9]{32}")
 
 class ApplicationError(RuntimeError):
     """An approval or exact-content application failed closed."""
+
+
+class _AmbiguousCheckpointState(ApplicationError):
+    """HEAD is neither the expected pre-state nor an exact application commit."""
 
 
 def _digest(value: bytes) -> str:
@@ -140,6 +146,41 @@ def _cleanup_unlocked(root: Path, transaction: dict[str, Any]) -> None:
     _wal_path(root).unlink(missing_ok=True)
 
 
+def _emit_application_unlocked(
+    root: Path, proposal_id: str, status: str, payload: dict[str, Any]
+) -> str | None:
+    from .control import ControlOutbox
+
+    try:
+        ControlOutbox(root)._emit_unlocked(
+            "application" if status == "applied" else "failure",
+            proposal_id,
+            payload,
+            dedupe_key=f"application-{status}:{proposal_id}",
+        )
+    except (OSError, ValueError) as error:
+        return str(error)[:4000]
+    return None
+
+
+def _expire_unlocked(
+    root: Path, store: ProposalStore, manifest: dict[str, Any], reason: str
+) -> None:
+    status = manifest["status"]
+    if status == "expired":
+        return
+    if status == "proposed":
+        manifest = store._transition_unlocked(
+            manifest["proposal_id"], "proposed", "notified", "opened for stale validation"
+        )
+        status = manifest["status"]
+    if status in {"notified", "approved"}:
+        store._transition_unlocked(manifest["proposal_id"], status, "expired", reason[:2000])
+    _emit_application_unlocked(
+        root, manifest["proposal_id"], "expired", {"error": reason[:4000], "status": "expired"}
+    )
+
+
 def _load_transaction(root: Path) -> dict[str, Any] | None:
     path = _wal_path(root)
     if not path.exists():
@@ -150,13 +191,27 @@ def _load_transaction(root: Path) -> dict[str, Any] | None:
         value = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError) as error:
         raise ApplicationError("application transaction descriptor is malformed") from error
-    if not isinstance(value, dict) or set(value) != {"version", "state", "proposal_id", "base_commit", "manifest_sha256", "targets"}:
+    if not isinstance(value, dict) or set(value) != {
+        "version", "state", "proposal_id", "base_commit", "manifest_sha256",
+        "pre_commit", "post_commit", "checkpoint_subject",
+        "allowed_commit_paths", "targets",
+    }:
         raise ApplicationError("application transaction descriptor has invalid fields")
     if (
-        value["version"] != 1 or value["state"] not in {"applying", "committed"}
+        value["version"] != 2 or value["state"] not in {"applying", "committed"}
         or not isinstance(value.get("proposal_id"), str) or _ID.fullmatch(value["proposal_id"]) is None
         or not isinstance(value.get("base_commit"), str) or re.fullmatch(r"[a-f0-9]{40,64}", value["base_commit"]) is None
         or not isinstance(value.get("manifest_sha256"), str) or _HEX64.fullmatch(value["manifest_sha256"]) is None
+        or not isinstance(value.get("pre_commit"), str) or re.fullmatch(r"[a-f0-9]{40,64}", value["pre_commit"]) is None
+        or (
+            value.get("post_commit") is not None
+            and (not isinstance(value["post_commit"], str) or re.fullmatch(r"[a-f0-9]{40,64}", value["post_commit"]) is None)
+        )
+        or value.get("checkpoint_subject") != APPLICATION_SUBJECT
+        or not isinstance(value.get("allowed_commit_paths"), list)
+        or any(not isinstance(item, str) for item in value["allowed_commit_paths"])
+        or value["allowed_commit_paths"] != sorted(value["allowed_commit_paths"])
+        or len(value["allowed_commit_paths"]) != len(set(value["allowed_commit_paths"]))
         or not isinstance(value["targets"], list) or not 1 <= len(value["targets"]) <= 20
     ):
         raise ApplicationError("application transaction descriptor is invalid")
@@ -177,6 +232,9 @@ def _load_transaction(root: Path) -> dict[str, Any] | None:
         _safe_target(root, item["path"])
         require_safe_path(root, root / item["snapshot"], directory=False)
         seen.add(item["path"])
+    expected_paths = sorted(seen | {".harness/improvements/lifecycle.jsonl"})
+    if value["allowed_commit_paths"] != expected_paths:
+        raise ApplicationError("application expected post-commit paths are invalid")
     return value
 
 
@@ -200,21 +258,37 @@ def _recover_unlocked(root: Path) -> bool:
             or item["snapshot_sha256"] != replacement["expected_old_sha256"]
         ):
             raise ApplicationError("application transaction target does not match its manifest")
-    if transaction["state"] == "applying":
+    target_digests = {item["path"]: item["new_sha256"] for item in transaction["targets"]}
+    try:
+        observed = identify_application_checkpoint(
+            root, transaction["pre_commit"], target_digests
+        )
+    except Exception as error:
+        raise ApplicationError(f"application recovery found ambiguous HEAD: {error}") from error
+    if observed is None:
+        if transaction["state"] == "committed" or transaction["post_commit"] is not None:
+            raise ApplicationError("committed application HEAD is missing")
         _restore_unlocked(root, transaction)
-        from .control import ControlOutbox
-        ControlOutbox(root)._emit_unlocked(
-            "failure", transaction["proposal_id"],
+        _emit_application_unlocked(
+            root, transaction["proposal_id"], "failed",
             {"error": "interrupted application was rolled back"},
-            dedupe_key=f"application-failure:{transaction['proposal_id']}",
         )
     else:
+        if transaction["post_commit"] not in {None, observed}:
+            raise ApplicationError("application post-commit identity does not match HEAD")
+        transaction["state"] = "committed"
+        transaction["post_commit"] = observed
+        atomic_write_text(_wal_path(root), json.dumps(transaction, sort_keys=True, indent=2) + "\n")
         store = ProposalStore(root)
         if store.load(transaction["proposal_id"])["status"] == "applying":
             store._transition_unlocked(
                 transaction["proposal_id"], "applying", "applied",
-                "recovered committed application",
+                "recovered exact application commit",
             )
+        _emit_application_unlocked(
+            root, transaction["proposal_id"], "applied",
+            {"status": "applied", "changed_paths": list(target_digests)},
+        )
         _cleanup_unlocked(root, transaction)
     return True
 
@@ -234,14 +308,46 @@ def _manifest_digest(root: Path, proposal_id: str) -> str:
     return _digest(path.read_bytes())
 
 
+def _finish_committed_unlocked(
+    root: Path,
+    store: ProposalStore,
+    transaction: dict[str, Any],
+    changed_paths: tuple[str, ...],
+) -> dict[str, Any]:
+    proposal_id = transaction["proposal_id"]
+    status = store.load(proposal_id)["status"]
+    if status == "applying":
+        store._transition_unlocked(
+            proposal_id, "applying", "applied", "exact application commit verified"
+        )
+    elif status != "applied":
+        raise _AmbiguousCheckpointState(
+            "application commit exists but lifecycle state is inconsistent"
+        )
+    control_error = _emit_application_unlocked(
+        root, proposal_id, "applied",
+        {"status": "applied", "changed_paths": list(changed_paths)},
+    )
+    _cleanup_unlocked(root, transaction)
+    result: dict[str, Any] = {
+        "status": "applied", "proposal_id": proposal_id,
+        "changed_paths": list(changed_paths), "commit_sha": transaction["post_commit"],
+    }
+    if control_error is not None:
+        result["control_error"] = control_error
+    return result
+
+
 def apply_proposal(
     root: Path,
     proposal_id: str,
     *,
     automatic: bool = False,
+    approve: bool = False,
     doctor_fn: Callable[[Path], Any] | None = None,
     checkpoint_fn: Callable[[Path, str], CheckpointResult] | None = None,
     fail_after_writes: int | None = None,
+    crash_after_checkpoint: bool = False,
 ) -> dict[str, Any]:
     """Apply exact UTF-8 content with CAS, snapshots, validation, and rollback."""
     profile_root = Path(root).resolve()
@@ -254,32 +360,43 @@ def apply_proposal(
             raise ApplicationError("legacy Markdown proposals cannot be applied")
         if manifest["status"] == "applied":
             return {"status": "already_applied", "proposal_id": proposal_id}
+        if manifest["status"] == "expired":
+            return {"status": "already_expired", "proposal_id": proposal_id}
         if manifest["status"] == "failed":
             raise ApplicationError("failed proposals cannot be retried without a new manifest")
         if automatic:
             allowed, reason = automatic_policy_allows(profile_root, manifest, config.improvement)
             if not allowed:
                 raise ApplicationError(reason)
-        elif manifest["status"] != "approved":
+        elif approve and manifest["status"] not in {"proposed", "notified", "approved"}:
+            raise ApplicationError("proposal cannot be approved from its current state")
+        elif not approve and manifest["status"] != "approved":
             raise ApplicationError("proposal must be approved before application")
         targets = tuple(item["path"] for item in manifest["replacements"])
         try:
             validate_application_baseline(profile_root, manifest["base_commit"], targets)
         except Exception as error:
+            _expire_unlocked(profile_root, store, manifest, f"stale managed baseline: {error}")
             raise ApplicationError(str(error)) from error
         for replacement in manifest["replacements"]:
             target = _safe_target(profile_root, replacement["path"])
             if not target.is_file() or _digest(target.read_bytes()) != replacement["expected_old_sha256"]:
-                if manifest["status"] == "notified":
-                    store._transition_unlocked(proposal_id, "notified", "expired", "target content is stale")
+                _expire_unlocked(profile_root, store, manifest, "proposal target digest is stale")
                 raise ApplicationError("proposal target digest is stale")
         snapshot_root = ensure_safe_directory(
             profile_root, profile_root / _SNAPSHOTS / proposal_id
         )
         transaction = {
-            "version": 1, "state": "applying", "proposal_id": proposal_id,
+            "version": 2, "state": "applying", "proposal_id": proposal_id,
             "base_commit": manifest["base_commit"],
-            "manifest_sha256": _manifest_digest(profile_root, proposal_id), "targets": [],
+            "manifest_sha256": _manifest_digest(profile_root, proposal_id),
+            "pre_commit": current_profile_commit(profile_root),
+            "post_commit": None,
+            "checkpoint_subject": APPLICATION_SUBJECT,
+            "allowed_commit_paths": sorted(
+                set(targets) | {".harness/improvements/lifecycle.jsonl"}
+            ),
+            "targets": [],
         }
         try:
             for index, replacement in enumerate(manifest["replacements"]):
@@ -304,11 +421,13 @@ def apply_proposal(
         except BaseException:
             _cleanup_unlocked(profile_root, transaction)
             raise
-        if automatic:
+        if automatic or approve:
             if manifest["status"] == "proposed":
-                manifest = store._transition_unlocked(proposal_id, "proposed", "notified", "automatic policy selected proposal")
+                reason = "automatic policy selected proposal" if automatic else "opened for user approval"
+                manifest = store._transition_unlocked(proposal_id, "proposed", "notified", reason)
             if manifest["status"] == "notified":
-                manifest = store._transition_unlocked(proposal_id, "notified", "approved", "automatic policy approved exact bytes")
+                reason = "automatic policy approved exact bytes" if automatic else "approved by user"
+                manifest = store._transition_unlocked(proposal_id, "notified", "approved", reason)
         store._transition_unlocked(proposal_id, "approved", "applying")
         try:
             for index, replacement in enumerate(manifest["replacements"], start=1):
@@ -327,30 +446,45 @@ def apply_proposal(
                 report = doctor_fn(profile_root)
             if not bool(getattr(report, "ok", False)):
                 raise ApplicationError("doctor rejected the applied profile")
-            checkpoint = (checkpoint_fn or checkpoint_profile)(profile_root, APPLICATION_SUBJECT)
-            if checkpoint.error is not None:
-                raise ApplicationError(f"application checkpoint failed: {checkpoint.error}")
-            transaction["state"] = "committed"
-            atomic_write_text(_wal_path(profile_root), json.dumps(transaction, sort_keys=True, indent=2) + "\n")
-            store._transition_unlocked(proposal_id, "applying", "applied")
-            from .control import ControlOutbox
-            control_error = None
+            checkpoint = None
+            checkpoint_error: BaseException | None = None
             try:
-                ControlOutbox(profile_root)._emit_unlocked(
-                    "application", proposal_id,
-                    {"status": "applied", "changed_paths": list(targets)},
-                    dedupe_key=f"application-applied:{proposal_id}",
+                checkpoint = (checkpoint_fn or checkpoint_profile)(profile_root, APPLICATION_SUBJECT)
+            except BaseException as error:
+                checkpoint_error = error
+            if crash_after_checkpoint:
+                os._exit(91)
+            try:
+                observed_post = identify_application_checkpoint(
+                    profile_root,
+                    transaction["pre_commit"],
+                    {item["path"]: item["new_sha256"] for item in transaction["targets"]},
                 )
-            except (OSError, ValueError) as error:
-                control_error = str(error)[:4000]
-            _cleanup_unlocked(profile_root, transaction)
-            result = {
-                "status": "applied", "proposal_id": proposal_id,
-                "changed_paths": list(targets), "commit_sha": checkpoint.commit_sha,
-            }
-            if control_error is not None:
-                result["control_error"] = control_error
-            return result
+            except Exception as error:
+                raise _AmbiguousCheckpointState(str(error)) from error
+            if observed_post is None:
+                detail = (
+                    str(checkpoint_error)
+                    if checkpoint_error is not None
+                    else (checkpoint.error if checkpoint is not None else "no result")
+                )
+                raise ApplicationError(f"application checkpoint failed before commit: {detail}")
+            if (
+                checkpoint is not None and checkpoint.commit_sha is not None
+                and checkpoint.commit_sha != observed_post
+            ):
+                raise _AmbiguousCheckpointState(
+                    "checkpoint result does not match the exact application commit"
+                )
+            transaction["state"] = "committed"
+            transaction["post_commit"] = observed_post
+            atomic_write_text(_wal_path(profile_root), json.dumps(transaction, sort_keys=True, indent=2) + "\n")
+            return _finish_committed_unlocked(
+                profile_root, store, transaction, targets
+            )
+        except _AmbiguousCheckpointState:
+            # Unknown HEAD must retain WAL and snapshots for explicit recovery.
+            raise
         except RuntimeError as error:
             if fail_after_writes is not None and str(error).startswith("injected"):
                 raise

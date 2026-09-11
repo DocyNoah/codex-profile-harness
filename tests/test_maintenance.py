@@ -328,6 +328,24 @@ class MaintenanceTests(unittest.TestCase):
             self.assertEqual("applied", ProposalStore(root).load(proposal["proposal_id"])["status"])
             self.assertEqual("# Context\n\nAutomatic exact bytes.\n", target.read_text())
 
+    def test_top_level_maintenance_failure_is_deduped_in_control_without_masking_error(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = self.make_profile(Path(temporary_directory))
+
+            for _ in range(2):
+                with mock.patch.object(
+                    maintenance_module, "_run_maintenance_locked",
+                    side_effect=RuntimeError("model schema failure"),
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "model schema failure"):
+                        run_maintenance(root, now=NOW)
+
+            events = ControlOutbox(root).poll(now=NOW)
+            failures = [item for item in events if item["kind"] == "failure"]
+            self.assertEqual(1, len(failures))
+            self.assertEqual("maintenance", failures[0]["subject_id"])
+            self.assertIn("model schema failure", failures[0]["payload"]["error"])
+
     def test_maintain_noop_checkpoints_pending_managed_documents(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = self.make_profile(Path(temporary_directory))

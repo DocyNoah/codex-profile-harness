@@ -34,7 +34,6 @@ from .control import ControlOutbox, MAX_POLL_BYTES
 from .proposals import MAX_MANIFEST_BYTES, ProposalStore
 from .runner import run_codex
 from .profile_git import (
-    APPLICATION_SUBJECT,
     CHECKPOINT_SUBJECT,
     checkpoint_profile,
     inspect_profile_git,
@@ -324,26 +323,16 @@ def main(argv: list[str] | None = None) -> int:
                 if value["status"] == "proposed":
                     store.transition(arguments.proposal_id, "proposed", "notified", "opened for user decision")
                 result = store.transition(arguments.proposal_id, "notified", "rejected", arguments.reason)
-                checkpoint = checkpoint_profile(root, APPLICATION_SUBJECT)
-                if checkpoint.error is not None:
-                    raise RuntimeError(checkpoint.error)
                 _print_bounded_json({"proposal_id": arguments.proposal_id, "status": result["status"]}, limit=MAX_MANIFEST_BYTES)
                 return 0
             value = store.load(arguments.proposal_id)
             if value["status"] == "applied":
                 _print_bounded_json(apply_proposal(root, arguments.proposal_id), limit=MAX_MANIFEST_BYTES)
                 return 0
-            if value["status"] == "proposed":
-                store.transition(arguments.proposal_id, "proposed", "notified", "opened for user decision")
-                value = store.load(arguments.proposal_id)
-            if value["status"] == "notified":
-                store.transition(arguments.proposal_id, "notified", "approved", "approved by user")
-                value = store.load(arguments.proposal_id)
-            if value["status"] == "approved":
-                approval_checkpoint = checkpoint_profile(root, APPLICATION_SUBJECT)
-                if approval_checkpoint.error is not None:
-                    raise RuntimeError(approval_checkpoint.error)
-            _print_bounded_json(apply_proposal(root, arguments.proposal_id), limit=MAX_MANIFEST_BYTES)
+            _print_bounded_json(
+                apply_proposal(root, arguments.proposal_id, approve=True),
+                limit=MAX_MANIFEST_BYTES,
+            )
             return 0
         elif arguments.command == "control":
             root = find_profile_root(Path.cwd())

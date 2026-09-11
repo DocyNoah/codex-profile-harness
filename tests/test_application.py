@@ -91,6 +91,7 @@ class ApplicationTests(unittest.TestCase):
         for variant in variants:
             with self.subTest(variant=variant), tempfile.TemporaryDirectory() as temporary_directory:
                 root, manifest = self.make_profile(Path(temporary_directory))
+                self.notify_and_approve(root, manifest["proposal_id"])
                 if variant == "target":
                     (root / "CONTEXT.md").write_text("changed\n")
                     subprocess.run(["git", "-C", str(root), "add", "CONTEXT.md"], check=True)
@@ -103,6 +104,93 @@ class ApplicationTests(unittest.TestCase):
                     (root / "MEMORY.md").write_text("dirty\n")
                 with self.assertRaises(ApplicationError):
                     apply_proposal(root, manifest["proposal_id"])
+                self.assertEqual("expired", ProposalStore(root).load(manifest["proposal_id"])["status"])
+                self.assertEqual(
+                    "already_expired",
+                    apply_proposal(root, manifest["proposal_id"])["status"],
+                )
+                events = ControlOutbox(root).poll(now=datetime(2026, 9, 12, tzinfo=timezone.utc))
+                self.assertEqual(1, len([item for item in events if item["subject_id"] == manifest["proposal_id"]]))
+
+    def test_commit_that_succeeds_before_checkpoint_error_converges_to_applied(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root, manifest = self.make_profile(Path(temporary_directory))
+            self.notify_and_approve(root, manifest["proposal_id"])
+            from profile_harness.profile_git import checkpoint_profile
+
+            def committed_then_raised(profile_root: Path, subject: str):
+                result = checkpoint_profile(profile_root, subject)
+                self.assertIsNone(result.error)
+                raise RuntimeError("transport failed after commit")
+
+            result = apply_proposal(
+                root, manifest["proposal_id"], checkpoint_fn=committed_then_raised
+            )
+
+            self.assertEqual("applied", result["status"])
+            self.assertEqual("applied", ProposalStore(root).load(manifest["proposal_id"])["status"])
+            self.assertEqual("# Context\n\nApplied exactly.\n", (root / "CONTEXT.md").read_text())
+            self.assertFalse((root / ".harness/state/application-transaction.json").exists())
+
+    def test_recovery_finishes_exact_commit_after_process_crash(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root, manifest = self.make_profile(Path(temporary_directory))
+            self.notify_and_approve(root, manifest["proposal_id"])
+            script = (
+                "import sys;from pathlib import Path;"
+                f"sys.path.insert(0,{str(ROOT / 'src')!r});"
+                "from profile_harness.application import apply_proposal;"
+                f"apply_proposal(Path({str(root)!r}),{manifest['proposal_id']!r},crash_after_checkpoint=True)"
+            )
+
+            crashed = subprocess.run([sys.executable, "-c", script], check=False)
+            self.assertEqual(91, crashed.returncode)
+            descriptor = root / ".harness/state/application-transaction.json"
+            self.assertTrue(descriptor.exists())
+            transaction = json.loads(descriptor.read_text())
+            self.assertRegex(transaction["pre_commit"], r"^[a-f0-9]{40,64}$")
+            self.assertIsNone(transaction["post_commit"])
+            self.assertEqual(
+                "harness: apply approved profile improvement",
+                transaction["checkpoint_subject"],
+            )
+            self.assertEqual(
+                [".harness/improvements/lifecycle.jsonl", "CONTEXT.md"],
+                transaction["allowed_commit_paths"],
+            )
+            owner = root / ".harness/state/curation.lock/owner.json"
+            metadata = json.loads(owner.read_text())
+            metadata["acquired_at"] = "2000-01-01T00:00:00Z"
+            owner.write_text(json.dumps(metadata))
+
+            self.assertTrue(recover_application(root))
+            self.assertEqual("applied", ProposalStore(root).load(manifest["proposal_id"])["status"])
+            self.assertEqual("# Context\n\nApplied exactly.\n", (root / "CONTEXT.md").read_text())
+
+    def test_cli_approval_does_not_checkpoint_unrelated_dirty_managed_content(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root, manifest = self.make_profile(Path(temporary_directory))
+            committed_memory = subprocess.run(
+                ["git", "-C", str(root), "show", "HEAD:MEMORY.md"],
+                text=True, capture_output=True, check=True,
+            ).stdout
+            (root / "MEMORY.md").write_text("user work must remain uncommitted\n")
+
+            result = subprocess.run(
+                [sys.executable, str(ROOT / "bin/profile-harness"), "proposal", "approve", manifest["proposal_id"]],
+                cwd=root, text=True, capture_output=True, check=False,
+            )
+
+            self.assertNotEqual(0, result.returncode)
+            self.assertEqual(
+                committed_memory,
+                subprocess.run(
+                    ["git", "-C", str(root), "show", "HEAD:MEMORY.md"],
+                    text=True, capture_output=True, check=True,
+                ).stdout,
+            )
+            self.assertEqual("user work must remain uncommitted\n", (root / "MEMORY.md").read_text())
+            self.assertEqual("expired", ProposalStore(root).load(manifest["proposal_id"])["status"])
 
     def test_doctor_or_checkpoint_failure_rolls_back_exact_bytes(self) -> None:
         for failure in ("doctor", "checkpoint"):

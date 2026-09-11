@@ -39,7 +39,7 @@ _STATUSES = frozenset({
 _TRANSITIONS = {
     "proposed": frozenset({"notified"}),
     "notified": frozenset({"approved", "rejected", "expired"}),
-    "approved": frozenset({"applying"}),
+    "approved": frozenset({"applying", "expired"}),
     "applying": frozenset({"applied", "failed"}),
     "applied": frozenset(),
     "rejected": frozenset(),

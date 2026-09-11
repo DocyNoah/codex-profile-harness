@@ -122,6 +122,21 @@ def _checkpoint_preflight(profile_root: Path, subject: str) -> None:
 
 
 def run_maintenance(root: Path, *, now: datetime | None = None) -> dict[str, Any]:
+    """Run maintenance and durably surface failures without masking them."""
+    profile_root = Path(root).resolve()
+    try:
+        return _run_maintenance(profile_root, now=now)
+    except BaseException as error:
+        try:
+            from .control import emit_failure_with_default_lease
+
+            emit_failure_with_default_lease(profile_root, "maintenance", error)
+        except BaseException:
+            pass
+        raise
+
+
+def _run_maintenance(root: Path, *, now: datetime | None = None) -> dict[str, Any]:
     """Recover, checkpoint pending documents, then run due work under one lease."""
     profile_root = Path(root).resolve()
     with ProfileLease(profile_root, stale_timeout=DEFAULT_STALE_TIMEOUT_SECONDS):

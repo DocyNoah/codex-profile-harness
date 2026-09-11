@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 import fcntl
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -619,6 +620,45 @@ def validate_application_baseline(
     )
     if disallowed:
         raise ProfileGitError("proposal base changed outside proposal metadata: " + ", ".join(disallowed))
+
+
+def identify_application_checkpoint(
+    root: Path,
+    pre_commit: str,
+    target_digests: dict[str, str],
+) -> str | None:
+    """Identify one exact harness application commit after an ambiguous result."""
+    profile_root = Path(root).expanduser().resolve()
+    current = current_profile_commit(profile_root)
+    if current == pre_commit:
+        return None
+    parent = _git(
+        profile_root, "rev-parse", f"{current}^", read_only=True
+    ).stdout.strip()
+    subject = _git(
+        profile_root, "log", "-1", "--format=%s", current, read_only=True
+    ).stdout.strip()
+    if parent != pre_commit or subject != APPLICATION_SUBJECT:
+        raise ProfileGitError("HEAD changed to an unexpected commit during application")
+    changed = {
+        path for path in _git(
+            profile_root, "diff", "--name-only", "-z", pre_commit, current,
+            read_only=True,
+        ).stdout.split("\0") if path
+    }
+    allowed = set(target_digests) | {".harness/improvements/lifecycle.jsonl"}
+    if ".harness/improvements/lifecycle.jsonl" not in changed or not changed <= allowed:
+        raise ProfileGitError("application commit changed unexpected paths")
+    if _dirty_paths(profile_root):
+        raise ProfileGitError("application commit left managed paths dirty")
+    for relative, expected in target_digests.items():
+        path = require_safe_path(profile_root, profile_root / relative, directory=False)
+        if not path.is_file():
+            raise ProfileGitError("application commit target is missing")
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        if digest != expected:
+            raise ProfileGitError("application commit target digest is unexpected")
+    return current
 
 
 def validate_pending_checkpoint(root: Path) -> str | None:

@@ -10,7 +10,7 @@ import re
 from typing import Any
 import uuid
 
-from .config import load_profile_config
+from .config import DEFAULT_STALE_TIMEOUT_SECONDS, load_profile_config
 from .fs import atomic_write_text, ensure_safe_directory, exclusive_write_text, require_safe_path
 from .locking import ProfileLease
 
@@ -252,3 +252,17 @@ def emit_failure_event_unlocked(root: Path, subject: str, error: str, *, dedupe_
     return ControlOutbox(root)._emit_unlocked(
         "failure", subject, {"error": str(error)[:4000]}, dedupe_key=dedupe_key
     )
+
+
+def emit_failure_with_default_lease(
+    root: Path, subject: str, error: BaseException
+) -> dict[str, Any]:
+    """Record top-level failures even when profile configuration is unreadable."""
+    profile_root = Path(root).resolve()
+    detail = f"{type(error).__name__}: {error}"[:4000]
+    dedupe_digest = hashlib.sha256(detail.encode("utf-8", "replace")).hexdigest()
+    with ProfileLease(profile_root, stale_timeout=DEFAULT_STALE_TIMEOUT_SECONDS):
+        return ControlOutbox(profile_root)._emit_unlocked(
+            "failure", subject, {"error": detail},
+            dedupe_key=f"{subject}-failure:{dedupe_digest}",
+        )
