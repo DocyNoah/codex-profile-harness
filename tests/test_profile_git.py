@@ -37,7 +37,7 @@ from profile_harness.profile_git import (  # noqa: E402
     tracked_forbidden_paths,
 )
 import profile_harness.profile_git as profile_git_module  # noqa: E402
-from profile_harness.locking import ProfileLease  # noqa: E402
+from profile_harness.locking import LeaseBusyError, ProfileLease  # noqa: E402
 
 
 def git(root: Path, *arguments: str, check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -1089,6 +1089,37 @@ class ProfileGitTests(unittest.TestCase):
                 if holder.poll() is None:
                     holder.terminate()
                     holder.wait(timeout=2)
+
+    def test_checkpoint_wait_survives_owner_metadata_gap_during_handoff(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            profile = Path(temporary_directory) / "profile"
+            init_profile(profile, "Work")
+            (profile / "MEMORY.md").write_text("handoff\n", encoding="utf-8")
+            original_acquire = ProfileLease.acquire
+            attempts = 0
+
+            def acquire_after_handoff_gap(lease: ProfileLease) -> ProfileLease:
+                nonlocal attempts
+                attempts += 1
+                if attempts == 1:
+                    raise LeaseBusyError(
+                        "curation lease is live: checkpoint",
+                        owner={"operation": "profile-git-checkpoint"},
+                    )
+                if attempts == 2:
+                    time.sleep(0.06)
+                    raise LeaseBusyError("curation lease is live: {}", owner={})
+                return original_acquire(lease)
+
+            with (
+                mock.patch.object(profile_git_module, "_GUARD_TIMEOUT", 0.05),
+                mock.patch.object(ProfileLease, "acquire", acquire_after_handoff_gap),
+            ):
+                result = checkpoint_profile(profile, CHECKPOINT_SUBJECT)
+
+            self.assertTrue(result.committed, result.error)
+            self.assertEqual(3, attempts)
+            self.assertEqual("handoff\n", git(profile, "show", "HEAD:MEMORY.md").stdout)
 
     def test_initialization_keeps_git_init_and_first_commit_in_one_guard_section(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

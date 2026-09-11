@@ -892,14 +892,19 @@ def checkpoint_profile(
             started = time.monotonic()
             ordinary_deadline = started + _GUARD_TIMEOUT
             checkpoint_deadline = started + _TIMEOUT
+            checkpoint_owner_observed = False
             while True:
                 try:
                     lease.acquire()
                     break
                 except LeaseBusyError as error:
+                    checkpoint_owner_observed = (
+                        checkpoint_owner_observed
+                        or error.owner.get("operation") == _CHECKPOINT_LEASE_OPERATION
+                    )
                     deadline = (
                         checkpoint_deadline
-                        if error.owner.get("operation") == _CHECKPOINT_LEASE_OPERATION
+                        if checkpoint_owner_observed
                         else ordinary_deadline
                     )
                     if time.monotonic() >= deadline:
