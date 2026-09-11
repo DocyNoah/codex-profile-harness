@@ -8,6 +8,7 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -15,7 +16,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from profile_harness.config import init_profile  # noqa: E402
 from profile_harness.doctor import diagnose  # noqa: E402
-from profile_harness.journal import verify_journal  # noqa: E402
+from profile_harness.journal import append_entry, verify_journal  # noqa: E402
 from profile_harness.proposals import ProposalError, ProposalStore  # noqa: E402
 from profile_harness.profile_git import checkpoint_profile  # noqa: E402
 
@@ -49,6 +50,53 @@ class ProposalStoreTests(unittest.TestCase):
             },
             created_at=NOW,
         )
+
+    def create_with_id(self, store: ProposalStore, root: Path, proposal_id: str) -> dict:
+        target = root / "CONTEXT.md"
+        return store.create(
+            title="Fixed identifier",
+            rationale="Exercise immutable collision and recovery behavior.",
+            risk_level="low",
+            source_journal_hashes=["a" * 64],
+            replacements=[{
+                "path": "CONTEXT.md",
+                "expected_old_sha256": hashlib.sha256(target.read_bytes()).hexdigest(),
+                "content": "# Context\n\nFixed.\n",
+            }],
+            base_commit="b" * 40,
+            policy={
+                "mode": "approval_required",
+                "automatic_eligible": False,
+                "reason": "approval is required",
+            },
+            created_at=NOW,
+            proposal_id=proposal_id,
+        )
+
+    def write_pending_improvement_wal(
+        self, root: Path, proposal_id: str, lifecycle_snapshot: Path
+    ) -> None:
+        proposed = root / ".harness/improvements/proposed"
+        targets = []
+        for suffix in (".json", ".md"):
+            path = proposed / f"{proposal_id}{suffix}"
+            targets.append({
+                "path": str(path.relative_to(root)),
+                "digest": hashlib.sha256(path.read_bytes()).hexdigest(),
+            })
+        descriptor = root / ".harness/state/improvement-transaction.json"
+        descriptor.write_text(json.dumps({
+            "version": 2,
+            "state": "applying",
+            "transaction_id": "f" * 32,
+            "targets": targets,
+            "journal_existed": False,
+            "journal_snapshot": None,
+            "journal_snapshot_digest": None,
+            "lifecycle_existed": True,
+            "lifecycle_snapshot": ".harness/state/proposal-lifecycle.before",
+            "lifecycle_snapshot_digest": hashlib.sha256(lifecycle_snapshot.read_bytes()).hexdigest(),
+        }, sort_keys=True, indent=2) + "\n", encoding="utf-8")
 
     def test_create_generates_unique_runtime_ids_and_exact_manifest_rendering(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -94,6 +142,24 @@ class ProposalStoreTests(unittest.TestCase):
                 with self.subTest(replacement=replacement), self.assertRaises(ProposalError):
                     store.create(replacements=[replacement], **base)
 
+    def test_create_collision_never_removes_an_existing_artifact(self) -> None:
+        for suffix in (".json", ".md"):
+            with self.subTest(suffix=suffix), tempfile.TemporaryDirectory() as temporary_directory:
+                root = self.make_profile(Path(temporary_directory))
+                store = ProposalStore(root)
+                proposal_id = "c" * 32
+                proposed = root / ".harness/improvements/proposed"
+                collision = proposed / f"{proposal_id}{suffix}"
+                collision.write_bytes(b"pre-existing immutable artifact\n")
+
+                with self.assertRaisesRegex(ProposalError, "already exists"):
+                    self.create_with_id(store, root, proposal_id)
+
+                self.assertEqual(b"pre-existing immutable artifact\n", collision.read_bytes())
+                other = proposed / f"{proposal_id}{'.md' if suffix == '.json' else '.json'}"
+                self.assertFalse(other.exists())
+                self.assertFalse((root / ".harness/improvements/lifecycle.jsonl").exists())
+
     def test_load_rejects_tampering_and_symlink_escape(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             parent = Path(temporary_directory)
@@ -134,6 +200,102 @@ class ProposalStoreTests(unittest.TestCase):
 
             with self.assertRaisesRegex(ProposalError, "creation digest"):
                 store.load(manifest["proposal_id"])
+
+    def test_load_digests_the_same_json_buffer_that_it_parses(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = self.make_profile(Path(temporary_directory))
+            store = ProposalStore(root)
+            manifest = self.create(store, root)
+            json_path = root / ".harness/improvements/proposed" / f"{manifest['proposal_id']}.json"
+            original = json_path.read_bytes()
+            tampered = json.loads(original.decode("utf-8"))
+            tampered["base_commit"] = "c" * 40
+            json_path.write_text(
+                json.dumps(tampered, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            from profile_harness import proposals as proposals_module
+            creation = verify_journal(root / ".harness/improvements/lifecycle.jsonl")[0]
+
+            def swap_before_digest_reopen(path: Path) -> str:
+                if path.name == json_path.name:
+                    json_path.write_bytes(original)
+                    return creation["json_digest"]
+                return creation["markdown_digest"]
+
+            with mock.patch.object(proposals_module, "_file_digest", swap_before_digest_reopen):
+                with self.assertRaisesRegex(ProposalError, "creation digest"):
+                    store.load(manifest["proposal_id"])
+
+    def test_public_transition_recovers_pending_improvement_before_appending(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = self.make_profile(Path(temporary_directory))
+            store = ProposalStore(root)
+            retained_id = self.create(store, root)["proposal_id"]
+            snapshot = root / ".harness/state/proposal-lifecycle.before"
+            lifecycle = root / ".harness/improvements/lifecycle.jsonl"
+            snapshot.write_bytes(lifecycle.read_bytes())
+            pending_id = "d" * 32
+            self.create_with_id(store, root, pending_id)
+            self.write_pending_improvement_wal(root, pending_id, snapshot)
+
+            transitioned = store.transition(retained_id, "proposed", "notified")
+
+            self.assertEqual("notified", transitioned["status"])
+            self.assertEqual("notified", store.load(retained_id)["status"])
+            self.assertFalse((root / ".harness/state/improvement-transaction.json").exists())
+            for suffix in (".json", ".md"):
+                self.assertFalse(
+                    (root / ".harness/improvements/proposed" / f"{pending_id}{suffix}").exists()
+                )
+            events = verify_journal(lifecycle)
+            self.assertEqual([retained_id, retained_id], [event["proposal_id"] for event in events])
+
+    def test_public_create_recovers_pending_improvement_before_writing(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = self.make_profile(Path(temporary_directory))
+            store = ProposalStore(root)
+            retained_id = self.create(store, root)["proposal_id"]
+            snapshot = root / ".harness/state/proposal-lifecycle.before"
+            lifecycle = root / ".harness/improvements/lifecycle.jsonl"
+            snapshot.write_bytes(lifecycle.read_bytes())
+            pending_id = "d" * 32
+            self.create_with_id(store, root, pending_id)
+            self.write_pending_improvement_wal(root, pending_id, snapshot)
+
+            created = self.create(store, root)
+
+            self.assertEqual("proposed", store.load(created["proposal_id"])["status"])
+            self.assertFalse((root / ".harness/state/improvement-transaction.json").exists())
+            self.assertEqual(
+                [retained_id, created["proposal_id"]],
+                [event["proposal_id"] for event in verify_journal(lifecycle)],
+            )
+
+    def test_pending_recovery_fails_closed_without_discarding_unrelated_suffix(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = self.make_profile(Path(temporary_directory))
+            store = ProposalStore(root)
+            retained_id = self.create(store, root)["proposal_id"]
+            snapshot = root / ".harness/state/proposal-lifecycle.before"
+            lifecycle = root / ".harness/improvements/lifecycle.jsonl"
+            snapshot.write_bytes(lifecycle.read_bytes())
+            pending_id = "e" * 32
+            self.create_with_id(store, root, pending_id)
+            self.write_pending_improvement_wal(root, pending_id, snapshot)
+            append_entry(lifecycle, {
+                "event": "proposal_transition", "proposal_id": retained_id,
+                "from_status": "proposed", "target_status": "notified",
+                "reason": None, "changed_at": "2026-09-11T12:01:00Z",
+            })
+            before = lifecycle.read_bytes()
+
+            with self.assertRaisesRegex(ProposalError, "pending improvement"):
+                self.create(store, root)
+
+            self.assertEqual(before, lifecycle.read_bytes())
+            self.assertTrue((root / ".harness/state/improvement-transaction.json").exists())
+            self.assertEqual("notified", store.load(retained_id)["status"])
 
     def test_legacy_markdown_is_readable_but_never_transitionable(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

@@ -500,21 +500,57 @@ def recover_improvement_transaction(root: Path, *, checkpoint: bool = True) -> b
                 raise ImprovementError(f"invalid improvement journal snapshot: {error}") from error
             if journal.exists() and _file_digest(journal) != transaction["journal_snapshot_digest"]:
                 raise ImprovementError("improvement journal changed before recovery")
+        lifecycle_restore_snapshot = False
+        lifecycle_remove_new_file = False
+        if transaction["version"] == 2:
+            try:
+                lifecycle_entries = verify_journal(lifecycle)
+                snapshot_entries = verify_journal(lifecycle_snapshot) if lifecycle_snapshot is not None else []
+            except (OSError, UnicodeError, ValueError) as error:
+                raise ImprovementError(f"invalid proposal lifecycle journal: {error}") from error
+            snapshot_bytes = lifecycle_snapshot.read_bytes() if lifecycle_snapshot is not None else b""
+            current_bytes = lifecycle.read_bytes() if lifecycle.exists() else b""
+            if not current_bytes.startswith(snapshot_bytes):
+                raise ImprovementError("proposal lifecycle journal does not extend its snapshot")
+            suffix = lifecycle_entries[len(snapshot_entries):]
+            expected_creations: dict[str, tuple[str, str, str, str]] = {}
+            for relative, digest in target_map.items():
+                path = Path(relative)
+                if path.suffix != ".json":
+                    continue
+                markdown_relative = str(path.with_suffix(".md"))
+                markdown_digest = target_map.get(markdown_relative)
+                if markdown_digest is not None:
+                    expected_creations[path.stem] = (
+                        relative, markdown_relative, digest, markdown_digest
+                    )
+            seen_creation_ids: set[str] = set()
+            for entry in suffix:
+                expected = expected_creations.get(entry.get("proposal_id"))
+                if (
+                    entry.get("event") != "proposal_created"
+                    or expected is None
+                    or entry["proposal_id"] in seen_creation_ids
+                    or (
+                        entry.get("json_path"), entry.get("markdown_path"),
+                        entry.get("json_digest"), entry.get("markdown_digest"),
+                    ) != expected
+                ):
+                    raise ImprovementError(
+                        "proposal lifecycle changed outside the pending improvement exact suffix"
+                    )
+                seen_creation_ids.add(entry["proposal_id"])
+            lifecycle_restore_snapshot = lifecycle_snapshot is not None and bool(suffix)
+            lifecycle_remove_new_file = lifecycle_snapshot is None and lifecycle.exists() and bool(suffix)
         for target in targets:
             target.unlink(missing_ok=True)
             fsync_directory(target.parent)
         if snapshot is not None and not journal.exists():
             atomic_copy_file(snapshot, journal)
         if transaction["version"] == 2:
-            try:
-                verify_journal(lifecycle)
-            except (OSError, UnicodeError, ValueError) as error:
-                raise ImprovementError(f"invalid proposal lifecycle journal: {error}") from error
-            if lifecycle_snapshot is not None:
-                if not lifecycle.read_bytes().startswith(lifecycle_snapshot.read_bytes()):
-                    raise ImprovementError("proposal lifecycle journal does not extend its snapshot")
+            if lifecycle_restore_snapshot:
                 atomic_copy_file(lifecycle_snapshot, lifecycle)
-            elif lifecycle.exists():
+            elif lifecycle_remove_new_file:
                 lifecycle.unlink()
                 fsync_directory(lifecycle.parent)
     descriptor.unlink()

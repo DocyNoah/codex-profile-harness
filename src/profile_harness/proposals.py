@@ -5,8 +5,10 @@ from __future__ import annotations
 from datetime import datetime, timezone
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
+import stat
 from typing import Any, Iterable
 import uuid
 
@@ -18,6 +20,7 @@ from .locking import ProfileLease
 
 PROPOSAL_VERSION = 1
 MAX_MANIFEST_BYTES = 1024 * 1024
+MAX_MARKDOWN_BYTES = MAX_MANIFEST_BYTES * 2
 MAX_REPLACEMENTS = 20
 MAX_CONTENT_CHARS = 64_000
 MAX_TITLE_CHARS = 200
@@ -77,6 +80,44 @@ def _file_digest(path: Path) -> str:
         while chunk := handle.read(1024 * 1024):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _buffer_digest(value: bytes) -> str:
+    return hashlib.sha256(value).hexdigest()
+
+
+def _read_bounded_regular(
+    path: Path, *, limit: int, label: str, missing_ok: bool = False
+) -> bytes | None:
+    """Read one regular file once, without following a final symlink."""
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags)
+    except FileNotFoundError:
+        if missing_ok:
+            return None
+        raise ProposalError(f"proposal {label} is missing") from None
+    except OSError as error:
+        raise ProposalError(f"proposal {label} cannot be opened safely") from error
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+            raise ProposalError(f"proposal {label} must be a single-link regular file")
+        with os.fdopen(descriptor, "rb") as handle:
+            descriptor = -1
+            raw = handle.read(limit + 1)
+    except ProposalError:
+        raise
+    except OSError as error:
+        raise ProposalError(f"proposal {label} cannot be read safely") from error
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    if len(raw) > limit:
+        raise ProposalError(f"proposal {label} exceeds the bounded size limit")
+    return raw
 
 
 def _safe_target(root: Path, relative_text: object) -> Path:
@@ -292,6 +333,26 @@ class ProposalStore:
             status = entry["target_status"]
         return status
 
+    def _recover_pending_unlocked(self) -> None:
+        try:
+            descriptor = require_safe_path(
+                self.root,
+                self.root / ".harness/state/improvement-transaction.json",
+                directory=False,
+            )
+        except ValueError as error:
+            raise ProposalError(str(error)) from error
+        if not descriptor.exists():
+            return
+        try:
+            from .improvement import ImprovementError, recover_improvement_transaction
+
+            recover_improvement_transaction(self.root)
+        except (ImprovementError, OSError, ValueError) as error:
+            raise ProposalError(
+                f"pending improvement transaction cannot be recovered safely: {error}"
+            ) from error
+
     def create(
         self,
         *,
@@ -321,6 +382,7 @@ class ProposalStore:
         }
         config = load_profile_config(self.root)
         with ProfileLease(self.root, stale_timeout=config.curation.stale_timeout_seconds):
+            self._recover_pending_unlocked()
             validate_manifest(self.root, manifest, verify_current=True)
             proposed = self._proposed_root()
             json_path = proposed / f"{identifier}.json"
@@ -331,16 +393,23 @@ class ProposalStore:
             except ValueError as error:
                 raise ProposalError(str(error)) from error
             encoded = json.dumps(manifest, ensure_ascii=False, sort_keys=True, indent=2) + "\n"
-            if not exclusive_write_text(json_path, encoded):
-                raise ProposalError("immutable proposal already exists")
+            json_created = False
+            markdown_created = False
             try:
-                if not exclusive_write_text(markdown_path, render_markdown(manifest)):
+                json_created = exclusive_write_text(json_path, encoded)
+                if not json_created:
+                    raise ProposalError("immutable proposal already exists")
+                markdown_created = exclusive_write_text(markdown_path, render_markdown(manifest))
+                if not markdown_created:
                     raise ProposalError("immutable proposal rendering already exists")
                 self._record_creation_unlocked(manifest, json_path, markdown_path)
             except BaseException:
-                json_path.unlink(missing_ok=True)
-                markdown_path.unlink(missing_ok=True)
-                fsync_directory(proposed)
+                if json_created:
+                    json_path.unlink(missing_ok=True)
+                if markdown_created:
+                    markdown_path.unlink(missing_ok=True)
+                if json_created or markdown_created:
+                    fsync_directory(proposed)
                 raise
         return manifest
 
@@ -355,11 +424,11 @@ class ProposalStore:
             require_safe_path(self.root, markdown_path, directory=False)
         except ValueError as error:
             raise ProposalError(str(error)) from error
-        if json_path.is_file():
+        raw = _read_bounded_regular(
+            json_path, limit=MAX_MANIFEST_BYTES, label="manifest", missing_ok=True
+        )
+        if raw is not None:
             try:
-                raw = json_path.read_bytes()
-                if len(raw) > MAX_MANIFEST_BYTES:
-                    raise ProposalError("proposal manifest exceeds the bounded size limit")
                 value = json.loads(raw.decode("utf-8"))
             except ProposalError:
                 raise
@@ -368,23 +437,38 @@ class ProposalStore:
             validate_manifest(self.root, value)
             if value["proposal_id"] != proposal_id:
                 raise ProposalError("proposal filename does not match its ID")
-            if not markdown_path.is_file() or markdown_path.read_text(encoding="utf-8") != render_markdown(value):
+            markdown_raw = _read_bounded_regular(
+                markdown_path, limit=MAX_MARKDOWN_BYTES, label="Markdown rendering"
+            )
+            assert markdown_raw is not None
+            try:
+                markdown = markdown_raw.decode("utf-8")
+            except UnicodeError as error:
+                raise ProposalError("proposal Markdown rendering is not valid UTF-8") from error
+            if markdown != render_markdown(value):
                 raise ProposalError("proposal Markdown rendering does not match its manifest")
             creation = self._creation(proposal_id)
             if (
-                creation["json_digest"] != _file_digest(json_path)
-                or creation["markdown_digest"] != _file_digest(markdown_path)
+                creation["json_digest"] != _buffer_digest(raw)
+                or creation["markdown_digest"] != _buffer_digest(markdown_raw)
             ):
                 raise ProposalError("proposal creation digest does not match immutable artifacts")
             loaded = json.loads(json.dumps(value))
             loaded["status"] = self._status(proposal_id)
             return loaded
-        if markdown_path.is_file():
+        markdown_raw = _read_bounded_regular(
+            markdown_path, limit=MAX_MARKDOWN_BYTES, label="legacy Markdown", missing_ok=True
+        )
+        if markdown_raw is not None:
+            try:
+                content = markdown_raw.decode("utf-8")
+            except UnicodeError as error:
+                raise ProposalError("proposal legacy Markdown is not valid UTF-8") from error
             return {
                 "proposal_id": proposal_id,
                 "status": "legacy",
                 "legacy": True,
-                "content": markdown_path.read_text(encoding="utf-8"),
+                "content": content,
                 "path": str(markdown_path.relative_to(self.root)),
             }
         raise ProposalError("proposal does not exist")
@@ -416,6 +500,7 @@ class ProposalStore:
             raise ProposalError(f"invalid proposal transition: {expected} -> {target}")
         config = load_profile_config(self.root)
         with ProfileLease(self.root, stale_timeout=config.curation.stale_timeout_seconds):
+            self._recover_pending_unlocked()
             manifest = self.load(proposal_id)
             if manifest.get("legacy"):
                 raise ProposalError("legacy Markdown proposals are read-only and never applicable")
