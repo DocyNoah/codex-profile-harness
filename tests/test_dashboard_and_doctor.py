@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Callable
 import copy
 from datetime import datetime, timedelta, timezone
+import hashlib
 import json
 from pathlib import Path
 import shutil
@@ -114,6 +115,212 @@ class DashboardTests(unittest.TestCase):
 
 
 class DoctorTests(unittest.TestCase):
+    def test_doctor_validates_installed_launchd_scheduler_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            parent = Path(temporary_directory)
+            root = parent / "profile"
+            init_profile(root, "Work")
+            executable = parent / "bin/profile-harness"
+            executable.parent.mkdir()
+            executable.write_text("#!/bin/sh\n", encoding="utf-8")
+            executable.chmod(0o700)
+            log_dir = parent / "logs"
+            log_dir.mkdir(mode=0o700)
+            log = log_dir / "work.log"
+            log.write_text("", encoding="utf-8")
+            log.chmod(0o600)
+            artifact = parent / "com.codex-profile-harness.work.plist"
+            rendered = (ROOT / "examples/launchd.plist").read_text(encoding="utf-8")
+            rendered = rendered.replace("__PROFILE_ROOT__", str(root.resolve()))
+            rendered = rendered.replace("__HARNESS_EXECUTABLE__", str(executable.resolve()))
+            profile_id = "work-" + hashlib.sha256(str(root.resolve()).encode()).hexdigest()[:8]
+            rendered = rendered.replace("__PROFILE_ID__", profile_id)
+            rendered = rendered.replace("__LOG_PATH__", str(log.resolve()))
+            artifact.write_text(rendered, encoding="utf-8")
+            artifact.chmod(0o600)
+
+            report = diagnose(root, scheduler_artifacts=(artifact.resolve(),))
+
+            self.assertTrue(report.ok, report.format())
+            self.assertIn("900-second launchd schedule", report.format())
+
+    def test_doctor_rejects_scheduler_placeholder_wrong_cadence_and_unsafe_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            parent = Path(temporary_directory)
+            root = parent / "profile"
+            init_profile(root, "Work")
+            artifact = parent / "bad.plist"
+            rendered = (ROOT / "examples/launchd.plist").read_text(encoding="utf-8")
+            rendered = rendered.replace("<integer>900</integer>", "<integer>60</integer>")
+            artifact.write_text(rendered, encoding="utf-8")
+            artifact.chmod(0o666)
+
+            report = diagnose(root, scheduler_artifacts=(artifact.resolve(),))
+
+            self.assertFalse(report.ok)
+            output = report.format().lower()
+            self.assertIn("scheduler", output)
+            self.assertIn("placeholder", output)
+            self.assertIn("writable", output)
+
+    def test_doctor_validates_installed_systemd_pair_and_cron_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            parent = Path(temporary_directory)
+            root = parent / "profile"
+            init_profile(root, "Work")
+            executable = parent / "bin/profile-harness"
+            executable.parent.mkdir()
+            executable.write_text("#!/bin/sh\n", encoding="utf-8")
+            executable.chmod(0o700)
+            profile_id = "work-" + hashlib.sha256(str(root.resolve()).encode()).hexdigest()[:8]
+            replacements = {
+                "__PROFILE_ROOT__": str(root.resolve()),
+                "__HARNESS_EXECUTABLE__": str(executable.resolve()),
+                "__PROFILE_ID__": profile_id,
+            }
+            units = []
+            for source_name, target_name in (
+                ("systemd.service", f"codex-profile-harness-{profile_id}.service"),
+                ("systemd.timer", f"codex-profile-harness-{profile_id}.timer"),
+            ):
+                content = (ROOT / "examples" / source_name).read_text(encoding="utf-8")
+                for marker, value in replacements.items():
+                    content = content.replace(marker, value)
+                target = parent / target_name
+                target.write_text(content, encoding="utf-8")
+                target.chmod(0o600)
+                units.append(target)
+
+            systemd = diagnose(root, scheduler_artifacts=tuple(item.resolve() for item in units))
+            self.assertTrue(systemd.ok, systemd.format())
+            self.assertIn("900-second systemd user schedule", systemd.format())
+
+            cron = (ROOT / "examples/cron.example").read_text(encoding="utf-8")
+            for marker, value in replacements.items():
+                cron = cron.replace(marker, value)
+            cron_path = parent / "installed.crontab"
+            cron_path.write_text(cron, encoding="utf-8")
+            cron_path.chmod(0o600)
+            cron_report = diagnose(root, scheduler_artifacts=(cron_path.resolve(),))
+            self.assertTrue(cron_report.ok, cron_report.format())
+            self.assertIn("900-second cron fallback", cron_report.format())
+
+    def test_doctor_rejects_resolved_scheduler_with_wrong_cadence_or_profile(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            parent = Path(temporary_directory)
+            root = parent / "profile"
+            other = parent / "other"
+            init_profile(root, "Work")
+            executable = parent / "profile-harness"
+            executable.write_text("#!/bin/sh\n", encoding="utf-8")
+            executable.chmod(0o700)
+            log_dir = parent / "logs"
+            log_dir.mkdir(mode=0o700)
+            log = log_dir / "work.log"
+            log.write_text("", encoding="utf-8")
+            log.chmod(0o600)
+            text = (ROOT / "examples/launchd.plist").read_text(encoding="utf-8")
+            for marker, value in {
+                "__PROFILE_ROOT__": str(other.resolve()),
+                "__HARNESS_EXECUTABLE__": str(executable.resolve()),
+                "__PROFILE_ID__": "work-1234abcd",
+                "__LOG_PATH__": str(log.resolve()),
+            }.items():
+                text = text.replace(marker, value)
+            text = text.replace("<integer>900</integer>", "<integer>60</integer>")
+            artifact = parent / "wrong.plist"
+            artifact.write_text(text, encoding="utf-8")
+            artifact.chmod(0o600)
+
+            report = diagnose(root, scheduler_artifacts=(artifact.resolve(),))
+            self.assertFalse(report.ok)
+            self.assertIn("900 seconds", report.format())
+
+    def test_doctor_binds_scheduler_identity_and_rejects_symlinked_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            parent = Path(temporary_directory)
+            root = parent / "work"
+            init_profile(root, "Work")
+            executable = parent / "profile-harness"
+            executable.write_text("#!/bin/sh\n", encoding="utf-8")
+            executable.chmod(0o700)
+            log_dir = parent / "logs"
+            log_dir.mkdir(mode=0o700)
+            log = log_dir / "work.log"
+            log.write_text("", encoding="utf-8")
+            log.chmod(0o600)
+            text = (ROOT / "examples/launchd.plist").read_text(encoding="utf-8")
+            for marker, value in {
+                "__PROFILE_ROOT__": str(root.resolve()),
+                "__HARNESS_EXECUTABLE__": str(executable.resolve()),
+                "__PROFILE_ID__": "work-deadbeef",
+                "__LOG_PATH__": str(log.resolve()),
+            }.items():
+                text = text.replace(marker, value)
+            real_dir = parent / "real"
+            real_dir.mkdir()
+            artifact = real_dir / "wrong.plist"
+            artifact.write_text(text, encoding="utf-8")
+            artifact.chmod(0o600)
+
+            identity_report = diagnose(root, scheduler_artifacts=(artifact.resolve(),))
+            self.assertFalse(identity_report.ok)
+            self.assertIn("exact profile identity", identity_report.format())
+
+            alias = parent / "alias"
+            alias.symlink_to(real_dir, target_is_directory=True)
+            symlink_report = diagnose(root, scheduler_artifacts=(alias / "wrong.plist",))
+            self.assertFalse(symlink_report.ok)
+            self.assertIn("symlink", symlink_report.format().lower())
+
+    def test_doctor_requires_systemd_hardening(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            parent = Path(temporary_directory)
+            root = parent / "work"
+            init_profile(root, "Work")
+            executable = parent / "profile-harness"
+            executable.write_text("#!/bin/sh\n", encoding="utf-8")
+            executable.chmod(0o700)
+            profile_id = "work-" + hashlib.sha256(str(root.resolve()).encode()).hexdigest()[:8]
+            replacements = {
+                "__PROFILE_ROOT__": str(root.resolve()),
+                "__HARNESS_EXECUTABLE__": str(executable.resolve()),
+                "__PROFILE_ID__": profile_id,
+            }
+            units = []
+            for source_name, suffix in (("systemd.service", ".service"), ("systemd.timer", ".timer")):
+                content = (ROOT / "examples" / source_name).read_text(encoding="utf-8")
+                for marker, value in replacements.items():
+                    content = content.replace(marker, value)
+                if suffix == ".service":
+                    content = content.replace("UMask=0077\n", "")
+                target = parent / f"codex-profile-harness-{profile_id}{suffix}"
+                target.write_text(content, encoding="utf-8")
+                target.chmod(0o600)
+                units.append(target)
+
+            report = diagnose(root, scheduler_artifacts=tuple(item.resolve() for item in units))
+            self.assertFalse(report.ok)
+            self.assertIn("hardening", report.format().lower())
+
+    def test_doctor_rejects_scheduler_variable_expansion(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            parent = Path(temporary_directory)
+            root = parent / "work"
+            init_profile(root, "Work")
+            profile_id = "work-" + hashlib.sha256(str(root.resolve()).encode()).hexdigest()[:8]
+            cron = (ROOT / "examples/cron.example").read_text(encoding="utf-8")
+            cron = cron.replace("__PROFILE_ID__", profile_id)
+            cron = cron.replace("__PROFILE_ROOT__", str(root.resolve()))
+            cron = cron.replace("__HARNESS_EXECUTABLE__", "$HOME/bin/profile-harness")
+            artifact = parent / "installed.crontab"
+            artifact.write_text(cron, encoding="utf-8")
+            artifact.chmod(0o600)
+
+            report = diagnose(root, scheduler_artifacts=(artifact.resolve(),))
+
+            self.assertFalse(report.ok)
+            self.assertIn("shell interpolation", report.format().lower())
     def test_doctor_validates_control_outbox_contract(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory) / "profile"

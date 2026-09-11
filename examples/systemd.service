@@ -1,0 +1,11 @@
+[Unit]
+Description=Codex Profile Harness maintenance (__PROFILE_ID__)
+
+[Service]
+Type=oneshot
+WorkingDirectory="__PROFILE_ROOT__"
+ExecStart="__HARNESS_EXECUTABLE__" maintain --profile "__PROFILE_ROOT__"
+SyslogIdentifier=codex-profile-harness-__PROFILE_ID__
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true

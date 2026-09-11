@@ -2,8 +2,13 @@
 
 ## Install
 
+Recommended: ask a local Codex agent to install this release after reading
+[INSTALL_AGENT.md](INSTALL_AGENT.md). The agent inspects the actual device,
+previews every affected path, selects the native scheduler, and verifies the
+result. This document remains the shorter manual reference.
+
 From a cloned or extracted release, inspect `hooks/hooks.json`, preview the
-operation, then install:
+bounded plugin/CLI operation, then install:
 
 ```sh
 python3 scripts/install.py --dry-run
@@ -80,25 +85,37 @@ history. Registration accepts only real directories below `projects/`.
 
 ## Scheduling and models
 
-Install [examples/cron.example](examples/cron.example) with `crontab -e` after
-adjusting its profile path, and create the log directory:
+Prefer [examples/launchd.plist](examples/launchd.plist) on macOS or the
+[examples/systemd.service](examples/systemd.service) and
+[examples/systemd.timer](examples/systemd.timer) pair on Linux. Use
+[examples/cron.example](examples/cron.example) only as a fallback. Replace its
+placeholders with canonical absolute paths and a unique profile ID as specified
+in `INSTALL_AGENT.md`.
+
+The plugin installer does not install a scheduler. Install the selected artifact
+separately with mode `0600` and verify the actual installed artifact:
 
 ```sh
-mkdir -p "$HOME/.local/state/profile-harness"
-crontab -e
+profile-harness doctor --profile "$PROFILE_ROOT" --scheduler-artifact /absolute/installed.plist
 ```
 
 Every 15 minutes, `maintain` performs model-free due checks. Curation runs with
 `gpt-5.6-sol` / `medium` at 30 receipts or 4 hours oldest-receipt age. Improvement
 runs with `gpt-6-astra` / `high` after a 24 hours cooldown and either 10 new
-curations, or 72 hours plus 3 new curations. Not-due runs consume no model token;
-due work consumes tokens. Improvement is proposal-only and never auto-applies.
+curations or one validated improvement signal repeated across three curations.
+Not-due runs consume no model token; due work consumes tokens. Approval is the
+default; proposal-only and explicitly allowlisted `auto_safe` modes are available.
+
+Maintenance scheduling is separate from the Codex control heartbeat. Give the
+rendered [templates/automations/harness-control.md](templates/automations/harness-control.md)
+request to Codex to create one dedicated `Harness Control` task using
+`gpt-5.6-luna` / `low` and one 15-minute heartbeat. It only invokes the public
+`profile-harness control poll --json` command and stays quiet when no event is due.
 
 To run or inspect manually:
 
 ```sh
-cd "$PROFILE_ROOT"
-profile-harness maintain
+profile-harness maintain --profile "$PROFILE_ROOT"
 profile-harness dashboard
 profile-harness doctor
 profile-harness git status
@@ -113,8 +130,9 @@ work itself. Curation reconciles evidence; it is not a separate routine rewrite.
 Only managed profile documents are staged: profile instructions/context,
 `PROJECTS.toml`, config, curated semantic/procedural memory, journals, and
 improvement proposals/status. Runtime evidence and state, `DASHBOARD.md`, and
-nested repositories are ignored. Deterministic commits are local: there is no
-automatic push. Git hooks are disabled only for harness-owned checkpoint commands;
+nested repositories are ignored. Deterministic commits are local by default:
+there is no automatic push unless the user opts in with a privacy acknowledgement
+and exact upstream. Git hooks are disabled only for harness-owned checkpoint commands;
 normal user Git commands retain their configured hooks.
 
 `profile-harness doctor` reports capture, journal, transaction, and checkpoint
@@ -154,7 +172,9 @@ are untouched.
 
 ## Uninstall
 
-Pause/remove the cron entry, then unregister the plugin and marketplace:
+Pause/remove only the profile-specific LaunchAgent, systemd user units, or cron
+block, and remove the dedicated Harness Control heartbeat/task after verifying
+its identity. Then unregister the plugin and marketplace:
 
 ```sh
 codex plugin remove codex-profile-harness@codex-profile-harness-local

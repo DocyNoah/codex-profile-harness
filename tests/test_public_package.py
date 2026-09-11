@@ -4,6 +4,8 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import plistlib
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -208,8 +210,92 @@ class PublicPackageTests(unittest.TestCase):
     def test_cron_runs_maintain_every_fifteen_minutes(self) -> None:
         cron = (ROOT / "examples/cron.example").read_text()
         self.assertIn("*/15 * * * *", cron)
-        self.assertIn("profile-harness\" maintain", cron)
+        command = next(line for line in cron.splitlines() if line.startswith("*/15 ")).split(None, 5)[5]
+        self.assertEqual(
+            ["__HARNESS_EXECUTABLE__", "maintain", "--profile", "__PROFILE_ROOT__"],
+            shlex.split(command),
+        )
         self.assertNotIn("curate --run", cron)
+
+    def test_agent_install_contract_and_scheduler_assets_are_packaged(self) -> None:
+        required = {
+            "INSTALL_AGENT.md",
+            "templates/automations/harness-control.md",
+            "examples/launchd.plist",
+            "examples/systemd.service",
+            "examples/systemd.timer",
+            "examples/cron.example",
+        }
+        self.assertTrue(required <= set(PACKAGED_FILES))
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            _, plugin = self.build(Path(temporary_directory))
+            self.assertTrue(all((plugin / relative).is_file() for relative in required))
+
+        contract = (ROOT / "INSTALL_AGENT.md").read_text(encoding="utf-8").lower()
+        for phase in ("inspect", "preview", "install", "verify", "upgrade", "rollback", "uninstall"):
+            self.assertIn(phase, contract)
+        self.assertIn("agent", contract)
+        self.assertIn("doctor --scheduler-artifact", contract)
+        self.assertNotIn("one-click", contract)
+
+        manual = (ROOT / "INSTALL.md").read_text(encoding="utf-8")
+        self.assertIn("INSTALL_AGENT.md", manual)
+        self.assertIn("examples/launchd.plist", manual)
+        self.assertIn("examples/systemd.timer", manual)
+        self.assertIn("templates/automations/harness-control.md", manual)
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        self.assertIn("INSTALL_AGENT.md", readme)
+        self.assertIn("ask a local Codex agent", readme)
+
+    def test_scheduler_templates_are_argv_only_bounded_and_profile_specific(self) -> None:
+        launchd = plistlib.loads((ROOT / "examples/launchd.plist").read_bytes())
+        self.assertEqual(900, launchd["StartInterval"])
+        self.assertEqual(
+            ["__HARNESS_EXECUTABLE__", "maintain", "--profile", "__PROFILE_ROOT__"],
+            launchd["ProgramArguments"],
+        )
+        self.assertIn("__PROFILE_ID__", launchd["Label"])
+        self.assertEqual("__PROFILE_ROOT__", launchd["WorkingDirectory"])
+        self.assertEqual("__LOG_PATH__", launchd["StandardOutPath"])
+        self.assertEqual("__LOG_PATH__", launchd["StandardErrorPath"])
+
+        service = (ROOT / "examples/systemd.service").read_text(encoding="utf-8")
+        timer = (ROOT / "examples/systemd.timer").read_text(encoding="utf-8")
+        self.assertIn('ExecStart="__HARNESS_EXECUTABLE__" maintain --profile "__PROFILE_ROOT__"', service)
+        self.assertIn("SyslogIdentifier=codex-profile-harness-__PROFILE_ID__", service)
+        self.assertIn("OnUnitActiveSec=900s", timer)
+        self.assertIn("Unit=codex-profile-harness-__PROFILE_ID__.service", timer)
+
+        combined = "\n".join((service, timer, (ROOT / "examples/cron.example").read_text()))
+        for unsafe in ("sh -c", "/bin/sh", "$(", "`"):
+            self.assertNotIn(unsafe, combined)
+
+    def test_control_setup_prompt_is_bounded_and_uses_only_public_cli(self) -> None:
+        prompt = (ROOT / "templates/automations/harness-control.md").read_text(encoding="utf-8")
+        self.assertLessEqual(len(prompt.encode("utf-8")), 8192)
+        for phrase in (
+            "Harness Control", "gpt-5.6-luna", "low", "15 minutes",
+            "profile-harness control poll --json", "상세 <ID>", "승인 <ID>", "거절 <ID>",
+        ):
+            self.assertIn(phrase, prompt)
+        lowered = prompt.lower()
+        self.assertNotIn("private api", lowered)
+        self.assertNotIn("raw rrule", lowered)
+
+    def test_maintain_accepts_explicit_profile_for_scheduler_argv(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory) / "profile"
+            initialized = subprocess.run(
+                [sys.executable, str(ROOT / "bin/profile-harness"), "init", str(root), "--name", "Scheduled"],
+                text=True, capture_output=True, check=False,
+            )
+            self.assertEqual(0, initialized.returncode, initialized.stderr)
+            result = subprocess.run(
+                [sys.executable, str(ROOT / "bin/profile-harness"), "maintain", "--profile", str(root)],
+                cwd=root.parent, text=True, capture_output=True, check=False,
+            )
+            self.assertEqual(0, result.returncode, result.stderr)
+            self.assertEqual("no_op", json.loads(result.stdout)["curation"]["status"])
 
     def test_installer_dry_run_is_non_mutating_and_prints_selector(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -235,6 +321,8 @@ class PublicPackageTests(unittest.TestCase):
                 completed.stdout,
             )
             self.assertNotIn("dangerously-bypass", completed.stdout)
+            self.assertIn("INSTALL_AGENT.md", completed.stdout)
+            self.assertIn("does not install a scheduler", completed.stdout)
 
     def test_installer_uses_injectable_codex_boundary_and_recoverable_upgrade(self) -> None:
         module = self.load_script("profile_harness_installer", "install.py")

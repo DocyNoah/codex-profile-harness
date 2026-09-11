@@ -1,6 +1,7 @@
-# Install with: crontab -e
-# This example expects the profile at $HOME/codex-profiles/work and the executable
-# at $HOME/.local/bin/profile-harness.
-# Due checks are model-free. Empty/not-due runs do not invoke Codex.
-PATH=/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin
-*/15 * * * * mkdir -p "$HOME/.local/state/profile-harness" && cd "$HOME/codex-profiles/work" && "$HOME/.local/bin/profile-harness" maintain >> "$HOME/.local/state/profile-harness/work.log" 2>&1
+# Fallback only when a macOS LaunchAgent or Linux user systemd timer is unavailable.
+# Replace every placeholder with a verified canonical absolute path or bounded profile ID.
+# Cron invokes its command through a shell, so refuse whitespace or shell metacharacters
+# in substituted paths. This command itself contains no expansion, redirection, or pipeline.
+# BEGIN codex-profile-harness-__PROFILE_ID__
+*/15 * * * * __HARNESS_EXECUTABLE__ maintain --profile __PROFILE_ROOT__
+# END codex-profile-harness-__PROFILE_ID__

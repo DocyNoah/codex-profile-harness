@@ -71,7 +71,11 @@ def _parser() -> argparse.ArgumentParser:
     curate.add_argument("--limit", type=int)
     curate.add_argument("--batch", dest="batch_id")
 
-    commands.add_parser("maintain", help="run deterministic due maintenance")
+    maintain = commands.add_parser("maintain", help="run deterministic due maintenance")
+    maintain.add_argument(
+        "--profile", type=Path,
+        help="explicit profile root for scheduler argv (otherwise discover from cwd)",
+    )
 
     improve = commands.add_parser("improve", help="run proposal-only profile improvement")
     improve.add_argument("--run", action="store_true", required=True)
@@ -90,6 +94,13 @@ def _parser() -> argparse.ArgumentParser:
         "--profile",
         type=Path,
         help="profile root to diagnose, including when config.toml is broken",
+    )
+    doctor.add_argument(
+        "--scheduler-artifact",
+        action="append",
+        type=Path,
+        default=[],
+        help="validate an installed launchd, systemd, or cron artifact as evidence",
     )
     git = commands.add_parser("git", help="inspect or checkpoint profile documents")
     git_commands = git.add_subparsers(dest="git_command", required=True)
@@ -274,7 +285,12 @@ def main(argv: list[str] | None = None) -> int:
         elif arguments.command == "curate":
             return _curate(arguments)
         elif arguments.command == "maintain":
-            root = find_profile_root(Path.cwd())
+            root = (
+                arguments.profile.expanduser().resolve()
+                if arguments.profile is not None
+                else find_profile_root(Path.cwd())
+            )
+            load_profile_config(root)
             print(json.dumps(run_maintenance(root), ensure_ascii=False, sort_keys=True))
         elif arguments.command == "improve":
             root = find_profile_root(Path.cwd())
@@ -293,6 +309,7 @@ def main(argv: list[str] | None = None) -> int:
             report = diagnose(
                 root,
                 check_codex=arguments.check_codex,
+                scheduler_artifacts=tuple(arguments.scheduler_artifact),
             )
             print(report.format())
             return 0 if report.ok else 1

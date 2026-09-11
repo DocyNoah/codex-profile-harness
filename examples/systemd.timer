@@ -1,0 +1,12 @@
+[Unit]
+Description=Codex Profile Harness timer (__PROFILE_ID__)
+
+[Timer]
+OnBootSec=900s
+OnUnitActiveSec=900s
+AccuracySec=60s
+Persistent=true
+Unit=codex-profile-harness-__PROFILE_ID__.service
+
+[Install]
+WantedBy=timers.target

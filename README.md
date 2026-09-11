@@ -10,7 +10,10 @@ keeps managed profile documents in automatic local Git history.
 
 Requirements: macOS or Linux, Python 3.11+, Git, and an installed/authenticated
 Codex CLI. Clone [this repository](https://github.com/DocyNoah/codex-profile-harness),
-inspect `hooks/hooks.json`, then run:
+then ask a local Codex agent to read [INSTALL_AGENT.md](INSTALL_AGENT.md) and
+install it. The agent previews the affected paths, selects launchd or user
+systemd (cron only as fallback), and verifies actual scheduler evidence. For a
+manual plugin/CLI install, inspect `hooks/hooks.json`, then run:
 
 ```sh
 python3 scripts/install.py

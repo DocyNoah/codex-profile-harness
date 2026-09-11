@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.codex-profile-harness.__PROFILE_ID__</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>__HARNESS_EXECUTABLE__</string>
+    <string>maintain</string>
+    <string>--profile</string>
+    <string>__PROFILE_ROOT__</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>__PROFILE_ROOT__</string>
+  <key>StartInterval</key>
+  <integer>900</integer>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>StandardOutPath</key>
+  <string>__LOG_PATH__</string>
+  <key>StandardErrorPath</key>
+  <string>__LOG_PATH__</string>
+</dict>
+</plist>

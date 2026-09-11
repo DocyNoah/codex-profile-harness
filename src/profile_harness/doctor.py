@@ -9,7 +9,9 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import plistlib
 import re
+import shlex
 import shutil
 import tomllib
 
@@ -53,6 +55,8 @@ from .locking import LeaseBusyError, ProfileLease
 
 REQUIRED_PLUGIN_FILES = (
     ".codex-plugin/plugin.json",
+    "INSTALL_AGENT.md",
+    "INSTALL.md",
     "bin/profile-harness",
     "hooks/hooks.json",
     "schemas/hook-receipt.schema.json",
@@ -76,6 +80,11 @@ REQUIRED_PLUGIN_FILES = (
     "templates/profile/IDENTITY.md",
     "templates/profile/MEMORY.md",
     "templates/profile/USER.md",
+    "templates/automations/harness-control.md",
+    "examples/cron.example",
+    "examples/launchd.plist",
+    "examples/systemd.service",
+    "examples/systemd.timer",
     "templates/repo/AGENTS.md",
     "templates/repo/DECISIONS.md",
     "templates/repo/STATUS.md",
@@ -100,6 +109,13 @@ PROFILE_LAYOUT_DIRECTORIES = tuple(
 )
 PLUGIN_NAME = "codex-profile-harness"
 HOOK_COMMAND = 'python3 "$PLUGIN_ROOT/bin/profile-harness" hook capture'
+SCHEDULER_INTERVAL_SECONDS = 900
+SCHEDULER_PLACEHOLDERS = (
+    "__PROFILE_ROOT__",
+    "__HARNESS_EXECUTABLE__",
+    "__PROFILE_ID__",
+    "__LOG_PATH__",
+)
 _RFC3339_UTC_PATTERN = (
     r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}"
     r"(?:\.[0-9]{1,6})?Z$"
@@ -782,6 +798,193 @@ def _guard_is_locked(root: Path) -> bool:
             return False
 
 
+def _scheduler_file(path: Path) -> tuple[Path, str]:
+    candidate = Path(path).expanduser().absolute()
+    try:
+        resolved = candidate.resolve(strict=True)
+    except OSError as error:
+        raise ValueError(f"scheduler artifact cannot be resolved safely: {candidate}") from error
+    if resolved != candidate:
+        raise ValueError(f"scheduler artifact path contains a symlink or is not canonical: {candidate}")
+    if candidate.is_symlink() or not candidate.is_file():
+        raise ValueError(f"scheduler artifact is missing, not regular, or a symlink: {candidate}")
+    stat = candidate.stat()
+    if stat.st_size > 64 * 1024:
+        raise ValueError(f"scheduler artifact exceeds 64 KiB: {candidate}")
+    try:
+        text = candidate.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as error:
+        raise ValueError(f"scheduler artifact is not readable UTF-8: {candidate}") from error
+    errors: list[str] = []
+    if stat.st_mode & 0o022:
+        errors.append(f"scheduler artifact is group/world writable: {candidate}")
+    unresolved = [item for item in SCHEDULER_PLACEHOLDERS if item in text]
+    if unresolved:
+        errors.append("scheduler artifact contains unresolved placeholder(s): " + ", ".join(unresolved))
+    for unsafe in ("$", "`", "sh -c", "/bin/sh"):
+        if unsafe in text:
+            errors.append(f"scheduler artifact contains shell interpolation: {unsafe}")
+    if errors:
+        raise ValueError("; ".join(errors))
+    return candidate, text
+
+
+def _scheduler_profile_id(root: Path) -> str:
+    name = load_profile_config(root).name.lower()
+    slug = re.sub(r"[^a-z0-9]+", "-", name).strip("-") or "profile"
+    slug = slug[:55].rstrip("-") or "profile"
+    digest = hashlib.sha256(str(root).encode("utf-8")).hexdigest()[:8]
+    return f"{slug}-{digest}"
+
+
+def _exact_scheduler_argv(value: object, root: Path) -> tuple[str, str]:
+    if not isinstance(value, list) or len(value) != 4 or not all(isinstance(item, str) for item in value):
+        raise ValueError("scheduler command must contain exactly four argv entries")
+    executable, command, option, profile = value
+    if command != "maintain" or option != "--profile" or profile != str(root):
+        raise ValueError("scheduler command does not target the exact profile")
+    executable_path = Path(executable)
+    try:
+        executable_resolved = executable_path.resolve(strict=True)
+    except OSError as error:
+        raise ValueError("scheduler executable must be an existing absolute regular file") from error
+    if (
+        not executable_path.is_absolute()
+        or executable_path.is_symlink()
+        or executable_resolved != executable_path
+        or not executable_path.is_file()
+    ):
+        raise ValueError("scheduler executable must be an existing absolute regular file")
+    return executable, profile
+
+
+def _validate_launchd_artifact(path: Path, text: str, root: Path) -> str:
+    try:
+        value = plistlib.loads(text.encode("utf-8"))
+    except (plistlib.InvalidFileException, ValueError) as error:
+        raise ValueError("invalid launchd plist") from error
+    if not isinstance(value, dict):
+        raise ValueError("launchd plist must be a dictionary")
+    if value.get("StartInterval") != SCHEDULER_INTERVAL_SECONDS:
+        raise ValueError("launchd cadence must be exactly 900 seconds")
+    _exact_scheduler_argv(value.get("ProgramArguments"), root)
+    if value.get("WorkingDirectory") != str(root):
+        raise ValueError("launchd working directory does not match the profile")
+    label = value.get("Label")
+    expected_label = f"com.codex-profile-harness.{_scheduler_profile_id(root)}"
+    if label != expected_label:
+        raise ValueError("launchd label does not match the exact profile identity")
+    stdout, stderr = value.get("StandardOutPath"), value.get("StandardErrorPath")
+    if not isinstance(stdout, str) or stdout != stderr or not Path(stdout).is_absolute():
+        raise ValueError("launchd must use one absolute log path")
+    log_path = Path(stdout)
+    try:
+        resolved_log = log_path.resolve(strict=True)
+    except OSError as error:
+        raise ValueError("launchd log must be an existing non-symlink file with mode 0600") from error
+    if log_path.is_symlink() or resolved_log != log_path or not log_path.is_file() or log_path.stat().st_mode & 0o077:
+        raise ValueError("launchd log must be an existing non-symlink file with mode 0600")
+    parent = log_path.parent
+    if parent.is_symlink() or not parent.is_dir() or parent.stat().st_mode & 0o077:
+        raise ValueError("launchd log directory must be non-symlink and mode 0700")
+    return f"validated 900-second launchd schedule {label}"
+
+
+def _unit_values(text: str) -> dict[str, str]:
+    values: dict[str, str] = {}
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith(("#", "[")):
+            continue
+        if "=" not in line:
+            raise ValueError("invalid systemd assignment")
+        key, value = line.split("=", 1)
+        if key in values:
+            raise ValueError(f"duplicate systemd key: {key}")
+        values[key] = value
+    return values
+
+
+def _validate_systemd_artifacts(items: list[tuple[Path, str]], root: Path) -> str:
+    service_items = [item for item in items if item[0].suffix == ".service"]
+    timer_items = [item for item in items if item[0].suffix == ".timer"]
+    if len(service_items) != 1 or len(timer_items) != 1:
+        raise ValueError("systemd evidence requires exactly one service and one timer")
+    service_path, service_text = service_items[0]
+    timer_path, timer_text = timer_items[0]
+    service, timer = _unit_values(service_text), _unit_values(timer_text)
+    if service.get("Type") != "oneshot" or service.get("WorkingDirectory", "").strip('"') != str(root):
+        raise ValueError("systemd service is not a oneshot for the exact profile")
+    try:
+        argv = shlex.split(service.get("ExecStart", ""), posix=True)
+    except ValueError as error:
+        raise ValueError("systemd ExecStart is invalid") from error
+    _exact_scheduler_argv(argv, root)
+    identity = service.get("SyslogIdentifier", "")
+    expected_identity = f"codex-profile-harness-{_scheduler_profile_id(root)}"
+    if identity != expected_identity:
+        raise ValueError("systemd service does not match the exact profile identity")
+    if (
+        service.get("UMask") != "0077"
+        or service.get("NoNewPrivileges") != "true"
+        or service.get("PrivateTmp") != "true"
+    ):
+        raise ValueError("systemd service hardening is incomplete")
+    if timer.get("OnUnitActiveSec") != "900s" or timer.get("Unit") != f"{identity}.service":
+        raise ValueError("systemd timer cadence or service identity is invalid")
+    if service_path.stem != identity or timer_path.stem != identity:
+        raise ValueError("systemd filenames do not match the profile identity")
+    return f"validated 900-second systemd user schedule {identity}"
+
+
+def _validate_cron_artifact(path: Path, text: str, root: Path) -> str:
+    rows = [line for line in text.splitlines() if line.strip() and not line.lstrip().startswith("#")]
+    schedules = [line for line in rows if line.startswith("*/15 ")]
+    if len(schedules) != 1:
+        raise ValueError("cron evidence must contain exactly one 15-minute entry")
+    if any(character in schedules[0] for character in ";|&><"):
+        raise ValueError("cron command must not use shell operators")
+    try:
+        argv = shlex.split(schedules[0].split(None, 5)[5])
+    except (ValueError, IndexError) as error:
+        raise ValueError("cron command is invalid") from error
+    _exact_scheduler_argv(argv, root)
+    profile_id = _scheduler_profile_id(root)
+    if (
+        text.count(f"# BEGIN codex-profile-harness-{profile_id}") != 1
+        or text.count(f"# END codex-profile-harness-{profile_id}") != 1
+    ):
+        raise ValueError("cron markers do not match the exact profile identity")
+    return f"validated 900-second cron fallback {path.name}"
+
+
+def _scheduler_findings(root: Path, artifacts: tuple[Path, ...]) -> list[Finding]:
+    if not artifacts:
+        return []
+    findings: list[Finding] = []
+    loaded: list[tuple[Path, str]] = []
+    for artifact in artifacts:
+        try:
+            loaded.append(_scheduler_file(artifact))
+        except (OSError, ValueError) as error:
+            findings.append(Finding("ERROR", "scheduler", str(error)))
+    if findings:
+        return findings
+    try:
+        suffixes = {path.suffix for path, _ in loaded}
+        if suffixes == {".plist"} and len(loaded) == 1:
+            detail = _validate_launchd_artifact(*loaded[0], root)
+        elif suffixes == {".service", ".timer"} and len(loaded) == 2:
+            detail = _validate_systemd_artifacts(loaded, root)
+        elif len(loaded) == 1:
+            detail = _validate_cron_artifact(*loaded[0], root)
+        else:
+            raise ValueError("scheduler evidence must be one plist, one cron file, or a service/timer pair")
+    except (OSError, ValueError) as error:
+        return [Finding("ERROR", "scheduler", str(error))]
+    return [Finding("OK", "scheduler", detail)]
+
+
 def _archived_receipt(path: Path) -> tuple[dict, str]:
     value = _strict_json(path)
     receipt_id = value.get("id") if isinstance(value, dict) else None
@@ -804,10 +1007,12 @@ def diagnose(
     check_codex: bool = False,
     codex_command: str | None = None,
     recover_application_state: bool = True,
+    scheduler_artifacts: tuple[Path, ...] = (),
 ) -> DoctorReport:
     """Inspect integrity, recovering durable interrupted transactions when idle."""
     profile_root = Path(root).expanduser().resolve()
     findings = _plugin_findings()
+    findings.extend(_scheduler_findings(profile_root, scheduler_artifacts))
     for relative in PROFILE_FILES:
         path = profile_root / relative
         if path.is_symlink():

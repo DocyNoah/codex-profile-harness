@@ -367,6 +367,7 @@ def main(argv: list[str] | None = None) -> int:
     if arguments.dry_run:
         print(f"Would validate and build the reviewed marketplace at: {arguments.marketplace_root.expanduser()}")
         print(f"Would link profile-harness under: {arguments.bin_home.expanduser()}")
+        print("This primitive does not install a scheduler; have a local Codex agent follow INSTALL_AGENT.md.")
         print("No files or Codex settings were changed.")
         return 0
     try:
@@ -378,6 +379,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Previous installation retained at: {result.backup_path}")
     print(f"Executable: {result.executable_path}")
     print("Next: inspect hooks/hooks.json, start a new Codex task, then approve the hook prompt.")
+    print("For profile scheduling and Harness Control, have the local Codex agent follow INSTALL_AGENT.md.")
     print("Create a profile with: profile-harness init PATH --name NAME")
     return 0
 
