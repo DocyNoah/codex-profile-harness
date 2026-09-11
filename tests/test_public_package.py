@@ -376,7 +376,7 @@ class PublicPackageTests(unittest.TestCase):
 
     def test_installer_dry_run_is_non_mutating_and_prints_selector(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
-            parent = Path(temporary_directory)
+            parent = Path(temporary_directory).resolve()
             marketplace = parent / "marketplace"
             bin_home = parent / "bin"
             completed = subprocess.run(
@@ -404,7 +404,7 @@ class PublicPackageTests(unittest.TestCase):
     def test_explicit_backup_id_binds_preview_and_upgrade_destination(self) -> None:
         module = self.load_script("profile_harness_installer_bound_backup", "install.py")
         with tempfile.TemporaryDirectory() as directory:
-            parent = Path(directory)
+            parent = Path(directory).resolve()
             marketplace = parent / "marketplace"
             bin_home = parent / "bin"
             build_local_marketplace(ROOT, marketplace)
@@ -439,7 +439,7 @@ class PublicPackageTests(unittest.TestCase):
         module = self.load_script("profile_harness_installer_backup_guard", "install.py")
         for value in ("", "../escape", "slash/value", "space value", "bad\nvalue", "x" * 65):
             with self.subTest(value=value), tempfile.TemporaryDirectory() as directory:
-                parent = Path(directory)
+                parent = Path(directory).resolve()
                 marketplace = parent / "marketplace"
                 build_local_marketplace(ROOT, marketplace)
                 boundary = self.memory_boundary(
@@ -454,7 +454,7 @@ class PublicPackageTests(unittest.TestCase):
                 self.assertEqual([], boundary.commands)
 
         with tempfile.TemporaryDirectory() as directory:
-            parent = Path(directory)
+            parent = Path(directory).resolve()
             marketplace = parent / "marketplace"
             build_local_marketplace(ROOT, marketplace)
             (marketplace / "old-marker").write_text("old")
@@ -471,6 +471,63 @@ class PublicPackageTests(unittest.TestCase):
             self.assertEqual("old", (marketplace / "old-marker").read_text())
             self.assertEqual([], boundary.commands)
 
+    def test_installer_rejects_symlinked_marketplace_and_bin_ancestors_preflight(self) -> None:
+        module = self.load_script("profile_harness_installer_ancestor_guard", "install.py")
+
+        class NoCodex:
+            def __init__(self):
+                self.called = False
+
+            def inspect(self):
+                self.called = True
+                raise AssertionError("Codex inspection must not run")
+
+            def run(self, command):
+                raise AssertionError(f"Codex mutation must not run: {command}")
+
+        with tempfile.TemporaryDirectory() as directory:
+            parent = Path(directory).resolve()
+            real = parent / "real"
+            real.mkdir()
+            alias = parent / "alias"
+            alias.symlink_to(real, target_is_directory=True)
+            boundary = NoCodex()
+            with self.assertRaisesRegex(ValueError, "symlink ancestor"):
+                module.install(
+                    ROOT, alias / "marketplace", parent / "bin",
+                    codex=boundary, backup_id="safe-id",
+                )
+            self.assertFalse(boundary.called)
+            self.assertEqual([], list(real.iterdir()))
+
+            boundary = NoCodex()
+            with self.assertRaisesRegex(ValueError, "symlink ancestor"):
+                module.install(
+                    ROOT, parent / "marketplace", alias / "bin",
+                    codex=boundary, backup_id="safe-id",
+                )
+            self.assertFalse(boundary.called)
+            self.assertFalse((parent / "marketplace").exists())
+            self.assertEqual([], list(real.iterdir()))
+
+    def test_safe_destination_rejects_bad_ancestors_and_guards_backup_path(self) -> None:
+        module = self.load_script("profile_harness_installer_path_guard", "install.py")
+        with tempfile.TemporaryDirectory() as directory:
+            parent = Path(directory).resolve()
+            blocking = parent / "file"
+            blocking.write_text("not a directory")
+            with self.assertRaisesRegex(ValueError, "non-directory ancestor"):
+                module._safe_destination(blocking / "child", "test target")
+            with self.assertRaisesRegex(ValueError, "control character"):
+                module._safe_destination(parent / "bad\npath", "test target")
+
+            real = parent / "real"
+            real.mkdir()
+            alias = parent / "alias"
+            alias.symlink_to(real, target_is_directory=True)
+            with self.assertRaisesRegex(ValueError, "symlink ancestor"):
+                module._backup_destination(alias / "marketplace", "safe-id")
+
     def test_agent_backup_contract_prepares_mapping_before_shared_mutation(self) -> None:
         contract = (ROOT / "INSTALL_AGENT.md").read_text(encoding="utf-8").lower()
         for phrase in (
@@ -484,7 +541,7 @@ class PublicPackageTests(unittest.TestCase):
     def test_installer_uses_injectable_codex_boundary_and_recoverable_upgrade(self) -> None:
         module = self.load_script("profile_harness_installer", "install.py")
         with tempfile.TemporaryDirectory() as temporary_directory:
-            parent = Path(temporary_directory)
+            parent = Path(temporary_directory).resolve()
             marketplace = parent / "marketplace"
             bin_home = parent / "bin"
             build_local_marketplace(ROOT, marketplace)
@@ -526,7 +583,7 @@ class PublicPackageTests(unittest.TestCase):
     def test_installer_restores_previous_marketplace_when_codex_fails(self) -> None:
         module = self.load_script("profile_harness_installer_failure", "install.py")
         with tempfile.TemporaryDirectory() as temporary_directory:
-            parent = Path(temporary_directory)
+            parent = Path(temporary_directory).resolve()
             marketplace = parent / "marketplace"
             build_local_marketplace(ROOT, marketplace)
             (marketplace / "old-marker").write_text("old")
@@ -562,7 +619,7 @@ class PublicPackageTests(unittest.TestCase):
     def test_new_install_failure_restores_files_and_codex_state(self) -> None:
         module = self.load_script("profile_harness_installer_new_failure", "install.py")
         with tempfile.TemporaryDirectory() as temporary_directory:
-            parent = Path(temporary_directory)
+            parent = Path(temporary_directory).resolve()
             marketplace = parent / "marketplace"
             executable = parent / "bin/profile-harness"
             boundary = self.memory_boundary(
@@ -585,7 +642,7 @@ class PublicPackageTests(unittest.TestCase):
         module = self.load_script("profile_harness_installer_identity", "install.py")
         for marker in ("unrelated", "profile"):
             with self.subTest(marker=marker), tempfile.TemporaryDirectory() as directory:
-                parent = Path(directory)
+                parent = Path(directory).resolve()
                 target = parent / "target"
                 target.mkdir()
                 if marker == "profile":
@@ -602,7 +659,7 @@ class PublicPackageTests(unittest.TestCase):
 
         for tamper in ("catalog", "manifest"):
             with self.subTest(tamper=tamper), tempfile.TemporaryDirectory() as directory:
-                parent = Path(directory)
+                parent = Path(directory).resolve()
                 target = parent / "target"
                 build_local_marketplace(ROOT, target)
                 identity = (
@@ -621,7 +678,7 @@ class PublicPackageTests(unittest.TestCase):
     def test_marketplace_add_partial_failure_is_compensated(self) -> None:
         module = self.load_script("profile_harness_installer_partial", "install.py")
         with tempfile.TemporaryDirectory() as directory:
-            parent = Path(directory)
+            parent = Path(directory).resolve()
             target = parent / "marketplace"
             command = ("codex", "plugin", "marketplace", "add", str(target))
             boundary = self.memory_boundary(

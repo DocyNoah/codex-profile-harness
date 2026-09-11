@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -146,11 +147,33 @@ class SubprocessCodexBoundary:
 
 
 def _safe_destination(path: Path, label: str) -> Path:
-    value = path.expanduser().absolute()
+    raw = os.fspath(path)
+    if any(ord(character) < 32 or ord(character) == 127 for character in raw):
+        raise ValueError(f"{label} cannot contain a control character")
+    value = Path(os.path.abspath(os.path.expanduser(raw)))
     if value == Path(value.anchor):
         raise ValueError(f"{label} cannot be a filesystem root")
-    if value.is_symlink():
-        raise ValueError(f"{label} cannot be a symlink")
+    current = value
+    root = Path(value.anchor)
+    while True:
+        if os.path.lexists(current):
+            try:
+                metadata = current.lstat()
+            except OSError as error:
+                raise ValueError(f"{label} ancestor cannot be inspected") from error
+            if stat.S_ISLNK(metadata.st_mode):
+                raise ValueError(f"{label} has a symlink ancestor")
+            if not stat.S_ISDIR(metadata.st_mode):
+                raise ValueError(f"{label} has a non-directory ancestor")
+        if current == root:
+            break
+        current = current.parent
+    try:
+        resolved = value.resolve(strict=False)
+    except (OSError, RuntimeError) as error:
+        raise ValueError(f"{label} cannot be safely resolved") from error
+    if resolved != value:
+        raise ValueError(f"{label} safe resolution does not match its lexical path")
     return value
 
 
@@ -178,7 +201,10 @@ def _select_backup_id(
 
 
 def _backup_destination(marketplace: Path, backup_id: str) -> Path:
-    destination = marketplace.with_name(f"{marketplace.name}.previous.{backup_id}")
+    destination = _safe_destination(
+        marketplace.with_name(f"{marketplace.name}.previous.{backup_id}"),
+        "backup destination",
+    )
     if destination.exists() or destination.is_symlink():
         raise FileExistsError(f"backup already exists: {destination}")
     return destination

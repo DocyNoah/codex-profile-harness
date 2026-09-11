@@ -241,7 +241,7 @@ time.sleep(30)
     @unittest.skipUnless(os.name == "posix", "process-group contract is POSIX")
     def test_real_codex_boundary_is_noninteractive_bounded_and_kills_descendants(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            parent = Path(directory)
+            parent = Path(directory).resolve()
             pid_path = parent / "grandchild.pid"
             group_path = parent / "process-group.pid"
             late_path = parent / "late-write"
@@ -330,7 +330,7 @@ elif args[:2] == ["plugin", "list"]:
 
     def test_real_codex_boundary_overflow_rolls_back_and_recovery_failure_is_bounded(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            parent = Path(directory)
+            parent = Path(directory).resolve()
             mode = parent / "mode"
             flag = parent / "once"
             fake = self.make_executable(parent / "fake-codex", f'''
