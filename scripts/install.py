@@ -219,12 +219,24 @@ def _validate_existing_marketplace(root: Path) -> None:
     try:
         if set(hooks["hooks"]) != {"Stop", "SessionEnd"}:
             raise ValueError("unexpected hook events")
-        commands = [
-            hook["command"]
-            for event in ("Stop", "SessionEnd")
-            for group in hooks["hooks"][event]
-            for hook in group["hooks"]
-        ]
+        commands = []
+        for event in ("Stop", "SessionEnd"):
+            groups = hooks["hooks"][event]
+            if not isinstance(groups, list) or len(groups) != 1:
+                raise ValueError("unexpected hook groups")
+            event_hooks = groups[0]["hooks"]
+            if not isinstance(event_hooks, list) or len(event_hooks) != 1:
+                raise ValueError("unexpected hook commands")
+            hook = event_hooks[0]
+            timeout = hook["timeout"]
+            if (
+                hook.get("type") != "command"
+                or not isinstance(timeout, int)
+                or isinstance(timeout, bool)
+                or not 1 <= timeout <= 3
+            ):
+                raise ValueError("unsafe hook command")
+            commands.append(hook["command"])
     except (KeyError, TypeError, ValueError) as error:
         raise ValueError("existing target is not a Codex Profile Harness marketplace") from error
     if commands != [expected_command, expected_command]:

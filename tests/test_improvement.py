@@ -35,6 +35,15 @@ NOW = datetime(2026, 9, 11, 12, 0, 0, tzinfo=timezone.utc)
 
 
 class ImprovementTests(unittest.TestCase):
+    def setUp(self) -> None:
+        auth_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(auth_directory.cleanup)
+        auth_home = Path(auth_directory.name)
+        (auth_home / "auth.json").write_text("{}", encoding="utf-8")
+        environment = mock.patch.dict(os.environ, {"CODEX_HOME": str(auth_home)})
+        environment.start()
+        self.addCleanup(environment.stop)
+
     def make_profile(self, parent: Path) -> Path:
         root = parent / "profile"
         init_profile(root, "Work")
@@ -121,7 +130,7 @@ class ImprovementTests(unittest.TestCase):
         lines = ["#!/usr/bin/env python3", "import json,os,pathlib,sys"]
         if invocation is not None:
             lines.append(
-                f"pathlib.Path({str(invocation)!r}).write_text(json.dumps({{'argv':sys.argv[1:],'stdin':sys.stdin.read(),'cwd':os.getcwd()}}))"
+                f"pathlib.Path({str(invocation)!r}).write_text(json.dumps({{'argv':sys.argv[1:],'stdin':sys.stdin.read(),'cwd':os.getcwd(),'codex_home':os.environ.get('CODEX_HOME')}}))"
             )
         else:
             lines.append("sys.stdin.read()")
@@ -297,11 +306,15 @@ class ImprovementTests(unittest.TestCase):
             }]}
             fake = self.make_fake(parent, result, invocation)
             self.configure_fake(root, fake)
+            source_home = parent / "source-codex-home"
+            source_home.mkdir()
+            (source_home / "auth.json").write_text("{}", encoding="utf-8")
             protected = {name: (root / name).read_bytes() for name in (
                 "AGENTS.md", "IDENTITY.md", "USER.md", "CONTEXT.md", "MEMORY.md", "PROJECTS.toml", ".harness/config.toml"
             )}
 
-            output = run_improvement(root, now=NOW, force=True)
+            with mock.patch.dict(os.environ, {"CODEX_HOME": str(source_home)}):
+                output = run_improvement(root, now=NOW, force=True)
 
             self.assertEqual("performed", output["status"])
             self.assertEqual(
@@ -318,14 +331,23 @@ class ImprovementTests(unittest.TestCase):
             self.assertEqual(render_markdown(manifest), proposals[0].read_text())
             self.assertEqual(protected, {name: (root / name).read_bytes() for name in protected})
             call = json.loads(invocation.read_text())
-            self.assertEqual(str(root.resolve()), call["cwd"])
+            isolated_home = Path(call["codex_home"])
+            self.assertEqual(root.resolve(), Path(call["cwd"]))
+            self.assertFalse(isolated_home.is_relative_to(root.resolve()))
+            self.assertFalse(isolated_home.exists())
             self.assertIn(
                 '"batch_id": "20260911T100000000000Z-000000000000"',
                 call["stdin"],
             )
             self.assertNotIn("session_id", call["stdin"])
             self.assertEqual([
-                "exec", "--model", "gpt-6-astra", "-c", 'model_reasoning_effort="high"',
+                "exec", "--skip-git-repo-check", "--ephemeral",
+                "--ignore-user-config", "--ignore-rules",
+                "--disable", "shell_tool", "--disable", "unified_exec",
+                "--model", "gpt-6-astra",
+                "-c", 'model_reasoning_effort="high"',
+                "-c", 'cli_auth_credentials_store="file"',
+                "-c", "project_doc_max_bytes=0",
                 "--sandbox", "read-only", "--output-schema",
                 str((ROOT / "schemas/improvement-result.schema.json").resolve()),
                 "-o", str((root / ".harness/state/improvement-result.json").resolve()), "-",

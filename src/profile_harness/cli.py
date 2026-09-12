@@ -8,7 +8,7 @@ from pathlib import Path
 import subprocess
 import sys
 
-from .capture import MAX_INPUT_BYTES, CaptureError, CaptureResult, capture_event
+from .capture import MAX_INPUT_BYTES, CaptureError, capture_event
 from .config import (
     find_profile_marker_root,
     find_profile_root,
@@ -163,17 +163,14 @@ def _capture_from_stdin() -> int:
             raise CaptureError("stdin must contain one JSON object") from error
         if not isinstance(payload, dict):
             raise CaptureError("payload must be a JSON object")
-        result = capture_event(payload)
-    except (CaptureError, OSError) as error:
-        result = CaptureResult(False, "error", error=str(error))
-        exit_code = 1
+        capture_event(payload)
+    except (CaptureError, OSError):
+        sys.stderr.write("profile-harness hook capture failed\n")
+        return 1
     except Exception:
-        result = CaptureResult(False, "error", error="capture failed safely")
-        exit_code = 1
-    else:
-        exit_code = 0
-    print(json.dumps(result.as_json_object(), ensure_ascii=False, sort_keys=True))
-    return exit_code
+        sys.stderr.write("profile-harness hook capture failed\n")
+        return 1
+    return 0
 
 
 def _curation_settings(root: Path) -> tuple[str, float, float, str, str]:

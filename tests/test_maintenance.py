@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 import hashlib
 import inspect
 import json
+import os
 from pathlib import Path
 import stat
 import subprocess
@@ -44,6 +45,15 @@ NOW = datetime(2026, 9, 11, 12, 0, 0, tzinfo=timezone.utc)
 
 
 class MaintenanceTests(unittest.TestCase):
+    def setUp(self) -> None:
+        auth_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(auth_directory.cleanup)
+        auth_home = Path(auth_directory.name)
+        (auth_home / "auth.json").write_text("{}", encoding="utf-8")
+        environment = mock.patch.dict(os.environ, {"CODEX_HOME": str(auth_home)})
+        environment.start()
+        self.addCleanup(environment.stop)
+
     def make_profile(self, parent: Path) -> Path:
         root = parent / "profile"
         init_profile(root, "Work")
@@ -417,7 +427,9 @@ class MaintenanceTests(unittest.TestCase):
             fake.write_text(
                 "#!/usr/bin/env python3\n"
                 "import json, os, pathlib, sys\n"
-                f"pathlib.Path({str(invocation_path)!r}).write_text(json.dumps({{'argv': sys.argv[1:], 'stdin': sys.stdin.read(), 'cwd': os.getcwd(), 'curator': os.environ.get('PROFILE_HARNESS_CURATOR')}}))\n"
+                "home = pathlib.Path(os.environ['CODEX_HOME'])\n"
+                "auth = home / 'auth.json'\n"
+                f"pathlib.Path({str(invocation_path)!r}).write_text(json.dumps({{'argv': sys.argv[1:], 'stdin': sys.stdin.read(), 'cwd': os.getcwd(), 'curator': os.environ.get('PROFILE_HARNESS_CURATOR'), 'codex_home': str(home), 'auth_is_symlink': auth.is_symlink(), 'auth_target': os.readlink(auth)}}))\n"
                 "pathlib.Path(sys.argv[sys.argv.index('-o') + 1]).write_text('{\"actions\": [], \"signals\": []}')\n",
                 encoding="utf-8",
             )
@@ -426,26 +438,41 @@ class MaintenanceTests(unittest.TestCase):
             prompt.write_text("literal prompt", encoding="utf-8")
             output = parent / "result.json"
             schema = ROOT / "schemas/curation-result.schema.json"
+            source_home = parent / "source-codex-home"
+            source_home.mkdir()
+            source_auth = source_home / "auth.json"
+            source_auth.write_text("{}", encoding="utf-8")
 
-            run_codex(
-                root,
-                prompt,
-                output,
-                command=str(fake),
-                model="gpt-5.6-sol",
-                reasoning_effort="medium",
-                schema_path=schema,
-                timeout=5,
-            )
+            with mock.patch.dict(os.environ, {"CODEX_HOME": str(source_home)}):
+                run_codex(
+                    root,
+                    prompt,
+                    output,
+                    command=str(fake),
+                    model="gpt-5.6-sol",
+                    reasoning_effort="medium",
+                    schema_path=schema,
+                    timeout=5,
+                )
 
             invocation = json.loads(invocation_path.read_text(encoding="utf-8"))
-            self.assertEqual(str(root.resolve()), invocation["cwd"])
+            isolated_home = Path(invocation["codex_home"])
+            self.assertEqual(root.resolve(), Path(invocation["cwd"]))
+            self.assertFalse(isolated_home.is_relative_to(root.resolve()))
+            self.assertFalse(isolated_home.exists())
+            self.assertTrue(invocation["auth_is_symlink"])
+            self.assertEqual(str(source_auth.resolve()), invocation["auth_target"])
             self.assertEqual("literal prompt", invocation["stdin"])
             self.assertEqual("1", invocation["curator"])
             self.assertEqual(
                 [
-                    "exec", "--model", "gpt-5.6-sol",
+                    "exec", "--skip-git-repo-check", "--ephemeral",
+                    "--ignore-user-config", "--ignore-rules",
+                    "--disable", "shell_tool", "--disable", "unified_exec",
+                    "--model", "gpt-5.6-sol",
                     "-c", 'model_reasoning_effort="medium"',
+                    "-c", 'cli_auth_credentials_store="file"',
+                    "-c", "project_doc_max_bytes=0",
                     "--sandbox", "read-only",
                     "--output-schema", str(schema.resolve()),
                     "-o", str(output.resolve()), "-",

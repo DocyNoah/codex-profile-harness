@@ -89,7 +89,10 @@ sure its switch is enabled. If that app screen is unavailable, open the CLI
 `/hooks` management screen, inspect the same commands, and select **Trust** there.
 There is no Review button or automatic approval popup; never use a hook-trust
 bypass. Start a new task after this one-time confirmation.
-Capture reads
+The capture command is intentionally silent on success: it persists the receipt
+and exits with status 0 without writing a hook response to stdout. A capture
+failure exits nonzero, keeps stdout empty, and emits only a fixed, non-sensitive
+message on stderr. Capture reads
 only a bounded regular transcript below `CODEX_HOME`. Missing, malformed,
 oversized, changed, or unsafe transcript input falls back to bounded hook data,
 sets `capture_quality` to `partial`, and does not expose the rejected path. Codex

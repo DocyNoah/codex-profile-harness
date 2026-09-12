@@ -51,7 +51,7 @@ The bracketed rows below describe contents; they are not literal folder names.
 
 ```text
 [profile folder]/
-├── AGENTS.md                 instructions Codex follows in this profile
+├── AGENTS.md                 ordinary repository-work boundaries for this profile
 ├── IDENTITY.md               the profile's role, responsibilities, and boundaries
 ├── USER.md                   your stable preferences and working style
 ├── CONTEXT.md                current profile-wide goals and background
@@ -95,6 +95,8 @@ Scheduled curation only repairs missed, duplicate, or conflicting state.
 - Open the profile project in Codex and work normally in any repository below `projects/`.
 - Ask Codex to register a repository when you add one.
 - Open `DASHBOARD.md` for a generated overview.
+- Ask Codex to use the profile harness admin workflow when you want to inspect,
+  configure, maintain, or repair the harness itself.
 - When Harness Control presents an improvement, review and approve or reject it in that task.
 - Ask Codex to “check the profile harness” if capture, memory, or scheduling looks wrong.
 

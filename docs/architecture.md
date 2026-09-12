@@ -78,6 +78,19 @@ lifecycle state, base commit, and automatic-policy eligibility. The model cannot
 choose arbitrary paths, commands, Git remotes, scheduler settings, or approval
 state.
 
+Curation and improvement model invocations keep the profile root as their
+working directory but use a mode-0700 temporary `CODEX_HOME`. The temporary home
+contains only an absolute `auth.json` symlink to the invoking user's credential
+file and is removed after the child exits. `--ignore-user-config`,
+`--ignore-rules`, and `project_doc_max_bytes=0` prevent global configuration,
+exec-policy rules, and ordinary profile `AGENTS.md` instructions from entering
+the bounded role-specific invocation; `--ephemeral` prevents session history.
+Both shell-tool implementations are disabled so untrusted evidence cannot make
+the model inspect the linked credential file. The model receives all required
+profile evidence in its bounded prompt and therefore does not need filesystem
+tools. Output schemas use the Responses API-supported JSON Schema subset;
+uniqueness remains enforced by deterministic runtime validation.
+
 Legacy Markdown-only proposals remain readable but cannot be applied. They must
 be rejected or superseded by a new manifest.
 

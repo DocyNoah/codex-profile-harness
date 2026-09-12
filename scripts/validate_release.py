@@ -190,6 +190,8 @@ def validate_source() -> None:
     require(manifest.get("version") == "0.4.1", "invalid plugin version")
     skill = validate_skill(ROOT / "skills/profile-harness/SKILL.md")
     require(skill["name"] == "profile-harness", "invalid skill name")
+    admin_skill = validate_skill(ROOT / "skills/profile-harness-admin/SKILL.md")
+    require(admin_skill["name"] == "profile-harness-admin", "invalid admin skill name")
     validate_release_workflow(ROOT / ".github/workflows/release.yml")
     for relative in RELEASE_FILES:
         path = ROOT / relative
@@ -230,6 +232,27 @@ def validate_generated() -> None:
             text=True, capture_output=True, check=False,
         )
         require(initialized.returncode == 0, initialized.stderr)
+        for event in ("Stop", "SessionEnd"):
+            captured = subprocess.run(
+                [sys.executable, str(cli), "hook", "capture"],
+                cwd=profile,
+                input=json.dumps({
+                    "hook_event_name": event,
+                    "session_id": f"release-{event}",
+                    "turn_id": f"release-{event}",
+                    "reason": "complete",
+                    "cwd": str(profile),
+                    "last_assistant_message": "release validation",
+                }),
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            require(captured.returncode == 0, captured.stderr)
+            require(
+                captured.stdout == "" and captured.stderr == "",
+                f"{event} hook capture must be silent on success",
+            )
         for arguments in (("maintain",), ("dashboard",), ("doctor",), ("git", "status")):
             completed = subprocess.run(
                 [sys.executable, str(cli), *arguments], cwd=profile,

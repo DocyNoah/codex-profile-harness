@@ -671,6 +671,7 @@ class DoctorTests(unittest.TestCase):
             for relative in (
                 "bin/profile-harness",
                 "skills/profile-harness/SKILL.md",
+                "skills/profile-harness-admin/SKILL.md",
             ):
                 path = plugin / relative
                 path.parent.mkdir(parents=True, exist_ok=True)
@@ -702,6 +703,13 @@ class DoctorTests(unittest.TestCase):
                     "hooks/hooks.json",
                     lambda value: value["hooks"]["Stop"][0]["hooks"][0].update(
                         {"command": "python3 unsafe.py"}
+                    ),
+                    "hook",
+                ),
+                (
+                    "hooks/hooks.json",
+                    lambda value: value["hooks"]["SessionEnd"][0]["hooks"][0].update(
+                        {"timeout": 4}
                     ),
                     "hook",
                 ),
@@ -768,12 +776,12 @@ class DoctorTests(unittest.TestCase):
                 "top-level action limit": set_value(
                     ("properties", "actions", "maxItems"), 101
                 ),
-                "top-level oneOf item": set_value(
+                "top-level anyOf item": set_value(
                     (
                         "properties",
                         "actions",
                         "items",
-                        "oneOf",
+                        "anyOf",
                     ),
                     [{"$ref": "#/$defs/repoStatus"}] * 6,
                 ),

@@ -352,7 +352,6 @@ class EndToEndTests(unittest.TestCase):
                 if path.is_file()
             }
 
-            captures = []
             for event, session, repository, message in (
                 ("Stop", "api-session", api, "API is ready for launch."),
                 ("SessionEnd", "web-session", web, "Web work remains unchanged."),
@@ -368,8 +367,13 @@ class EndToEndTests(unittest.TestCase):
                     repository, "hook", "capture", stdin=json.dumps(payload)
                 )
                 self.assertEqual(0, captured.returncode, captured.stderr)
-                captures.append(json.loads(captured.stdout))
-            receipt_ids = [item["receipt_id"] for item in captures]
+                self.assertEqual("", captured.stdout)
+                self.assertEqual("", captured.stderr)
+            receipts = [
+                json.loads(path.read_text(encoding="utf-8"))
+                for path in (profile / ".harness/memory/inbox").glob("*.json")
+            ]
+            receipt_ids = [item["id"] for item in receipts]
             self.assertEqual(2, len(set(receipt_ids)))
             self.assertEqual(
                 "harness: update repository registry",

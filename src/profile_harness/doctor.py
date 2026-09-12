@@ -64,6 +64,7 @@ REQUIRED_PLUGIN_FILES = (
     "schemas/curation-result.schema.json",
     "schemas/improvement-result.schema.json",
     "skills/profile-harness/SKILL.md",
+    "skills/profile-harness-admin/SKILL.md",
     "scripts/build_local_marketplace.py",
     "src/profile_harness/packaging.py",
     "src/profile_harness/profile_git.py",
@@ -259,7 +260,7 @@ def _validate_hooks(value: object) -> None:
             or command.get("command") != HOOK_COMMAND
             or not isinstance(command.get("timeout"), int)
             or isinstance(command.get("timeout"), bool)
-            or not 1 <= command["timeout"] <= 10
+            or not 1 <= command["timeout"] <= 3
         ):
             raise ValueError(f"hook event {event} has an unsafe capture command")
 
@@ -332,7 +333,6 @@ def _validate_receipt_schema(value: object) -> None:
     extra_keys = _array_contract(
         payload_properties["extra_keys"],
         maximum=10_000,
-        unique=False,
         label="receipt.payload.extra_keys",
     )
     _string_contract(
@@ -345,7 +345,6 @@ def _validate_receipt_schema(value: object) -> None:
         messages = _array_contract(
             payload_properties[field],
             maximum=8,
-            unique=False,
             label=f"receipt.payload.{field}",
         )
         _string_contract(
@@ -414,7 +413,6 @@ def _array_contract(
     value: object,
     *,
     maximum: int,
-    unique: bool,
     label: str,
     minimum: int | None = None,
 ) -> dict:
@@ -423,8 +421,8 @@ def _array_contract(
     _exact_integer(value, "maxItems", maximum, label)
     if minimum is not None:
         _exact_integer(value, "minItems", minimum, label)
-    if unique and value.get("uniqueItems") is not True:
-        raise ValueError(f"{label}.uniqueItems must be true")
+    if "uniqueItems" in value:
+        raise ValueError(f"{label}.uniqueItems is not supported by model output schemas")
     items = value.get("items")
     if not isinstance(items, dict):
         raise ValueError(f"{label}.items must be a schema")
@@ -445,17 +443,17 @@ def _validate_curation_schema(value: object) -> None:
         raise ValueError("curation actions must be an array schema")
     _exact_integer(actions, "maxItems", MAX_ACTIONS, "curation actions")
     items = actions.get("items")
-    one_of = items.get("oneOf") if isinstance(items, dict) else None
+    any_of = items.get("anyOf") if isinstance(items, dict) else None
     if (
-        not isinstance(one_of, list)
-        or len(one_of) != len(CURATION_ACTION_REFS)
+        not isinstance(any_of, list)
+        or len(any_of) != len(CURATION_ACTION_REFS)
         or any(
             not isinstance(item, dict) or set(item) != {"$ref"}
-            for item in one_of
+            for item in any_of
         )
-        or {item["$ref"] for item in one_of} != CURATION_ACTION_REFS
+        or {item["$ref"] for item in any_of} != CURATION_ACTION_REFS
     ):
-        raise ValueError("curation actions must use the exact action oneOf")
+        raise ValueError("curation actions must use the exact action anyOf")
 
     definitions = value.get("$defs") if isinstance(value, dict) else None
     if not isinstance(definitions, dict):
@@ -468,7 +466,6 @@ def _validate_curation_schema(value: object) -> None:
         definitions["sources"],
         minimum=1,
         maximum=MAX_ARRAY_ITEMS,
-        unique=True,
         label="sources",
     )
     _string_contract(
@@ -486,7 +483,7 @@ def _validate_curation_schema(value: object) -> None:
         label="content",
     )
     signal_items = _array_contract(
-        top_properties["signals"], maximum=MAX_SIGNALS, unique=True, label="signals"
+        top_properties["signals"], maximum=MAX_SIGNALS, label="signals"
     )
     _reference_contract(signal_items, "#/$defs/signal", "signals.items")
     signal = _object_contract(
@@ -511,6 +508,7 @@ def _validate_curation_schema(value: object) -> None:
         type_property = properties["type"]
         if (
             not isinstance(type_property, dict)
+            or type_property.get("type") != "string"
             or type_property.get("const") != action_type
         ):
             raise ValueError(f"{name}.type must select {action_type}")
@@ -536,6 +534,7 @@ def _validate_curation_schema(value: object) -> None:
     memory_kind = definitions["profileMemory"]["properties"]["kind"]
     if (
         not isinstance(memory_kind, dict)
+        or memory_kind.get("type") != "string"
         or not isinstance(memory_kind.get("enum"), list)
         or len(memory_kind["enum"]) != 2
         or set(memory_kind["enum"]) != {"semantic", "procedural"}
@@ -555,7 +554,6 @@ def _validate_curation_schema(value: object) -> None:
     supersedes = _array_contract(
         definitions["repoDecision"]["properties"]["supersedes"],
         maximum=MAX_ARRAY_ITEMS,
-        unique=True,
         label="repoDecision.supersedes",
     )
     _string_contract(
@@ -569,7 +567,6 @@ def _validate_curation_schema(value: object) -> None:
     discard_sources = _array_contract(
         definitions["discard"]["properties"]["source_receipt_ids"],
         maximum=MAX_ARRAY_ITEMS,
-        unique=True,
         label="discard.source_receipt_ids",
     )
     _string_contract(
@@ -602,11 +599,15 @@ def _validate_improvement_schema(value: object) -> None:
     )
     _string_contract(proposal["rationale"], minimum=1, maximum=MAX_RATIONALE_CHARS,
                      pattern="^[\\s\\S]*\\S[\\s\\S]*$", label="improvement proposal.rationale")
-    if set(proposal["risk_level"].get("enum", [])) != {"low", "medium", "high"}:
+    if (
+        proposal["risk_level"].get("type") != "string"
+        or set(proposal["risk_level"].get("enum", []))
+        != {"low", "medium", "high"}
+    ):
         raise ValueError("improvement proposal.risk_level is weakened")
     hashes = _array_contract(
         proposal["source_journal_hashes"], minimum=1, maximum=MAX_SOURCE_HASHES,
-        unique=True, label="improvement proposal.source_journal_hashes",
+        label="improvement proposal.source_journal_hashes",
     )
     _string_contract(
         hashes, minimum=64, maximum=64, pattern="^[a-f0-9]{64}$",
@@ -614,7 +615,7 @@ def _validate_improvement_schema(value: object) -> None:
     )
     replacements = _array_contract(
         proposal["replacements"], minimum=1, maximum=MAX_REPLACEMENTS,
-        unique=False, label="improvement proposal.replacements",
+        label="improvement proposal.replacements",
     )
     _reference_contract(replacements, "#/$defs/replacement", "improvement proposal.replacements.items")
     replacement = _object_contract(

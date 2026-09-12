@@ -41,6 +41,7 @@ PACKAGED_FILES = (
     "scripts/install.py",
     "scripts/validate_release.py",
     "skills/profile-harness/SKILL.md",
+    "skills/profile-harness-admin/SKILL.md",
     "src/profile_harness/__init__.py",
     "src/profile_harness/capture.py",
     "src/profile_harness/application.py",

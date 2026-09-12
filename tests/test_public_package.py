@@ -269,10 +269,8 @@ class PublicPackageTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "repository context"):
                 validator.validate_release_workflow(unsafe)
 
-    def test_packaged_agent_policies_match_runtime_modes_and_push_authority(self) -> None:
-        skill = (ROOT / "skills/profile-harness/SKILL.md").read_text(encoding="utf-8").lower()
-        agents = (ROOT / "templates/profile/AGENTS.md").read_text(encoding="utf-8").lower()
-        combined = skill + "\n" + agents
+    def test_packaged_admin_skill_matches_runtime_modes_and_push_authority(self) -> None:
+        admin = (ROOT / "skills/profile-harness-admin/SKILL.md").read_text(encoding="utf-8").lower()
         for phrase in (
             "approval_required", "proposal_only", "auto_safe",
             "runtime configuration", "deterministic local policy",
@@ -280,7 +278,7 @@ class PublicPackageTests(unittest.TestCase):
             "exact upstream", "harness engine", "manual push",
             "explicitly requests",
         ):
-            self.assertIn(phrase, combined, phrase)
+            self.assertIn(phrase, admin, phrase)
 
     def test_docs_define_agent_install_cli_preflight_and_legacy_upgrade(self) -> None:
         agent = (ROOT / "INSTALL_AGENT.md").read_text(encoding="utf-8").lower()
@@ -343,6 +341,30 @@ class PublicPackageTests(unittest.TestCase):
 
             self.assertEqual(0, completed.returncode, completed.stderr)
             self.assertIn("profile-harness", completed.stdout)
+
+    def test_installer_rejects_hook_timeout_above_codex_limit(self) -> None:
+        module = self.load_script("profile_harness_installer_hooks", "install.py")
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            marketplace, plugin = self.build(Path(temporary_directory))
+            hooks_path = plugin / "hooks/hooks.json"
+            hooks = json.loads(hooks_path.read_text(encoding="utf-8"))
+            hooks["hooks"]["SessionEnd"][0]["hooks"][0]["timeout"] = 4
+            hooks_path.write_text(json.dumps(hooks), encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "existing target"):
+                module._validate_existing_marketplace(marketplace)
+
+    def test_installer_rejects_malformed_hook_command_object(self) -> None:
+        module = self.load_script("profile_harness_installer_hook_shape", "install.py")
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            marketplace, plugin = self.build(Path(temporary_directory))
+            hooks_path = plugin / "hooks/hooks.json"
+            hooks = json.loads(hooks_path.read_text(encoding="utf-8"))
+            hooks["hooks"]["Stop"][0]["hooks"][0] = "not-an-object"
+            hooks_path.write_text(json.dumps(hooks), encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "existing target"):
+                module._validate_existing_marketplace(marketplace)
 
     def test_marketplace_builder_rejects_an_incompatible_python_runtime(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -444,7 +466,8 @@ class PublicPackageTests(unittest.TestCase):
                 env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
             )
             self.assertEqual(0, capture.returncode, capture.stderr)
-            self.assertEqual("captured", json.loads(capture.stdout)["status"])
+            self.assertEqual("", capture.stdout)
+            self.assertEqual("", capture.stderr)
             receipt = json.loads(next((profile / ".harness/memory/inbox").glob("*.json")).read_text())
             self.assertEqual("partial", receipt["payload"]["capture_quality"])
             # A fresh profile without evidence is a true no-op. Use a second profile
@@ -491,19 +514,19 @@ class PublicPackageTests(unittest.TestCase):
             (ROOT / "README.md").read_text(),
         )
 
-    def test_skill_preserves_agent_and_authority_boundaries(self) -> None:
+    def test_working_skill_and_profile_agents_exclude_admin_workflows(self) -> None:
         skill = (ROOT / "skills/profile-harness/SKILL.md").read_text().lower()
         profile_agents = (ROOT / "templates/profile/AGENTS.md").read_text().lower()
-        for phrase in (
-            "status.md", "tasks.md", "working agent", "naturally",
-            "missed", "duplicate", "conflicting", "user approval",
-            "proposal-only",
-        ):
+        for phrase in ("status.md", "tasks.md", "working agent", "materially changes"):
             self.assertIn(phrase, skill, phrase)
-        self.assertIn("explicit user approval", profile_agents)
-        self.assertIn("proposal-only", profile_agents)
         self.assertIn("project-context", profile_agents)
         self.assertIn("do not create", profile_agents)
+        for document in (skill, profile_agents):
+            for phrase in (
+                "approval_required", "proposal_only", "auto_safe", "wal",
+                "private_data_acknowledged", "auto_push", "manual push",
+            ):
+                self.assertNotIn(phrase, document, phrase)
         self.assertFalse(any((ROOT / "templates/repo").glob("**/*")))
 
     def test_cron_runs_maintain_every_fifteen_minutes(self) -> None:
@@ -519,6 +542,7 @@ class PublicPackageTests(unittest.TestCase):
     def test_agent_install_contract_and_scheduler_assets_are_packaged(self) -> None:
         required = {
             "INSTALL_AGENT.md",
+            "skills/profile-harness-admin/SKILL.md",
             "templates/automations/harness-control.md",
             "examples/launchd.plist",
             "examples/systemd.service",

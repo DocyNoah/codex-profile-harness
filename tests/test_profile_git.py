@@ -634,6 +634,7 @@ class ProfileGitTests(unittest.TestCase):
             fake_git.chmod(0o755)
             environment = os.environ.copy()
             environment["PATH"] = str(fake_bin) + os.pathsep + environment.get("PATH", "")
+            captured_receipts: set[Path] = set()
             for event in ("Stop", "SessionEnd"):
                 with self.subTest(event=event):
                     payload = json.dumps({
@@ -656,10 +657,13 @@ class ProfileGitTests(unittest.TestCase):
                     elapsed = time.monotonic() - started
                     self.assertEqual(0, captured.returncode, captured.stderr)
                     self.assertLess(elapsed, 2.5)
-                    receipt_id = json.loads(captured.stdout)["receipt_id"]
-                    self.assertTrue(
-                        (profile / ".harness/memory/inbox" / f"{receipt_id}.json").is_file()
+                    self.assertEqual("", captured.stdout)
+                    self.assertEqual("", captured.stderr)
+                    receipts = set(
+                        (profile / ".harness/memory/inbox").glob("*.json")
                     )
+                    self.assertEqual(1, len(receipts - captured_receipts))
+                    captured_receipts = receipts
             self.assertFalse(marker.exists())
 
     def test_hostile_git_environment_cannot_redirect_profile_checkpoint(self) -> None:

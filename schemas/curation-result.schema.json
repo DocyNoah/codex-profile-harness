@@ -9,7 +9,7 @@
       "type": "array",
       "maxItems": 100,
       "items": {
-        "oneOf": [
+        "anyOf": [
           {"$ref": "#/$defs/profileMemory"},
           {"$ref": "#/$defs/repoStatus"},
           {"$ref": "#/$defs/repoTasks"},
@@ -18,11 +18,11 @@
         ]
       }
     },
-    "signals": {"type": "array", "maxItems": 20, "uniqueItems": true, "items": {"$ref": "#/$defs/signal"}}
+    "signals": {"type": "array", "maxItems": 20, "items": {"$ref": "#/$defs/signal"}}
   },
   "additionalProperties": false,
   "$defs": {
-    "sources": {"type": "array", "minItems": 1, "maxItems": 100, "uniqueItems": true, "items": {"type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[A-Za-z0-9._-]+$"}},
+    "sources": {"type": "array", "minItems": 1, "maxItems": 100, "items": {"type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[A-Za-z0-9._-]+$"}},
     "content": {"type": "string", "minLength": 1, "maxLength": 64000, "pattern": "^[\\s\\S]*\\S[\\s\\S]*$"},
     "signal": {
       "type": "object", "required": ["signal_id", "summary", "source_receipt_ids"],
@@ -31,27 +31,27 @@
     },
     "profileMemory": {
       "type": "object", "required": ["type", "kind", "title", "content", "source_receipt_ids"],
-      "properties": {"type": {"const": "profile_memory"}, "kind": {"enum": ["semantic", "procedural"]}, "title": {"$ref": "#/$defs/content"}, "content": {"$ref": "#/$defs/content"}, "source_receipt_ids": {"$ref": "#/$defs/sources"}},
+      "properties": {"type": {"type": "string", "const": "profile_memory"}, "kind": {"type": "string", "enum": ["semantic", "procedural"]}, "title": {"$ref": "#/$defs/content"}, "content": {"$ref": "#/$defs/content"}, "source_receipt_ids": {"$ref": "#/$defs/sources"}},
       "additionalProperties": false
     },
     "repoStatus": {
       "type": "object", "required": ["type", "repository", "content", "source_receipt_ids"],
-      "properties": {"type": {"const": "repo_status"}, "repository": {"type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[\\s\\S]*\\S[\\s\\S]*$"}, "content": {"$ref": "#/$defs/content"}, "source_receipt_ids": {"$ref": "#/$defs/sources"}},
+      "properties": {"type": {"type": "string", "const": "repo_status"}, "repository": {"type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[\\s\\S]*\\S[\\s\\S]*$"}, "content": {"$ref": "#/$defs/content"}, "source_receipt_ids": {"$ref": "#/$defs/sources"}},
       "additionalProperties": false
     },
     "repoTasks": {
       "type": "object", "required": ["type", "repository", "content", "source_receipt_ids"],
-      "properties": {"type": {"const": "repo_tasks"}, "repository": {"type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[\\s\\S]*\\S[\\s\\S]*$"}, "content": {"$ref": "#/$defs/content"}, "source_receipt_ids": {"$ref": "#/$defs/sources"}},
+      "properties": {"type": {"type": "string", "const": "repo_tasks"}, "repository": {"type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[\\s\\S]*\\S[\\s\\S]*$"}, "content": {"$ref": "#/$defs/content"}, "source_receipt_ids": {"$ref": "#/$defs/sources"}},
       "additionalProperties": false
     },
     "repoDecision": {
       "type": "object", "required": ["type", "repository", "title", "content", "supersedes", "source_receipt_ids"],
-      "properties": {"type": {"const": "repo_decision"}, "repository": {"type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[\\s\\S]*\\S[\\s\\S]*$"}, "title": {"$ref": "#/$defs/content"}, "content": {"$ref": "#/$defs/content"}, "supersedes": {"type": "array", "maxItems": 100, "uniqueItems": true, "items": {"type": "string", "maxLength": 20, "pattern": "^[0-9]+$"}}, "source_receipt_ids": {"$ref": "#/$defs/sources"}},
+      "properties": {"type": {"type": "string", "const": "repo_decision"}, "repository": {"type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[\\s\\S]*\\S[\\s\\S]*$"}, "title": {"$ref": "#/$defs/content"}, "content": {"$ref": "#/$defs/content"}, "supersedes": {"type": "array", "maxItems": 100, "items": {"type": "string", "maxLength": 20, "pattern": "^[0-9]+$"}}, "source_receipt_ids": {"$ref": "#/$defs/sources"}},
       "additionalProperties": false
     },
     "discard": {
       "type": "object", "required": ["type", "reason", "source_receipt_ids"],
-      "properties": {"type": {"const": "discard"}, "reason": {"$ref": "#/$defs/content"}, "source_receipt_ids": {"type": "array", "maxItems": 100, "uniqueItems": true, "items": {"type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[A-Za-z0-9._-]+$"}}},
+      "properties": {"type": {"type": "string", "const": "discard"}, "reason": {"$ref": "#/$defs/content"}, "source_receipt_ids": {"type": "array", "maxItems": 100, "items": {"type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[A-Za-z0-9._-]+$"}}},
       "additionalProperties": false
     }
   }

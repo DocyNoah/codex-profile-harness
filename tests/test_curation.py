@@ -45,6 +45,15 @@ def validate_actions(result, *args, **kwargs):
 
 
 class CurationTests(unittest.TestCase):
+    def setUp(self) -> None:
+        auth_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(auth_directory.cleanup)
+        auth_home = Path(auth_directory.name)
+        (auth_home / "auth.json").write_text("{}", encoding="utf-8")
+        environment = mock.patch.dict(os.environ, {"CODEX_HOME": str(auth_home)})
+        environment.start()
+        self.addCleanup(environment.stop)
+
     def make_profile(self, parent: Path) -> tuple[Path, Path, Path]:
         root = parent / "profile"
         init_profile(root, "Work")
@@ -233,6 +242,50 @@ class CurationTests(unittest.TestCase):
         discard_sources = definitions["discard"]["properties"]["source_receipt_ids"]
         self.assertEqual(100, discard_sources["maxItems"])
         self.assertEqual(128, discard_sources["items"]["maxLength"])
+
+    def test_model_output_schemas_exclude_unsupported_unique_items_keyword(self) -> None:
+        def contains_unique_items(value: object) -> bool:
+            if isinstance(value, dict):
+                return "uniqueItems" in value or any(
+                    contains_unique_items(item) for item in value.values()
+                )
+            if isinstance(value, list):
+                return any(contains_unique_items(item) for item in value)
+            return False
+
+        for name in (
+            "curation-result.schema.json",
+            "improvement-result.schema.json",
+        ):
+            with self.subTest(schema=name):
+                schema = json.loads((ROOT / "schemas" / name).read_text(encoding="utf-8"))
+                self.assertFalse(contains_unique_items(schema))
+
+    def test_model_output_schema_const_and_enum_nodes_have_explicit_types(self) -> None:
+        def missing_type(value: object) -> bool:
+            if isinstance(value, dict):
+                if ("const" in value or "enum" in value) and "type" not in value:
+                    return True
+                return any(missing_type(item) for item in value.values())
+            if isinstance(value, list):
+                return any(missing_type(item) for item in value)
+            return False
+
+        for name in (
+            "curation-result.schema.json",
+            "improvement-result.schema.json",
+        ):
+            with self.subTest(schema=name):
+                schema = json.loads((ROOT / "schemas" / name).read_text(encoding="utf-8"))
+                self.assertFalse(missing_type(schema))
+
+    def test_curation_output_schema_uses_supported_action_union_keyword(self) -> None:
+        schema = json.loads(
+            (ROOT / "schemas/curation-result.schema.json").read_text(encoding="utf-8")
+        )
+        union = schema["properties"]["actions"]["items"]
+        self.assertNotIn("oneOf", union)
+        self.assertEqual(5, len(union["anyOf"]))
 
     def test_signals_require_bounded_unique_ids_summaries_and_batch_sources(self) -> None:
         valid = {
@@ -453,7 +506,7 @@ class CurationTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "hash"):
                 verify_journal(journal)
 
-    def test_run_codex_uses_read_only_schema_output_and_profile_cwd(self) -> None:
+    def test_run_codex_uses_profile_cwd_and_an_auth_only_isolated_codex_home(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             parent = Path(temporary_directory)
             root, _, _ = self.make_profile(parent)
@@ -462,7 +515,9 @@ class CurationTests(unittest.TestCase):
             fake.write_text(
                 "#!/usr/bin/env python3\n"
                 "import json, os, pathlib, sys\n"
-                f"pathlib.Path({str(arguments_file)!r}).write_text(json.dumps({{'argv': sys.argv[1:], 'cwd': os.getcwd()}}))\n"
+                "home = pathlib.Path(os.environ['CODEX_HOME'])\n"
+                "auth = home / 'auth.json'\n"
+                f"pathlib.Path({str(arguments_file)!r}).write_text(json.dumps({{'argv': sys.argv[1:], 'cwd': os.getcwd(), 'codex_home': str(home), 'home_mode': oct(home.stat().st_mode & 0o777), 'auth_is_symlink': auth.is_symlink(), 'auth_target': os.readlink(auth), 'auth': auth.read_text()}}))\n"
                 "output = pathlib.Path(sys.argv[sys.argv.index('-o') + 1])\n"
                 "output.write_text('{\"actions\": []}')\n",
                 encoding="utf-8",
@@ -471,18 +526,44 @@ class CurationTests(unittest.TestCase):
             prompt = parent / "prompt.md"
             prompt.write_text("Curate", encoding="utf-8")
             output = parent / "result.json"
+            source_home = parent / "source-codex-home"
+            source_home.mkdir()
+            source_auth = source_home / "auth.json"
+            source_auth.write_text('{"tokens":"shared"}', encoding="utf-8")
 
-            run_codex(root, prompt, output, command=str(fake), timeout=5)
+            with mock.patch.dict(os.environ, {"CODEX_HOME": str(source_home)}):
+                run_codex(root, prompt, output, command=str(fake), timeout=5)
 
             invocation = json.loads(arguments_file.read_text(encoding="utf-8"))
-            self.assertEqual(str(root.resolve()), invocation["cwd"])
+            isolated_home = Path(invocation["codex_home"])
+            self.assertEqual(root.resolve(), Path(invocation["cwd"]))
+            self.assertNotEqual(root.resolve(), isolated_home)
+            self.assertFalse(isolated_home.is_relative_to(root.resolve()))
+            self.assertFalse(isolated_home.exists())
+            self.assertEqual("0o700", invocation["home_mode"])
+            self.assertTrue(invocation["auth_is_symlink"])
+            self.assertEqual(str(source_auth.resolve()), invocation["auth_target"])
+            self.assertEqual('{"tokens":"shared"}', invocation["auth"])
+            self.assertEqual('{"tokens":"shared"}', source_auth.read_text(encoding="utf-8"))
             self.assertEqual(
                 [
                     "exec",
+                    "--skip-git-repo-check",
+                    "--ephemeral",
+                    "--ignore-user-config",
+                    "--ignore-rules",
+                    "--disable",
+                    "shell_tool",
+                    "--disable",
+                    "unified_exec",
                     "--model",
                     "gpt-5.6-sol",
                     "-c",
                     'model_reasoning_effort="medium"',
+                    "-c",
+                    'cli_auth_credentials_store="file"',
+                    "-c",
+                    "project_doc_max_bytes=0",
                     "--sandbox",
                     "read-only",
                     "--output-schema",
@@ -493,6 +574,97 @@ class CurationTests(unittest.TestCase):
                 ],
                 invocation["argv"],
             )
+
+    def test_run_codex_rejects_a_temporary_codex_home_inside_the_profile(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            parent = Path(temporary_directory)
+            root, _, _ = self.make_profile(parent)
+            called = parent / "called"
+            fake = parent / "fake-codex"
+            fake.write_text(
+                "#!/bin/sh\n"
+                f"touch {str(called)!r}\n",
+                encoding="utf-8",
+            )
+            fake.chmod(fake.stat().st_mode | stat.S_IXUSR)
+            prompt = parent / "prompt.md"
+            prompt.write_text("Curate", encoding="utf-8")
+            source_home = parent / "source-codex-home"
+            source_home.mkdir()
+            (source_home / "auth.json").write_text("{}", encoding="utf-8")
+
+            with (
+                mock.patch.dict(
+                    os.environ,
+                    {"TMPDIR": str(root), "CODEX_HOME": str(source_home)},
+                ),
+                mock.patch.object(tempfile, "tempdir", None),
+                self.assertRaisesRegex(RuntimeError, "inside the profile"),
+            ):
+                run_codex(root, prompt, parent / "result.json", command=str(fake), timeout=5)
+
+            self.assertFalse(called.exists())
+
+    def test_run_codex_fails_before_launch_when_authentication_is_unavailable(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            parent = Path(temporary_directory)
+            root, _, _ = self.make_profile(parent)
+            empty_home = parent / "empty-codex-home"
+            empty_home.mkdir()
+            called = parent / "called"
+            prompt = parent / "prompt.md"
+            prompt.write_text("Curate", encoding="utf-8")
+
+            with (
+                mock.patch.dict(os.environ, {"CODEX_HOME": str(empty_home)}),
+                self.assertRaisesRegex(RuntimeError, "authentication file"),
+            ):
+                run_codex(
+                    root,
+                    prompt,
+                    parent / "result.json",
+                    command=str(called),
+                    timeout=5,
+                )
+
+            self.assertFalse(called.exists())
+
+    def test_run_codex_removes_isolated_home_after_child_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            parent = Path(temporary_directory)
+            root, _, _ = self.make_profile(parent)
+            observed_home = parent / "observed-home"
+            fake = parent / "fake-codex"
+            fake.write_text(
+                "#!/usr/bin/env python3\n"
+                "import os, pathlib, sys\n"
+                f"pathlib.Path({str(observed_home)!r}).write_text(os.environ['CODEX_HOME'])\n"
+                "raise SystemExit(7)\n",
+                encoding="utf-8",
+            )
+            fake.chmod(fake.stat().st_mode | stat.S_IXUSR)
+            prompt = parent / "prompt.md"
+            prompt.write_text("Curate", encoding="utf-8")
+            source_home = parent / "source-codex-home"
+            source_home.mkdir()
+            source_auth = source_home / "auth.json"
+            original_auth = '{"tokens":"unchanged"}'
+            source_auth.write_text(original_auth, encoding="utf-8")
+
+            with (
+                mock.patch.dict(os.environ, {"CODEX_HOME": str(source_home)}),
+                self.assertRaises(subprocess.CalledProcessError),
+            ):
+                run_codex(
+                    root,
+                    prompt,
+                    parent / "result.json",
+                    command=str(fake),
+                    timeout=5,
+                )
+
+            self.assertFalse(Path(observed_home.read_text(encoding="utf-8")).exists())
+            self.assertEqual(original_auth, source_auth.read_text(encoding="utf-8"))
 
     def test_injected_failure_restores_files_journal_and_receipts(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

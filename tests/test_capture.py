@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+import io
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -18,6 +21,7 @@ from profile_harness.capture import (  # noqa: E402
     capture_event,
 )
 from profile_harness.config import init_profile  # noqa: E402
+import profile_harness.cli as cli_module  # noqa: E402
 
 
 class CaptureEventTests(unittest.TestCase):
@@ -268,7 +272,13 @@ class CaptureEventTests(unittest.TestCase):
 
 
 class CaptureCliTests(unittest.TestCase):
-    def run_cli(self, input_text: str, cwd: Path) -> subprocess.CompletedProcess[str]:
+    def run_cli(
+        self,
+        input_text: str,
+        cwd: Path,
+        *,
+        env: dict[str, str] | None = None,
+    ) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
             [sys.executable, str(ROOT / "bin/profile-harness"), "hook", "capture"],
             cwd=cwd,
@@ -276,15 +286,62 @@ class CaptureCliTests(unittest.TestCase):
             text=True,
             capture_output=True,
             check=False,
+            env=env,
         )
 
-    def test_cli_malformed_inputs_emit_json_and_fail_safely(self) -> None:
+    def assert_silent_success(
+        self,
+        payload: dict[str, object],
+        cwd: Path,
+        *,
+        env: dict[str, str] | None = None,
+    ) -> None:
+        result = self.run_cli(json.dumps(payload), cwd, env=env)
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertEqual("", result.stdout)
+        self.assertEqual("", result.stderr)
+
+    def test_cli_success_statuses_are_silent_hook_responses(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            parent = Path(temporary_directory)
+            root = parent / "profile"
+            init_profile(root, "Work")
+            stop = {
+                "hook_event_name": "Stop",
+                "session_id": "stop-session",
+                "turn_id": "turn-1",
+                "cwd": str(root),
+                "last_assistant_message": "done",
+            }
+            session_end = {
+                "hook_event_name": "SessionEnd",
+                "session_id": "end-session",
+                "reason": "complete",
+                "cwd": str(root),
+                "last_assistant_message": "done",
+            }
+
+            self.assert_silent_success(stop, root)
+            self.assert_silent_success(stop, root)
+            self.assert_silent_success(session_end, root)
+            self.assert_silent_success(
+                {**stop, "cwd": str(parent)}, parent
+            )
+            curator_environment = os.environ.copy()
+            curator_environment["PROFILE_HARNESS_CURATOR"] = "1"
+            self.assert_silent_success(
+                stop, root, env=curator_environment
+            )
+
+    def test_cli_malformed_inputs_keep_stdout_empty_and_fail_safely(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             cwd = Path(temporary_directory)
             malformed_inputs = (
                 "not json",
                 "[]",
                 json.dumps({"hook_event_name": [], "session_id": "s"}),
+                json.dumps({"hook_event_name": "Stop", "session_id": ""}),
+                json.dumps({"hook_event_name": "SessionEnd", "session_id": ""}),
                 '{"hook_event_name":"Stop","session_id":"s","value":NaN}',
                 '{"hook_event_name":"Stop","session_id":"s","value":Infinity}',
                 '{"hook_event_name":"Stop","session_id":"s","value":-Infinity}',
@@ -293,10 +350,39 @@ class CaptureCliTests(unittest.TestCase):
             for malformed in malformed_inputs:
                 with self.subTest(prefix=malformed[:12]):
                     result = self.run_cli(malformed, cwd)
-                    output = json.loads(result.stdout)
                     self.assertNotEqual(0, result.returncode)
-                    self.assertFalse(output["success"])
-                    self.assertEqual("error", output["status"])
+                    self.assertEqual("", result.stdout)
+                    self.assertEqual(
+                        "profile-harness hook capture failed\n", result.stderr
+                    )
+
+    def test_cli_capture_exceptions_emit_only_fixed_stderr(self) -> None:
+        payload = json.dumps({
+            "hook_event_name": "Stop",
+            "session_id": "session",
+        }).encode("utf-8")
+
+        class BinaryStdin:
+            def __init__(self, value: bytes) -> None:
+                self.buffer = io.BytesIO(value)
+
+        for error in (OSError("sensitive path"), RuntimeError("sensitive detail")):
+            with self.subTest(error=type(error).__name__):
+                stdout = io.StringIO()
+                stderr = io.StringIO()
+                with (
+                    mock.patch.object(sys, "stdin", BinaryStdin(payload)),
+                    mock.patch.object(sys, "stdout", stdout),
+                    mock.patch.object(sys, "stderr", stderr),
+                    mock.patch.object(cli_module, "capture_event", side_effect=error),
+                ):
+                    exit_code = cli_module._capture_from_stdin()
+
+                self.assertEqual(1, exit_code)
+                self.assertEqual("", stdout.getvalue())
+                self.assertEqual(
+                    "profile-harness hook capture failed\n", stderr.getvalue()
+                )
 
     def test_cli_process_safe_distinct_captures_all_survive(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -340,7 +426,8 @@ class CaptureCliTests(unittest.TestCase):
             self.assertTrue(
                 all(process.returncode == 0 for process, _ in captures), results
             )
-            self.assertTrue(all(json.loads(stdout)["success"] for stdout, _ in results))
+            self.assertTrue(all(stdout == "" for stdout, _ in results), results)
+            self.assertTrue(all(stderr == "" for _, stderr in results), results)
             self.assertEqual(
                 16, len(list((root / ".harness/memory/inbox").glob("*.json")))
             )

@@ -51,6 +51,15 @@ def validate_actions(result, *args, **kwargs):
 
 
 class FinalHardeningTests(unittest.TestCase):
+    def setUp(self) -> None:
+        auth_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(auth_directory.cleanup)
+        auth_home = Path(auth_directory.name)
+        (auth_home / "auth.json").write_text("{}", encoding="utf-8")
+        environment = mock.patch.dict(os.environ, {"CODEX_HOME": str(auth_home)})
+        environment.start()
+        self.addCleanup(environment.stop)
+
     def make_profile(self, parent: Path) -> tuple[Path, Path]:
         root = parent / "profile"
         init_profile(root, "Work")

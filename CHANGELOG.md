@@ -2,6 +2,12 @@
 
 ## 0.4.1 - 2026-09-12
 
+- Separate ordinary profile-work guidance from harness administration. Run
+  curation and improvement from the real profile root with an ephemeral,
+  auth-linked `CODEX_HOME`, while disabling user config, rules, and automatic
+  project-document instructions. Disable both shell implementations so the
+  model cannot inspect linked credentials, and keep model-output schemas within
+  the Responses API-supported JSON Schema subset.
 - Normalize GitHub-hosted Python permissions before CI and release validation.
 - Replace the operator-heavy README with a concise user guide and a complete
   agent-install request that names the source repository.
@@ -10,6 +16,11 @@
 - Bind generated launchers to the validated Python 3.11+ used during installation,
   so launchd and Codex hooks do not fall back to macOS Python 3.9.
 - Register plugin hooks explicitly and invoke the generated launcher directly.
+- Keep successful Stop and SessionEnd capture hooks silent so internal receipt
+  metadata is never misparsed as a Codex hook-control response; report failures
+  only through a bounded, non-sensitive stderr message and nonzero exit status.
+- Exercise both lifecycle hooks in release validation and enforce Codex's
+  three-second SessionEnd timeout ceiling in Doctor and installer validation.
 - Correct Codex app hook instructions to the current per-hook Trust controls and
   retain the CLI `/hooks` fallback.
 - Clarify that users create a profile folder, add it as a Codex project, and ask

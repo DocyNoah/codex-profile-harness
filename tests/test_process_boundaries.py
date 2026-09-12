@@ -35,6 +35,15 @@ def wait_pid_gone(pid: int, timeout: float = 3.0) -> bool:
 
 
 class ProcessBoundaryTests(unittest.TestCase):
+    def setUp(self) -> None:
+        auth_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(auth_directory.cleanup)
+        auth_home = Path(auth_directory.name)
+        (auth_home / "auth.json").write_text("{}", encoding="utf-8")
+        environment = mock.patch.dict(os.environ, {"CODEX_HOME": str(auth_home)})
+        environment.start()
+        self.addCleanup(environment.stop)
+
     def make_executable(self, path: Path, body: str) -> Path:
         path.write_text("#!/usr/bin/env python3\n" + body, encoding="utf-8")
         path.chmod(0o755)
