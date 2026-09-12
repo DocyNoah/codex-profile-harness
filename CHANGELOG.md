@@ -2,6 +2,7 @@
 
 ## 0.4.1 - 2026-09-12
 
+- Normalize GitHub-hosted Python permissions before CI and release validation.
 - Replace the operator-heavy README with a concise user guide and a complete
   agent-install request that names the source repository.
 - Require installation-time profile onboarding so `IDENTITY.md`, `USER.md`, and

@@ -20,6 +20,11 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
+      - name: Normalize hosted Python permissions
+        shell: bash
+        run: |
+          runtime="$(python -c 'import pathlib, sys; print(pathlib.Path(sys.executable).resolve())')"
+          sudo chmod go-w "$runtime"
       - name: Unit tests
         env:
           PYTHONDONTWRITEBYTECODE: "1"
